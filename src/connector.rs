@@ -538,9 +538,14 @@ async fn connect_dual_lane_once(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
+    use crate::shared::{bulk_server_mux_config, interactive_server_mux_config};
+    use mux::spawn_mux_no_reconnection;
 
     fn spawn_test_connector(
         dialer: DualLaneDialer,
@@ -589,6 +594,88 @@ mod tests {
             .unwrap();
     }
 
+    fn fake_connected_birth(
+        addr: SocketAddr,
+        terminate: Option<oneshot::Receiver<()>>,
+    ) -> ConnectedDualLaneBirth {
+        let (interactive_local, interactive_peer) = tokio::io::duplex(64 * 1024);
+        let (bulk_local, bulk_peer) = tokio::io::duplex(64 * 1024);
+        let (interactive_local_read, interactive_local_write) = tokio::io::split(interactive_local);
+        let (interactive_peer_read, interactive_peer_write) = tokio::io::split(interactive_peer);
+        let (bulk_local_read, bulk_local_write) = tokio::io::split(bulk_local);
+        let (bulk_peer_read, bulk_peer_write) = tokio::io::split(bulk_peer);
+        let mut interactive_local_tasks = JoinSet::new();
+        let (interactive_opener, interactive_accepter) = spawn_mux_no_reconnection(
+            interactive_local_read,
+            interactive_local_write,
+            interactive_client_mux_config(),
+            &mut interactive_local_tasks,
+        );
+        let mut bulk_local_tasks = JoinSet::new();
+        let (bulk_opener, bulk_accepter) = spawn_mux_no_reconnection(
+            bulk_local_read,
+            bulk_local_write,
+            bulk_client_mux_config(),
+            &mut bulk_local_tasks,
+        );
+        let mut interactive_peer_tasks = JoinSet::new();
+        let (interactive_peer_opener, interactive_peer_accepter) = spawn_mux_no_reconnection(
+            interactive_peer_read,
+            interactive_peer_write,
+            interactive_server_mux_config(),
+            &mut interactive_peer_tasks,
+        );
+        let mut bulk_peer_tasks = JoinSet::new();
+        let (bulk_peer_opener, bulk_peer_accepter) = spawn_mux_no_reconnection(
+            bulk_peer_read,
+            bulk_peer_write,
+            bulk_server_mux_config(),
+            &mut bulk_peer_tasks,
+        );
+        let mut supervisor = JoinSet::new();
+        let (opener, _accepter) = mux::spawn_dual_mux_paired_supervised(
+            interactive_opener,
+            interactive_accepter,
+            interactive_local_tasks,
+            bulk_opener,
+            bulk_accepter,
+            bulk_local_tasks,
+            &mut supervisor,
+        );
+        supervisor.spawn(async move {
+            let _keep_peer_alive = (
+                interactive_peer_opener,
+                interactive_peer_accepter,
+                interactive_peer_tasks,
+                bulk_peer_opener,
+                bulk_peer_accepter,
+                bulk_peer_tasks,
+            );
+            std::future::pending::<MuxError>().await
+        });
+        if let Some(terminate) = terminate {
+            supervisor.spawn(async move {
+                let _ = terminate.await;
+                MuxError::TaskStopped {
+                    task: "synthetic_dual_lane",
+                }
+            });
+        }
+        ConnectedDualLaneBirth {
+            session: ConnectedDualLane {
+                opener,
+                addr: SocketAddrPair {
+                    local_addr: "192.0.2.100:40000".parse().unwrap(),
+                    peer_addr: addr,
+                },
+                nonce: PairingNonce::generate(),
+                connected_at: Instant::now(),
+                opened_streams: 0,
+            },
+            supervisor,
+        }
+    }
+
     #[tokio::test]
     async fn pending_dial_does_not_block_other_destinations() {
         let blocked_addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
@@ -626,6 +713,111 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
 
         drop(blocked);
+        stop(commands, coordinator).await;
+    }
+
+    #[tokio::test]
+    async fn pending_dial_does_not_block_cached_session_requests() {
+        let cached_addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let blocked_addr: SocketAddr = "192.0.2.2:50000".parse().unwrap();
+        let blocked_started = Arc::new(tokio::sync::Notify::new());
+        let dialer: DualLaneDialer = Arc::new({
+            let blocked_started = Arc::clone(&blocked_started);
+            move |addr| {
+                if addr == cached_addr {
+                    Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
+                } else {
+                    blocked_started.notify_one();
+                    Box::pin(std::future::pending())
+                }
+            }
+        });
+        let (commands, coordinator) = spawn_test_connector(dialer);
+        drop(
+            enqueue(&commands, cached_addr)
+                .await
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let blocked = enqueue(&commands, blocked_addr).await;
+        blocked_started.notified().await;
+        let cached = tokio::time::timeout(Duration::from_secs(1), enqueue(&commands, cached_addr))
+            .await
+            .expect("pending dial blocked a cached session request")
+            .await
+            .unwrap()
+            .unwrap();
+        drop(cached);
+        reset(&commands).await;
+        assert_eq!(
+            blocked.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        stop(commands, coordinator).await;
+    }
+
+    #[tokio::test]
+    async fn pending_dial_does_not_block_dead_session_reaping() {
+        let session_addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let blocked_addr: SocketAddr = "192.0.2.2:50000".parse().unwrap();
+        let (terminate_tx, terminate_rx) = oneshot::channel();
+        let terminate_rx = Arc::new(Mutex::new(Some(terminate_rx)));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let blocked_started = Arc::new(tokio::sync::Notify::new());
+        let dialer: DualLaneDialer = Arc::new({
+            let terminate_rx = Arc::clone(&terminate_rx);
+            let attempts = Arc::clone(&attempts);
+            let blocked_started = Arc::clone(&blocked_started);
+            move |addr| {
+                if addr == blocked_addr {
+                    blocked_started.notify_one();
+                    return Box::pin(std::future::pending());
+                }
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let terminate = terminate_rx.lock().unwrap().take().unwrap();
+                    Box::pin(async move { Ok(fake_connected_birth(addr, Some(terminate))) })
+                } else {
+                    Box::pin(async {
+                        Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "synthetic redial failure",
+                        ))
+                    })
+                }
+            }
+        });
+        let (commands, coordinator) = spawn_test_connector(dialer);
+        drop(
+            enqueue(&commands, session_addr)
+                .await
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let blocked = enqueue(&commands, blocked_addr).await;
+        blocked_started.notified().await;
+        terminate_tx.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match enqueue(&commands, session_addr).await.await.unwrap() {
+                    Ok(stream) => {
+                        drop(stream);
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => break error,
+                }
+            }
+        })
+        .await
+        .expect("pending dial blocked dead-session reaping");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        reset(&commands).await;
+        assert_eq!(
+            blocked.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
         stop(commands, coordinator).await;
     }
 
