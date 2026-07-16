@@ -1,0 +1,21 @@
+[package]
+name = "rtp_mux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3"
+metrics = "0.24"
+mux = { git = "https://github.com/Banyc/mux.git", branch = "dev" }
+rand = "0.10"
+rtp = { git = "https://github.com/Banyc/rtp.git", branch = "dev" }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[patch."https://github.com/Banyc/mux.git"]
+mux = { path = "../mux" }
+
+[patch."https://github.com/Banyc/rtp.git"]
+rtp = { path = "../rtp" }
