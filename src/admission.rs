@@ -476,6 +476,24 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
+
+    #[test]
+    fn pending_lane_registry_try_acquire_within_limits() {
+        let registry = PendingLaneRegistry::new();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let permit = registry.try_acquire(ip);
+        assert!(permit.is_ok());
+    }
+    #[test]
+    fn pending_lane_registry_permit_releases_slot_on_drop() {
+        let registry = PendingLaneRegistry::new();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        {
+            let _permit = registry.try_acquire(ip).unwrap();
+        }
+        let permit2 = registry.try_acquire(ip);
+        assert!(permit2.is_ok());
+    }
     #[test]
     fn pending_lane_registry_permit_drop_releases_global_and_per_peer() {
         let registry = PendingLaneRegistry::new();
@@ -487,20 +505,144 @@ mod tests {
             assert_eq!(state.per_peer.get(&ip), Some(&1));
         }
         drop(permit);
-        let state = registry.state.lock().unwrap();
-        assert_eq!(state.admitted, 0);
-        assert!(!state.per_peer.contains_key(&ip));
+        {
+            let state = registry.state.lock().unwrap();
+            assert_eq!(state.admitted, 0);
+            assert!(!state.per_peer.contains_key(&ip));
+        }
     }
     #[test]
     fn pending_lane_registry_enforces_per_peer_limit() {
         let registry = PendingLaneRegistry::new();
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let permits: Vec<_> = (0..MAX_PENDING_LANES_PER_PEER)
-            .map(|_| registry.try_acquire(ip).unwrap())
-            .collect();
-        assert!(registry.try_acquire(ip).is_err());
-        drop(permits);
-        assert!(registry.try_acquire(ip).is_ok());
+        let mut permits = Vec::new();
+        for _ in 0..MAX_PENDING_LANES_PER_PEER {
+            permits.push(registry.try_acquire(ip).unwrap());
+        }
+        let extra = registry.try_acquire(ip);
+        assert!(extra.is_err());
+    }
+    #[test]
+    fn pending_lane_registry_duplicate_class_rejection() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut first = Some(registry.try_acquire(peer.ip()).unwrap());
+        let admission = registry.admit(nonce, LaneClass::Interactive, peer, local, &mut first);
+        assert!(matches!(admission, PendingLaneAdmission::Reserved));
+        assert!(first.is_none());
+        let mut second = Some(registry.try_acquire(peer.ip()).unwrap());
+        let admission = registry.admit(nonce, LaneClass::Interactive, peer, local, &mut second);
+        assert!(matches!(
+            admission,
+            PendingLaneAdmission::Reject("duplicate lane class for pairing nonce")
+        ));
+        assert!(second.is_some());
+    }
+    #[test]
+    fn pending_lane_registry_foreign_peer_rejection() {
+        let registry = PendingLaneRegistry::new();
+        let peer1: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let peer2: SocketAddr = "192.168.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut first = Some(registry.try_acquire(peer1.ip()).unwrap());
+        assert!(matches!(
+            registry.admit(nonce, LaneClass::Interactive, peer1, local, &mut first),
+            PendingLaneAdmission::Reserved
+        ));
+        let mut second = Some(registry.try_acquire(peer2.ip()).unwrap());
+        let admission = registry.admit(nonce, LaneClass::Bulk, peer2, local, &mut second);
+        assert!(matches!(
+            admission,
+            PendingLaneAdmission::Reject("pairing nonce peer mismatch")
+        ));
+        assert!(second.is_some());
+    }
+    #[test]
+    fn pending_lane_registry_pairing_is_not_blocked() {
+        let registry = PendingLaneRegistry::new();
+        let addr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        assert!(registry.try_acquire(addr.ip()).is_ok());
+    }
+    #[test]
+    fn lane_rejection_log_aggregates_across_classes_peers_and_lanes() {
+        let log = LaneRejectionLog::default();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        log.record(RejectedLaneContext {
+            class: LaneRejectionClass::HelloTimeout,
+            peer,
+            local_addr: local,
+            expected_class: Some(LaneClass::Interactive),
+            reason: "test".to_string(),
+        });
+        log.record(RejectedLaneContext {
+            class: LaneRejectionClass::HelloTimeout,
+            peer,
+            local_addr: local,
+            expected_class: Some(LaneClass::Interactive),
+            reason: "test".to_string(),
+        });
+        log.record(RejectedLaneContext {
+            class: LaneRejectionClass::HelloParse,
+            peer,
+            local_addr: local,
+            expected_class: Some(LaneClass::Bulk),
+            reason: "test".to_string(),
+        });
+        let summary = log.inner.summary.lock().unwrap();
+        assert_eq!(summary.total, 3);
+        assert_eq!(
+            summary.by_class.get(&LaneRejectionClass::HelloTimeout),
+            Some(&2)
+        );
+        assert_eq!(
+            summary.by_class.get(&LaneRejectionClass::HelloParse),
+            Some(&1)
+        );
+    }
+    #[test]
+    fn pending_lane_expiry_releases_per_peer_capacity() {
+        let registry = PendingLaneRegistry::new();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let permit = registry.try_acquire(ip).unwrap();
+        assert_eq!(registry.state.lock().unwrap().admitted, 1);
+        drop(permit);
+        assert_eq!(registry.state.lock().unwrap().admitted, 0);
+    }
+    #[test]
+    fn admit_reject_duplicate_class() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut first = Some(registry.try_acquire(peer.ip()).unwrap());
+        assert!(matches!(
+            registry.admit(nonce, LaneClass::Interactive, peer, local, &mut first),
+            PendingLaneAdmission::Reserved
+        ));
+        let mut second = Some(registry.try_acquire(peer.ip()).unwrap());
+        assert!(matches!(
+            registry.admit(nonce, LaneClass::Interactive, peer, local, &mut second),
+            PendingLaneAdmission::Reject("duplicate lane class for pairing nonce")
+        ));
+    }
+    #[test]
+    fn admit_wait_for_opposite_class_while_building() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut first = Some(registry.try_acquire(peer.ip()).unwrap());
+        registry.admit(nonce, LaneClass::Interactive, peer, local, &mut first);
+        let mut second = Some(registry.try_acquire(peer.ip()).unwrap());
+        let admission = registry.admit(nonce, LaneClass::Bulk, peer, local, &mut second);
+        assert!(
+            matches!(admission, PendingLaneAdmission::Wait { .. }),
+            "opposite class while Building should return Wait"
+        );
     }
     #[test]
     fn admit_allows_replacement_waiter_after_first_waiter_is_dropped() {
@@ -631,5 +773,74 @@ mod tests {
         registry.cancel_reservation(first_nonce, peer, LaneClass::Interactive);
         assert!(first_changed.has_changed().is_err());
         assert!(matches!(second_changed.has_changed(), Ok(false)));
+    }
+    #[test]
+    #[should_panic(expected = "accepted RTP mux lane must retain its admission permit")]
+    fn admit_reject_no_permit() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut permit: Option<PendingLanePermit> = None;
+        let _ = registry.admit(nonce, LaneClass::Interactive, peer, local, &mut permit);
+    }
+    #[test]
+    fn admit_reject_foreign_peer() {
+        let registry = PendingLaneRegistry::new();
+        let peer1: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let peer2: SocketAddr = "192.168.1.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut first = Some(registry.try_acquire(peer1.ip()).unwrap());
+        registry.admit(nonce, LaneClass::Interactive, peer1, local, &mut first);
+        let mut second = Some(registry.try_acquire(peer2.ip()).unwrap());
+        assert!(matches!(
+            registry.admit(nonce, LaneClass::Bulk, peer2, local, &mut second),
+            PendingLaneAdmission::Reject("pairing nonce peer mismatch")
+        ));
+    }
+    #[test]
+    fn ready_lane_rejects_foreign_peer_and_duplicate_class() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut first = Some(registry.try_acquire(peer.ip()).unwrap());
+        assert!(matches!(
+            registry.admit(nonce, LaneClass::Interactive, peer, local, &mut first),
+            PendingLaneAdmission::Reserved
+        ));
+        let foreign_peer: SocketAddr = "192.168.1.1:1000".parse().unwrap();
+        let mut foreign = Some(registry.try_acquire(foreign_peer.ip()).unwrap());
+        assert!(matches!(
+            registry.admit(nonce, LaneClass::Bulk, foreign_peer, local, &mut foreign),
+            PendingLaneAdmission::Reject("pairing nonce peer mismatch")
+        ));
+        let same_peer_ip: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let mut duplicate = Some(registry.try_acquire(same_peer_ip.ip()).unwrap());
+        assert!(matches!(
+            registry.admit(
+                nonce,
+                LaneClass::Interactive,
+                same_peer_ip,
+                local,
+                &mut duplicate
+            ),
+            PendingLaneAdmission::Reject("duplicate lane class for pairing nonce")
+        ));
+    }
+    #[test]
+    fn ready_lane_pairs_opposite_class() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut first = Some(registry.try_acquire(peer.ip()).unwrap());
+        registry.admit(nonce, LaneClass::Interactive, peer, local, &mut first);
+        let mut second = Some(registry.try_acquire(peer.ip()).unwrap());
+        assert!(matches!(
+            registry.admit(nonce, LaneClass::Bulk, peer, local, &mut second),
+            PendingLaneAdmission::Wait { .. }
+        ));
     }
 }
