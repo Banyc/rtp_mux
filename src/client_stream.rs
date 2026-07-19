@@ -436,7 +436,7 @@ mod tests {
         )
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn write_is_cancellation_safe_and_shutdown_delivers_final() {
         use tokio::io::{AsyncReadExt, AsyncWrite};
         let (opener, accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
