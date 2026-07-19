@@ -6,16 +6,15 @@ edition = "2024"
 [dependencies]
 futures = "0.3"
 metrics = "0.24"
-mux = { git = "https://github.com/Banyc/mux.git", branch = "dev" }
+mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.21" }
 rand = "0.10"
-rtp = { git = "https://github.com/Banyc/rtp.git", branch = "dev" }
+rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.79" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 
-[patch."https://github.com/Banyc/mux.git"]
-mux = { path = "../mux" }
-
-[patch."https://github.com/Banyc/rtp.git"]
-rtp = { path = "../rtp" }
+# [patch."https://github.com/Banyc/mux.git"]
+# mux = { path = "../mux" }
+# [patch."https://github.com/Banyc/rtp.git"]
+# rtp = { path = "../rtp" }
