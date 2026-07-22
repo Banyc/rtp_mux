@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 
-# [patch."https://github.com/Banyc/mux.git"]
-# mux = { path = "../mux" }
-# [patch."https://github.com/Banyc/rtp.git"]
-# rtp = { path = "../rtp" }
+[patch."https://github.com/Banyc/mux.git"]
+mux = { path = "../mux" }
+[patch."https://github.com/Banyc/rtp.git"]
+rtp = { path = "../rtp" }

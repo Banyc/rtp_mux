@@ -428,7 +428,6 @@ dependencies = [
 [[package]]
 name = "mux"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/mux.git?tag=v0.0.22#61b31932ae46d7e40140abcecf263e9a4ab15acd"
 dependencies = [
  "getrandom 0.2.17",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
@@ -682,7 +681,6 @@ checksum = "1e0e61cd21fbddd85fbd9367b775660a01d388c08a61c6d2824af480b0309bb9"
 [[package]]
 name = "rtp"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/rtp.git?tag=v0.0.79#470fbf9af792f1b257dd32d0e1f39ae32087bf04"
 dependencies = [
  "async-trait",
  "async_async_io",
