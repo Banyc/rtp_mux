@@ -176,6 +176,60 @@ impl ClientStream {
             io::Error::new(io::ErrorKind::BrokenPipe, message)
         }
     }
+
+    fn poll_write_vectored_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.poll_pending_control(cx) {
+            Poll::Ready(Ok(Some(ControlKind::Shutdown))) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "stream shut down",
+                )));
+            }
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        if self.shutdown_complete || self.shutdown_started {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream shut down",
+            )));
+        }
+        if let Some(error) = &*self.background_error.lock().unwrap() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                error.to_string(),
+            )));
+        }
+        let chunk = bufs
+            .iter()
+            .fold(0usize, |total, buf| total.saturating_add(buf.len()))
+            .min(WRITE_MAX_CHUNK);
+        match self.write_tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) if chunk > 0 => {
+                let mut data = Vec::with_capacity(chunk);
+                for buf in bufs {
+                    let remaining = chunk - data.len();
+                    if remaining == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..buf.len().min(remaining)]);
+                }
+                let _ = self.write_tx.send_item(WriteCommand::Data(data));
+                Poll::Ready(Ok(chunk))
+            }
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(0)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "write channel closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 impl fmt::Debug for ClientStream {
@@ -223,44 +277,19 @@ impl AsyncWrite for ClientStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.poll_pending_control(cx) {
-            Poll::Ready(Ok(Some(ControlKind::Shutdown))) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "stream shut down",
-                )));
-            }
-            Poll::Ready(Ok(_)) => {}
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending => return Poll::Pending,
-        }
-        if self.shutdown_complete || self.shutdown_started {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stream shut down",
-            )));
-        }
-        if let Some(error) = &*self.background_error.lock().unwrap() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                error.to_string(),
-            )));
-        }
-        let chunk = buf.len().min(WRITE_MAX_CHUNK);
-        match self.write_tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) if chunk > 0 => {
-                let _ = self
-                    .write_tx
-                    .send_item(WriteCommand::Data(buf[..chunk].to_vec()));
-                Poll::Ready(Ok(chunk))
-            }
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(0)),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "write channel closed",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        self.poll_write_vectored_inner(cx, &[io::IoSlice::new(buf)])
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_vectored_inner(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -504,6 +533,78 @@ mod tests {
             .unwrap();
         assert_eq!(bytes.len(), accepted_big_bytes + small.len());
         assert_eq!(&bytes[bytes.len() - small.len()..], small);
+        accepter_task.abort();
+    }
+
+    #[tokio::test]
+    async fn vectored_data_precedes_fin_in_both_directions() {
+        use std::io::IoSlice;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (opener, accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let addr = SocketAddrPair {
+            local_addr: "127.0.0.1:10000".parse().unwrap(),
+            peer_addr: "127.0.0.1:10001".parse().unwrap(),
+        };
+        let (writer, reader) = opener.open_migrating_with_reader(43, mux::LaneClass::Interactive);
+        let mut client = ClientStream::new(writer, reader, addr);
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let accepter_task = tokio::spawn(async move {
+            let mut accepter = accepter.into_migrating_only();
+            let mut accepted_tx = Some(accepted_tx);
+            while let Ok(accepted) = accepter.accept().await {
+                match accepted {
+                    mux::AcceptedStream::Migrating {
+                        reader,
+                        writer,
+                        source_lane,
+                        ..
+                    } => {
+                        if let Some(accepted_tx) = accepted_tx.take() {
+                            let _ = accepted_tx.send((reader, writer, source_lane));
+                        }
+                    }
+                    mux::AcceptedStream::Plain { .. } => panic!("expected migrating stream"),
+                }
+            }
+        });
+        assert!(client.is_write_vectored());
+        let request = [
+            IoSlice::new(b"client-"),
+            IoSlice::new(b"vectored-"),
+            IoSlice::new(b"request"),
+        ];
+        let request_len = request.iter().map(|buf| buf.len()).sum::<usize>();
+        assert_eq!(client.write_vectored(&request).await.unwrap(), request_len);
+        client.shutdown().await.unwrap();
+        let (reader, writer, source_lane) =
+            tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        let mut server = crate::ServerStream::Migrating {
+            reader,
+            writer,
+            addr,
+            source_lane,
+        };
+        assert!(server.is_write_vectored());
+        let mut received_request = Vec::new();
+        server.read_to_end(&mut received_request).await.unwrap();
+        assert_eq!(received_request, b"client-vectored-request");
+        let response = [
+            IoSlice::new(b"server-"),
+            IoSlice::new(b"vectored-"),
+            IoSlice::new(b"response"),
+        ];
+        let response_len = response.iter().map(|buf| buf.len()).sum::<usize>();
+        assert_eq!(
+            server.write_vectored(&response).await.unwrap(),
+            response_len
+        );
+        server.shutdown().await.unwrap();
+        let mut received_response = Vec::new();
+        client.read_to_end(&mut received_response).await.unwrap();
+        assert_eq!(received_response, b"server-vectored-response");
         accepter_task.abort();
     }
 }

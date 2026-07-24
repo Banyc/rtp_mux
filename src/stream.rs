@@ -65,6 +65,26 @@ impl AsyncWrite for ServerStream {
         }
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match &mut *self {
+            Self::Plain { writer, .. } | Self::Migrating { writer, .. } => {
+                Pin::new(writer).poll_write_vectored(cx, bufs)
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain { writer, .. } | Self::Migrating { writer, .. } => {
+                writer.is_write_vectored()
+            }
+        }
+    }
+
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
