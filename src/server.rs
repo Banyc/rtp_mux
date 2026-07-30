@@ -27,10 +27,7 @@ use crate::{
         PendingLaneAdmission, PendingLaneRegistry, PendingLaneWait, PreparedLane,
         RejectedLaneContext,
     },
-    shared::{
-        ADMISSION_REJECTION_LOG_INTERVAL, HELLO_DEADLINE, bulk_lane_addr, bulk_server_mux_config,
-        interactive_server_mux_config,
-    },
+    shared::{ADMISSION_REJECTION_LOG_INTERVAL, HELLO_DEADLINE, bulk_lane_addr, server_mux_config},
     stream::{ServerStream, SocketAddrPair},
 };
 
@@ -49,6 +46,7 @@ pub struct RtpMuxServer {
     bulk_listener: rtp::udp::Listener,
     mux: JoinSet<MuxError>,
     fec: bool,
+    response_migration: bool,
 }
 
 enum BirthHeartbeatFailure {
@@ -87,7 +85,13 @@ impl RtpMuxServer {
             bulk_listener,
             mux: JoinSet::new(),
             fec,
+            response_migration: false,
         }
+    }
+
+    pub fn with_response_migration(mut self, enabled: bool) -> Self {
+        self.response_migration = enabled;
+        self
     }
 
     pub fn listener(&self) -> &rtp::udp::Listener {
@@ -110,7 +114,10 @@ impl RtpMuxServer {
             ?bulk_addr,
             "Listening (interactive + bulk dual-lane)"
         );
-        let handler: StreamHandler = Arc::new(handler);
+        let env = AcceptEnv {
+            handler: Arc::new(handler),
+            response_migration: self.response_migration,
+        };
         let registry = PendingLaneRegistry::new();
         let rejections = LaneRejectionLog::default();
         let mut interactive_backoff = AcceptErrorBackoff::default();
@@ -176,13 +183,13 @@ impl RtpMuxServer {
                         AdmittedLane {
                             read,
                             write,
-                            config: interactive_server_mux_config(),
+                            config: server_mux_config(),
                             expected_class: LaneClass::Interactive,
                             peer,
                             local_addr: addr,
                             permit,
                         },
-                        Arc::clone(&handler),
+                        env.clone(),
                         Arc::clone(&registry),
                         rejections.clone(),
                     );
@@ -227,13 +234,13 @@ impl RtpMuxServer {
                         AdmittedLane {
                             read,
                             write,
-                            config: bulk_server_mux_config(),
+                            config: server_mux_config(),
                             expected_class: LaneClass::Bulk,
                             peer,
                             local_addr: bulk_addr,
                             permit,
                         },
-                        Arc::clone(&handler),
+                        env.clone(),
                         Arc::clone(&registry),
                         rejections.clone(),
                     );
@@ -249,9 +256,15 @@ async fn finish_frame_delivery_accept(
     accept?.await.map_err(io::Error::other)?
 }
 
+#[derive(Clone)]
+struct AcceptEnv {
+    handler: StreamHandler,
+    response_migration: bool,
+}
+
 fn spawn_lane_accept(
     admitted: AdmittedLane,
-    handler: StreamHandler,
+    env: AcceptEnv,
     registry: Arc<PendingLaneRegistry>,
     rejections: LaneRejectionLog,
 ) {
@@ -396,7 +409,7 @@ fn spawn_lane_accept(
                             local_addr,
                             _permit: permit.take().unwrap(),
                         };
-                        pair_lanes_inner(lane, other, handler, nonce);
+                        pair_lanes_inner(lane, other, env.clone(), nonce);
                     }
                     PendingLaneWait::Timeout => {
                         signal_rejected_lane(
@@ -463,7 +476,7 @@ fn spawn_lane_accept(
                     local_addr,
                     _permit: permit.take().unwrap(),
                 };
-                pair_lanes_inner(lane, other, handler, nonce);
+                pair_lanes_inner(lane, other, env.clone(), nonce);
             }
             PendingLaneAdmission::Reject(reason) => {
                 signal_rejected_lane(
@@ -561,12 +574,7 @@ fn record_rejected_lane(
     rejections.record(context);
 }
 
-fn pair_lanes_inner(
-    lane_a: PendingLane,
-    lane_b: PendingLane,
-    handler: StreamHandler,
-    nonce: PairingNonce,
-) {
+fn pair_lanes_inner(lane_a: PendingLane, lane_b: PendingLane, env: AcceptEnv, nonce: PairingNonce) {
     counter!("stream.rtp_mux.paired").increment(1);
     let addrs = classify_lane_addrs(
         lane_a.pending.class,
@@ -575,7 +583,7 @@ fn pair_lanes_inner(
         lane_b.peer,
         lane_b.local_addr,
     );
-    pair_lanes(lane_a, lane_b, handler, addrs, nonce);
+    pair_lanes(lane_a, lane_b, env, addrs, nonce);
 }
 
 async fn run_pending_lane_expiry(registry: Arc<PendingLaneRegistry>, rejections: LaneRejectionLog) {
@@ -638,20 +646,20 @@ fn classify_lane_addrs(
 fn pair_lanes(
     lane_a: PendingLane,
     lane_b: PendingLane,
-    handler: StreamHandler,
+    env: AcceptEnv,
     addrs: DualLaneSocketAddrs,
     nonce: PairingNonce,
 ) {
     let mut tasks = JoinSet::new();
     match complete_pairing(lane_a.pending, lane_b.pending, &mut tasks) {
-        Ok((_opener, accepter)) => {
+        Ok((opener, accepter)) => {
             let addr = SocketAddrPair {
                 local_addr: addrs.interactive_local,
                 peer_addr: addrs.interactive_peer,
             };
             tokio::spawn(async move {
                 let paired_at = Instant::now();
-                let accepted_streams = run_dual_mux_accepter(accepter, addr, handler).await;
+                let accepted_streams = run_dual_mux_accepter(accepter, opener, addr, env).await;
                 let error = match tasks.join_next().await {
                     Some(Ok(error)) => error,
                     Some(Err(source)) => MuxError::TaskJoin {
@@ -691,10 +699,16 @@ fn pair_lanes(
 
 async fn run_dual_mux_accepter(
     accepter: mux::DualStreamAccepter,
+    opener: mux::DualStreamOpener,
     addr: SocketAddrPair,
-    handler: StreamHandler,
+    env: AcceptEnv,
 ) -> u64 {
-    let mut accepter = accepter.into_migrating_only();
+    let mut accepter = if env.response_migration {
+        accepter.into_migrating_duplex(opener)
+    } else {
+        drop(opener);
+        accepter.into_migrating_only()
+    };
     let mut accepted_streams = 0;
     loop {
         let accepted = match accepter.accept().await {
@@ -712,6 +726,16 @@ async fn run_dual_mux_accepter(
                 addr,
                 source_lane,
             },
+            AcceptedStream::MigratingDuplex {
+                reader,
+                writer,
+                source_lane,
+            } => ServerStream::MigratingDuplex {
+                reader,
+                writer: crate::migrating_write_half::MigratingWriteHalf::new(writer),
+                addr,
+                source_lane,
+            },
             AcceptedStream::Plain {
                 reader,
                 writer,
@@ -724,7 +748,7 @@ async fn run_dual_mux_accepter(
             },
         };
         counter!("stream.rtp_mux.accepts").increment(1);
-        handler(stream);
+        (env.handler)(stream);
         accepted_streams += 1;
     }
     accepted_streams

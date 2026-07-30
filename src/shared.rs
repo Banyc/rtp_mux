@@ -25,36 +25,18 @@ pub(crate) fn bulk_lane_addr(interactive: SocketAddr) -> io::Result<SocketAddr> 
     Ok(bulk)
 }
 
-pub(crate) fn interactive_server_mux_config() -> MuxConfig {
+pub(crate) fn lane_mux_config(initiation: Initiation) -> MuxConfig {
     MuxConfig {
-        initiation: Initiation::Server,
+        initiation,
         heartbeat_interval: Duration::from_secs(5),
         frame_reassembly: true,
     }
 }
-
-pub(crate) fn interactive_client_mux_config() -> MuxConfig {
-    MuxConfig {
-        initiation: Initiation::Client,
-        heartbeat_interval: Duration::from_secs(5),
-        frame_reassembly: true,
-    }
+pub(crate) fn server_mux_config() -> MuxConfig {
+    lane_mux_config(Initiation::Server)
 }
-
-pub(crate) fn bulk_server_mux_config() -> MuxConfig {
-    MuxConfig {
-        initiation: Initiation::Server,
-        heartbeat_interval: Duration::from_secs(5),
-        frame_reassembly: true,
-    }
-}
-
-pub(crate) fn bulk_client_mux_config() -> MuxConfig {
-    MuxConfig {
-        initiation: Initiation::Client,
-        heartbeat_interval: Duration::from_secs(5),
-        frame_reassembly: true,
-    }
+pub(crate) fn client_mux_config() -> MuxConfig {
+    lane_mux_config(Initiation::Client)
 }
 
 #[cfg(test)]
@@ -63,9 +45,9 @@ mod tests {
 
     #[test]
     fn dual_lane_configs_enable_frame_reassembly() {
-        assert!(interactive_client_mux_config().frame_reassembly);
-        assert!(interactive_server_mux_config().frame_reassembly);
-        assert!(bulk_client_mux_config().frame_reassembly);
-        assert!(bulk_server_mux_config().frame_reassembly);
+        assert!(client_mux_config().frame_reassembly);
+        assert!(server_mux_config().frame_reassembly);
+        assert!(client_mux_config().frame_reassembly);
+        assert!(server_mux_config().frame_reassembly);
     }
 }

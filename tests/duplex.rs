@@ -1,0 +1,54 @@
+use rtp_mux::{RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer, ServerStream};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const RESPONSE_CHUNKS: usize = 16;
+const CHUNK: usize = 64 * 1024;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn response_migration_end_to_end() {
+    let server = RtpMuxServer::bind("127.0.0.1:0", false)
+        .await
+        .unwrap()
+        .with_response_migration(true);
+    let addr = server.listener().local_addr();
+    let saw_duplex = Arc::new(AtomicBool::new(false));
+    let saw_duplex_handler = Arc::clone(&saw_duplex);
+    tokio::spawn(server.serve(move |stream| {
+        saw_duplex_handler.store(
+            matches!(stream, ServerStream::MigratingDuplex { .. }),
+            Ordering::SeqCst,
+        );
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let mut req = [0u8; 4];
+            stream.read_exact(&mut req).await.unwrap();
+            assert_eq!(&req, b"ping");
+            let chunk = vec![0x5Au8; CHUNK];
+            for _ in 0..RESPONSE_CHUNKS {
+                stream.write_all(&chunk).await.unwrap();
+            }
+            stream.shutdown().await.unwrap();
+        });
+    }));
+    let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
+    let mut config = RtpMuxConnectorConfig::standard(bind, false);
+    config.response_migration = true;
+    let connector = RtpMuxConnector::with_config(config);
+    let mut stream = connector.connect_stream(addr).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.unwrap();
+    assert_eq!(resp.len(), RESPONSE_CHUNKS * CHUNK, "response truncated");
+    assert!(resp.iter().all(|b| *b == 0x5A), "response corrupted");
+    assert!(
+        saw_duplex.load(Ordering::SeqCst),
+        "server handler should have received a MigratingDuplex stream"
+    );
+}

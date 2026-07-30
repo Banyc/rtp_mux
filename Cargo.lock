@@ -428,12 +428,13 @@ dependencies = [
 [[package]]
 name = "mux"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/mux.git?tag=v0.0.23#c6558129efcc0d54a9371223c830d0d8d23da2be"
+source = "git+https://github.com/Banyc/mux.git?tag=v0.0.24#eec36be5b6269555a5d04c78435acb8c6d5244d8"
 dependencies = [
  "getrandom 0.4.3",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -682,7 +683,7 @@ checksum = "1e0e61cd21fbddd85fbd9367b775660a01d388c08a61c6d2824af480b0309bb9"
 [[package]]
 name = "rtp"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/rtp.git?tag=v0.0.80#af53f31820d24f534667806b0073554498e6570c"
+source = "git+https://github.com/Banyc/rtp.git?tag=v0.0.81#cd7e819fd2ea3b1b9b72ca5340bfe48a8625830f"
 dependencies = [
  "async-trait",
  "async_async_io",
@@ -888,13 +889,13 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.7.1"
+version = "2.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6328af13490e73a9b4694030fafd93f8c8c6a9dede33e821c3fc63eddf8042ba"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]

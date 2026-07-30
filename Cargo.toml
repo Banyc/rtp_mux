@@ -6,9 +6,9 @@ edition = "2024"
 [dependencies]
 futures = "0.3"
 metrics = "0.24"
-mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.23" }
+mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.24" }
 rand = "0.10"
-rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.80" }
+rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.81" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

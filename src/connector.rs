@@ -21,8 +21,7 @@ use crate::{
     client_stream::ClientStream,
     shared::{
         BIRTH_LIVENESS_DEADLINE, BIRTH_LIVENESS_GRACE, MAX_CONCURRENT_DUAL_DIALS,
-        MAX_DIAL_WAITERS_PER_ADDR, MAX_DUAL_CONNECT_ATTEMPTS, bulk_client_mux_config,
-        interactive_client_mux_config,
+        MAX_DIAL_WAITERS_PER_ADDR, MAX_DUAL_CONNECT_ATTEMPTS, client_mux_config,
     },
     stream::SocketAddrPair,
 };
@@ -36,6 +35,7 @@ pub struct RtpMuxConnectorConfig {
     pub bind: BindSelector,
     pub bulk_addr: BulkAddrSelector,
     pub fec: bool,
+    pub response_migration: bool,
 }
 
 impl RtpMuxConnectorConfig {
@@ -44,6 +44,7 @@ impl RtpMuxConnectorConfig {
             bind,
             bulk_addr: Arc::new(crate::shared::bulk_lane_addr),
             fec,
+            response_migration: false,
         }
     }
 }
@@ -53,11 +54,17 @@ pub struct OpenedStream {
     pub writer: mux::MigratingStreamWriter,
     pub reader: oneshot::Receiver<StreamReader>,
     pub addr: SocketAddrPair,
+    pub response: Option<(u64, mux::ResponseRouterHandle)>,
 }
 
 impl OpenedStream {
     pub fn into_stream(self) -> ClientStream {
-        ClientStream::new(self.writer, self.reader, self.addr)
+        match self.response {
+            Some((logical_id, router)) => {
+                ClientStream::new_duplex(self.writer, self.reader, self.addr, logical_id, router)
+            }
+            None => ClientStream::new(self.writer, self.reader, self.addr),
+        }
     }
 }
 
@@ -67,6 +74,7 @@ struct ConnectedDualLane {
     nonce: PairingNonce,
     connected_at: Instant,
     opened_streams: u64,
+    response_router: Option<mux::ResponseRouter>,
 }
 
 struct ConnectedDualLaneBirth {
@@ -114,11 +122,14 @@ impl RtpMuxConnector {
             bind,
             bulk_addr,
             fec,
+            response_migration,
         } = config;
         let dialer: DualLaneDialer = Arc::new(move |addr| {
             let bind = Arc::clone(&bind);
             let bulk_addr = Arc::clone(&bulk_addr);
-            Box::pin(async move { connect_dual_lane(addr, bind, bulk_addr, fec).await })
+            Box::pin(async move {
+                connect_dual_lane(addr, bind, bulk_addr, fec, response_migration).await
+            })
         });
         let mut connector = JoinSet::new();
         connector.spawn(run_connector(command_rx, dialer));
@@ -333,10 +344,15 @@ fn send_connected_stream(session: &mut ConnectedDualLane, request: StreamRequest
     session.opened_streams += 1;
     counter!("stream.rtp_mux.rtp_connects").increment(1);
     counter!("stream.rtp_mux.mux_connects").increment(1);
+    let response = session
+        .response_router
+        .as_ref()
+        .map(|router| (stream_id, router.handle()));
     let _ = request.response.send(Ok(OpenedStream {
         writer,
         reader,
         addr: session.addr,
+        response,
     }));
 }
 
@@ -356,13 +372,22 @@ async fn connect_dual_lane(
     bind: BindSelector,
     bulk_addr: BulkAddrSelector,
     fec: bool,
+    response_migration: bool,
 ) -> io::Result<ConnectedDualLaneBirth> {
     let started = Instant::now();
     let mut failures = Vec::new();
 
     for attempt in 1..=MAX_DUAL_CONNECT_ATTEMPTS {
         let attempt_started = Instant::now();
-        match connect_dual_lane_once(addr, Arc::clone(&bind), Arc::clone(&bulk_addr), fec).await {
+        match connect_dual_lane_once(
+            addr,
+            Arc::clone(&bind),
+            Arc::clone(&bulk_addr),
+            fec,
+            response_migration,
+        )
+        .await
+        {
             Ok(birth) => {
                 if attempt > 1 {
                     info!(
@@ -410,6 +435,7 @@ async fn connect_dual_lane_once(
     bind: BindSelector,
     bulk_addr: BulkAddrSelector,
     fec: bool,
+    response_migration: bool,
 ) -> io::Result<ConnectedDualLaneBirth> {
     let bind_addr = bind(addr);
     let bulk_addr = bulk_addr(addr)?;
@@ -465,7 +491,7 @@ async fn connect_dual_lane_once(
         spawn_mux_no_reconnection_with_first_receive_deadline_and_ready(
             interactive_reader,
             interactive_writer,
-            interactive_client_mux_config(),
+            client_mux_config(),
             BIRTH_LIVENESS_DEADLINE,
             &mut interactive_tasks,
         );
@@ -475,7 +501,7 @@ async fn connect_dual_lane_once(
         spawn_mux_no_reconnection_with_first_receive_deadline_and_ready(
             bulk_reader,
             bulk_writer,
-            bulk_client_mux_config(),
+            client_mux_config(),
             BIRTH_LIVENESS_DEADLINE,
             &mut bulk_tasks,
         );
@@ -519,7 +545,12 @@ async fn connect_dual_lane_once(
         }
     }
 
-    drop(accepter);
+    let response_router = if response_migration {
+        Some(mux::spawn_response_router(accepter))
+    } else {
+        drop(accepter);
+        None
+    };
 
     Ok(ConnectedDualLaneBirth {
         session: ConnectedDualLane {
@@ -531,6 +562,7 @@ async fn connect_dual_lane_once(
             nonce,
             connected_at: Instant::now(),
             opened_streams: 0,
+            response_router,
         },
         supervisor,
     })
@@ -544,7 +576,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::shared::{bulk_server_mux_config, interactive_server_mux_config};
+    use crate::shared::server_mux_config;
     use mux::spawn_mux_no_reconnection;
 
     fn spawn_test_connector(
@@ -608,28 +640,28 @@ mod tests {
         let (interactive_opener, interactive_accepter) = spawn_mux_no_reconnection(
             interactive_local_read,
             interactive_local_write,
-            interactive_client_mux_config(),
+            client_mux_config(),
             &mut interactive_local_tasks,
         );
         let mut bulk_local_tasks = JoinSet::new();
         let (bulk_opener, bulk_accepter) = spawn_mux_no_reconnection(
             bulk_local_read,
             bulk_local_write,
-            bulk_client_mux_config(),
+            client_mux_config(),
             &mut bulk_local_tasks,
         );
         let mut interactive_peer_tasks = JoinSet::new();
         let (interactive_peer_opener, interactive_peer_accepter) = spawn_mux_no_reconnection(
             interactive_peer_read,
             interactive_peer_write,
-            interactive_server_mux_config(),
+            server_mux_config(),
             &mut interactive_peer_tasks,
         );
         let mut bulk_peer_tasks = JoinSet::new();
         let (bulk_peer_opener, bulk_peer_accepter) = spawn_mux_no_reconnection(
             bulk_peer_read,
             bulk_peer_write,
-            bulk_server_mux_config(),
+            server_mux_config(),
             &mut bulk_peer_tasks,
         );
         let mut supervisor = JoinSet::new();
@@ -671,6 +703,7 @@ mod tests {
                 nonce: PairingNonce::generate(),
                 connected_at: Instant::now(),
                 opened_streams: 0,
+                response_router: None,
             },
             supervisor,
         }
