@@ -13,10 +13,7 @@ const CHUNK: usize = 64 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn response_migration_end_to_end() {
-    let server = RtpMuxServer::bind("127.0.0.1:0", false)
-        .await
-        .unwrap()
-        .with_response_migration(true);
+    let server = RtpMuxServer::bind("127.0.0.1:0", false).await.unwrap();
     let addr = server.listener().local_addr();
     let saw_duplex = Arc::new(AtomicBool::new(false));
     let saw_duplex_handler = Arc::clone(&saw_duplex);
@@ -38,9 +35,7 @@ async fn response_migration_end_to_end() {
         });
     }));
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
-    let mut config = RtpMuxConnectorConfig::standard(bind, false);
-    config.response_migration = true;
-    let connector = RtpMuxConnector::with_config(config);
+    let connector = RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
     let mut stream = connector.connect_stream(addr).await.unwrap();
     stream.write_all(b"ping").await.unwrap();
     let mut resp = Vec::new();

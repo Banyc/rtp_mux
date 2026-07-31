@@ -9,6 +9,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 enum ReaderState {
+    #[cfg_attr(not(test), allow(dead_code))]
     Pending {
         rx: tokio::sync::oneshot::Receiver<StreamReader>,
     },
@@ -28,20 +29,23 @@ pub struct ClientStream {
     reader_state: ReaderState,
     addr: SocketAddrPair,
     name: mux::StreamName,
+    _session: Option<std::sync::Arc<crate::connector::StreamRebind>>,
 }
 impl ClientStream {
+    #[cfg(test)]
     pub(crate) fn new(
         writer: MigratingStreamWriter,
         reader: tokio::sync::oneshot::Receiver<StreamReader>,
         addr: SocketAddrPair,
     ) -> Self {
-        let write = MigratingWriteHalf::new(writer);
+        let (write, _rebind_tx) = MigratingWriteHalf::new_with_rebind(writer);
         let name = write.name_handle();
         Self {
             write,
             reader_state: ReaderState::Pending { rx: reader },
             addr,
             name,
+            _session: None,
         }
     }
     pub(crate) fn new_duplex(
@@ -50,8 +54,10 @@ impl ClientStream {
         addr: SocketAddrPair,
         logical_id: u64,
         router: mux::ResponseRouterHandle,
+        session: crate::connector::SessionGuard,
     ) -> Self {
-        let write = MigratingWriteHalf::new(writer);
+        let (write, rebind_tx) = MigratingWriteHalf::new_with_rebind(writer);
+        let session = crate::connector::StreamRebind::track(rebind_tx.downgrade(), session);
         let name = write.name_handle();
         let (spliced_tx, spliced_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -68,6 +74,7 @@ impl ClientStream {
             reader_state: ReaderState::PendingSpliced { rx: spliced_rx },
             addr,
             name,
+            _session: Some(session),
         }
     }
     pub fn addr(&self) -> SocketAddrPair {
@@ -159,6 +166,7 @@ impl AsyncWrite for ClientStream {
 mod tests {
     use std::time::Duration;
 
+    use crate::migrating_write_half::{WRITE_MAX_CHUNK, WRITE_QUEUE_CAPACITY};
     use mux::{Initiation, MuxConfig, MuxError};
     use tokio::{io::AsyncWriteExt, task::JoinSet};
 
@@ -267,7 +275,7 @@ mod tests {
                             let _ = accepted_tx.send((reader, writer));
                         }
                     }
-                    mux::AcceptedStream::Plain { .. } => panic!("expected migrating stream"),
+                    _ => panic!("expected migrating stream"),
                 }
             }
         });
@@ -344,7 +352,7 @@ mod tests {
                             let _ = accepted_tx.send((reader, writer, source_lane));
                         }
                     }
-                    mux::AcceptedStream::Plain { .. } => panic!("expected migrating stream"),
+                    _ => panic!("expected migrating stream"),
                 }
             }
         });

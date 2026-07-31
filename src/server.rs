@@ -27,6 +27,7 @@ use crate::{
         PendingLaneAdmission, PendingLaneRegistry, PendingLaneWait, PreparedLane,
         RejectedLaneContext,
     },
+    group::{GroupMember, SessionGroupRegistry},
     shared::{ADMISSION_REJECTION_LOG_INTERVAL, HELLO_DEADLINE, bulk_lane_addr, server_mux_config},
     stream::{ServerStream, SocketAddrPair},
 };
@@ -46,7 +47,6 @@ pub struct RtpMuxServer {
     bulk_listener: rtp::udp::Listener,
     mux: JoinSet<MuxError>,
     fec: bool,
-    response_migration: bool,
 }
 
 enum BirthHeartbeatFailure {
@@ -85,13 +85,7 @@ impl RtpMuxServer {
             bulk_listener,
             mux: JoinSet::new(),
             fec,
-            response_migration: false,
         }
-    }
-
-    pub fn with_response_migration(mut self, enabled: bool) -> Self {
-        self.response_migration = enabled;
-        self
     }
 
     pub fn listener(&self) -> &rtp::udp::Listener {
@@ -114,11 +108,9 @@ impl RtpMuxServer {
             ?bulk_addr,
             "Listening (interactive + bulk dual-lane)"
         );
-        let env = AcceptEnv {
-            handler: Arc::new(handler),
-            response_migration: self.response_migration,
-        };
+        let env: StreamHandler = Arc::new(handler);
         let registry = PendingLaneRegistry::new();
+        let groups = SessionGroupRegistry::new();
         let rejections = LaneRejectionLog::default();
         let mut interactive_backoff = AcceptErrorBackoff::default();
         let mut bulk_backoff = AcceptErrorBackoff::default();
@@ -138,8 +130,10 @@ impl RtpMuxServer {
                 Some(result) = self.mux.join_next() => {
                     match result {
                         Ok(error) => warn!(?error, ?addr, "MUX error"),
-                        Err(error) if error.is_cancelled() => trace!(?error, "MUX task cancelled (normal shutdown/reset)"),
-                        Err(error) => warn!(?error, ?addr, "MUX supervision task failed to join")
+                        Err(error) if error.is_cancelled() => {
+                            trace!(?error, "MUX task cancelled (normal shutdown/reset)")
+                        }
+                        Err(error) => warn!(?error, ?addr, "MUX supervision task failed to join"),
                     }
                 }
                 () = tokio::time::sleep(ADMISSION_REJECTION_LOG_INTERVAL) => rejections.flush(),
@@ -154,12 +148,16 @@ impl RtpMuxServer {
                             interactive_backoff.accepted("rtp_mux_interactive", addr);
                             stream
                         }
-                        Err(error) => match interactive_backoff.failed_dispatching("rtp_mux_interactive", addr, error) {
-                            Ok(()) => {
-                                tokio::task::yield_now().await;
-                                continue;
+                        Err(error) => {
+                            match interactive_backoff
+                                .failed_dispatching("rtp_mux_interactive", addr, error)
+                            {
+                                Ok(()) => {
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                }
+                                Err(source) => return Err(ServeError::Accept { source, addr }),
                             }
-                            Err(source) => return Err(ServeError::Accept { source, addr })
                         }
                     };
                     counter!("stream.rtp_mux.rtp.accepts").increment(1);
@@ -191,6 +189,7 @@ impl RtpMuxServer {
                         },
                         env.clone(),
                         Arc::clone(&registry),
+                        Arc::clone(&groups),
                         rejections.clone(),
                     );
                 }
@@ -205,12 +204,19 @@ impl RtpMuxServer {
                             bulk_backoff.accepted("rtp_mux_bulk", bulk_addr);
                             stream
                         }
-                        Err(error) => match bulk_backoff.failed_dispatching("rtp_mux_bulk", bulk_addr, error) {
-                            Ok(()) => {
-                                tokio::task::yield_now().await;
-                                continue;
+                        Err(error) => {
+                            match bulk_backoff.failed_dispatching("rtp_mux_bulk", bulk_addr, error) {
+                                Ok(()) => {
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                }
+                                Err(source) => {
+                                    return Err(ServeError::Accept {
+                                        source,
+                                        addr: bulk_addr,
+                                    })
+                                }
                             }
-                            Err(source) => return Err(ServeError::Accept { source, addr: bulk_addr })
                         }
                     };
                     counter!("stream.rtp_mux.rtp.accepts").increment(1);
@@ -242,6 +248,7 @@ impl RtpMuxServer {
                         },
                         env.clone(),
                         Arc::clone(&registry),
+                        Arc::clone(&groups),
                         rejections.clone(),
                     );
                 }
@@ -256,16 +263,11 @@ async fn finish_frame_delivery_accept(
     accept?.await.map_err(io::Error::other)?
 }
 
-#[derive(Clone)]
-struct AcceptEnv {
-    handler: StreamHandler,
-    response_migration: bool,
-}
-
 fn spawn_lane_accept(
     admitted: AdmittedLane,
-    env: AcceptEnv,
+    env: StreamHandler,
     registry: Arc<PendingLaneRegistry>,
+    groups: Arc<SessionGroupRegistry>,
     rejections: LaneRejectionLog,
 ) {
     let AdmittedLane {
@@ -279,7 +281,7 @@ fn spawn_lane_accept(
     } = admitted;
     tokio::spawn(async move {
         let started = Instant::now();
-        let (class, nonce) =
+        let (class, nonce, group) =
             match tokio::time::timeout(HELLO_DEADLINE, read_lane_hello(&mut read)).await {
                 Ok(Ok(result)) => result,
                 Err(_) => {
@@ -340,8 +342,26 @@ fn spawn_lane_accept(
             counter!("stream.rtp_mux.class_mismatch").increment(1);
             return;
         }
+        if groups.is_full(&group) {
+            signal_rejected_lane(
+                &mut write,
+                &rejections,
+                RejectedLaneContext {
+                    class: LaneRejectionClass::GroupFull,
+                    peer,
+                    local_addr,
+                    expected_class: Some(expected_class),
+                    reason: "session group is full".to_string(),
+                },
+                elapsed,
+            )
+            .await;
+            drop(permit);
+            counter!("stream.rtp_mux.group_full").increment(1);
+            return;
+        }
         let mut permit = Some(permit);
-        match registry.admit(nonce, class, peer, local_addr, &mut permit) {
+        match registry.admit(nonce, class, peer, local_addr, group, &mut permit) {
             PendingLaneAdmission::Reserved => {
                 if let Err(failure) = write_birth_heartbeat_result(&mut write).await {
                     registry.cancel_reservation(nonce, peer, class);
@@ -407,9 +427,10 @@ fn spawn_lane_accept(
                             ),
                             peer,
                             local_addr,
+                            group,
                             _permit: permit.take().unwrap(),
                         };
-                        pair_lanes_inner(lane, other, env.clone(), nonce);
+                        pair_lanes_inner(lane, other, env.clone(), nonce, &groups);
                     }
                     PendingLaneWait::Timeout => {
                         signal_rejected_lane(
@@ -474,9 +495,10 @@ fn spawn_lane_accept(
                     pending: mux::PendingAcceptor::new(class, nonce, opener, accepter, tasks),
                     peer,
                     local_addr,
+                    group,
                     _permit: permit.take().unwrap(),
                 };
-                pair_lanes_inner(lane, other, env.clone(), nonce);
+                pair_lanes_inner(lane, other, env.clone(), nonce, &groups);
             }
             PendingLaneAdmission::Reject(reason) => {
                 signal_rejected_lane(
@@ -574,7 +596,13 @@ fn record_rejected_lane(
     rejections.record(context);
 }
 
-fn pair_lanes_inner(lane_a: PendingLane, lane_b: PendingLane, env: AcceptEnv, nonce: PairingNonce) {
+fn pair_lanes_inner(
+    lane_a: PendingLane,
+    lane_b: PendingLane,
+    env: StreamHandler,
+    nonce: PairingNonce,
+    groups: &Arc<SessionGroupRegistry>,
+) {
     counter!("stream.rtp_mux.paired").increment(1);
     let addrs = classify_lane_addrs(
         lane_a.pending.class,
@@ -583,7 +611,7 @@ fn pair_lanes_inner(lane_a: PendingLane, lane_b: PendingLane, env: AcceptEnv, no
         lane_b.peer,
         lane_b.local_addr,
     );
-    pair_lanes(lane_a, lane_b, env, addrs, nonce);
+    pair_lanes(lane_a, lane_b, env, addrs, nonce, groups);
 }
 
 async fn run_pending_lane_expiry(registry: Arc<PendingLaneRegistry>, rejections: LaneRejectionLog) {
@@ -646,20 +674,31 @@ fn classify_lane_addrs(
 fn pair_lanes(
     lane_a: PendingLane,
     lane_b: PendingLane,
-    env: AcceptEnv,
+    env: StreamHandler,
     addrs: DualLaneSocketAddrs,
     nonce: PairingNonce,
+    groups: &Arc<SessionGroupRegistry>,
 ) {
+    let group_token = lane_a.group;
     let mut tasks = JoinSet::new();
     match complete_pairing(lane_a.pending, lane_b.pending, &mut tasks) {
         Ok((opener, accepter)) => {
+            let member = match groups.join(group_token, opener.clone()) {
+                Ok(member) => member,
+                Err(reason) => {
+                    warn!(reason, ?nonce, dn_interactive = ?addrs.interactive_peer, "RTP mux session rejected at group join");
+                    counter!("stream.rtp_mux.group_full").increment(1);
+                    return;
+                }
+            };
             let addr = SocketAddrPair {
                 local_addr: addrs.interactive_local,
                 peer_addr: addrs.interactive_peer,
             };
             tokio::spawn(async move {
                 let paired_at = Instant::now();
-                let accepted_streams = run_dual_mux_accepter(accepter, opener, addr, env).await;
+                let accepted_streams =
+                    run_dual_mux_accepter(accepter, opener, addr, env, member).await;
                 let error = match tasks.join_next().await {
                     Some(Ok(error)) => error,
                     Some(Err(source)) => MuxError::TaskJoin {
@@ -668,30 +707,11 @@ fn pair_lanes(
                     },
                     None => MuxError::TaskStopped { task: "dual_lane" },
                 };
-                warn!(
-                    event = "rtp_mux_session_terminated",
-                    ?error,
-                    ?nonce,
-                    dn_interactive = ?addrs.interactive_peer,
-                    dn_interactive_local = ?addrs.interactive_local,
-                    dn_bulk = ?addrs.bulk_peer,
-                    dn_bulk_local = ?addrs.bulk_local,
-                    accepted_streams,
-                    uptime_ms = paired_at.elapsed().as_millis(),
-                    "RTP mux dual-lane session terminated"
-                );
+                warn!(event = "rtp_mux_session_terminated", ?error, ?nonce, dn_interactive = ?addrs.interactive_peer, dn_interactive_local = ?addrs.interactive_local, dn_bulk = ?addrs.bulk_peer, dn_bulk_local = ?addrs.bulk_local, accepted_streams, uptime_ms = paired_at.elapsed().as_millis(), "RTP mux dual-lane session terminated");
             });
         }
         Err(error) => {
-            warn!(
-                ?error,
-                ?nonce,
-                dn_interactive = ?addrs.interactive_peer,
-                dn_interactive_local = ?addrs.interactive_local,
-                dn_bulk = ?addrs.bulk_peer,
-                dn_bulk_local = ?addrs.bulk_local,
-                "RTP mux dual-lane pairing failed"
-            );
+            warn!(?error, ?nonce, dn_interactive = ?addrs.interactive_peer, dn_interactive_local = ?addrs.interactive_local, dn_bulk = ?addrs.bulk_peer, dn_bulk_local = ?addrs.bulk_local, "RTP mux dual-lane pairing failed");
             counter!("stream.rtp_mux.pairing_timeout").increment(1);
         }
     }
@@ -701,14 +721,10 @@ async fn run_dual_mux_accepter(
     accepter: mux::DualStreamAccepter,
     opener: mux::DualStreamOpener,
     addr: SocketAddrPair,
-    env: AcceptEnv,
+    handler: StreamHandler,
+    member: GroupMember,
 ) -> u64 {
-    let mut accepter = if env.response_migration {
-        accepter.into_migrating_duplex(opener)
-    } else {
-        drop(opener);
-        accepter.into_migrating_only()
-    };
+    let mut accepter = accepter.into_migrating_duplex_shared(opener, member.feed());
     let mut accepted_streams = 0;
     loop {
         let accepted = match accepter.accept().await {
@@ -730,12 +746,17 @@ async fn run_dual_mux_accepter(
                 reader,
                 writer,
                 source_lane,
-            } => ServerStream::MigratingDuplex {
-                reader,
-                writer: crate::migrating_write_half::MigratingWriteHalf::new(writer),
-                addr,
-                source_lane,
-            },
+            } => {
+                let (writer, rebind_tx) =
+                    crate::migrating_write_half::MigratingWriteHalf::new_with_rebind(writer);
+                member.register_writer(&rebind_tx);
+                ServerStream::MigratingDuplex {
+                    reader,
+                    writer,
+                    addr,
+                    source_lane,
+                }
+            }
             AcceptedStream::Plain {
                 reader,
                 writer,
@@ -748,7 +769,7 @@ async fn run_dual_mux_accepter(
             },
         };
         counter!("stream.rtp_mux.accepts").increment(1);
-        (env.handler)(stream);
+        handler(stream);
         accepted_streams += 1;
     }
     accepted_streams

@@ -48,6 +48,7 @@ pub struct MigratingWriteHalf {
     shutdown_started: bool,
     shutdown_complete: bool,
     name: mux::StreamName,
+    _rebind_tx: tokio::sync::mpsc::Sender<mux::DualStreamOpener>,
     _background_writer: tokio::task::JoinHandle<()>,
 }
 impl fmt::Debug for MigratingWriteHalf {
@@ -56,14 +57,34 @@ impl fmt::Debug for MigratingWriteHalf {
     }
 }
 impl MigratingWriteHalf {
-    pub(crate) fn new(mut writer: MigratingStreamWriter) -> Self {
+    pub(crate) fn new_with_rebind(
+        mut writer: MigratingStreamWriter,
+    ) -> (Self, tokio::sync::mpsc::Sender<mux::DualStreamOpener>) {
         let name = writer.name_handle();
         let (write_tx, mut write_rx) =
             tokio::sync::mpsc::channel::<WriteCommand>(WRITE_QUEUE_CAPACITY);
+        let (rebind_tx, mut rebind_rx) = tokio::sync::mpsc::channel::<mux::DualStreamOpener>(1);
         let background_error: Arc<Mutex<Option<BackgroundWriteError>>> = Arc::new(Mutex::new(None));
         let background_error_clone = Arc::clone(&background_error);
         let background_writer = tokio::spawn(async move {
-            while let Some(command) = write_rx.recv().await {
+            let mut rebind_open = true;
+            loop {
+                let command = tokio::select! {
+                    biased;
+                    opener = rebind_rx.recv(), if rebind_open => {
+                        match opener {
+                            Some(opener) => {
+                                let _ = writer.rebind(opener).await;
+                            }
+                            None => rebind_open = false,
+                        }
+                        continue;
+                    }
+                    command = write_rx.recv() => match command {
+                        Some(command) => command,
+                        None => break,
+                    },
+                };
                 match command {
                     WriteCommand::Data(buf) => {
                         if let Err(error) = writer.write_all(&buf).await {
@@ -101,15 +122,17 @@ impl MigratingWriteHalf {
             }
             let _ = writer.finalize().await;
         });
-        Self {
+        let half = Self {
             write_tx: tokio_util::sync::PollSender::new(write_tx),
             pending_control: None,
             background_error,
             shutdown_started: false,
             shutdown_complete: false,
             name,
+            _rebind_tx: rebind_tx.clone(),
             _background_writer: background_writer,
-        }
+        };
+        (half, rebind_tx)
     }
     pub fn name_handle(&self) -> mux::StreamName {
         self.name.clone()
