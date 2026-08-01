@@ -1,4 +1,5 @@
 use crate::shared::{MAX_PENDING_LANES, MAX_PENDING_LANES_PER_PEER, PAIRING_DEADLINE};
+use metrics::counter;
 use mux::{GroupToken, LaneClass, PairingNonce};
 use rtp::socket::{FrameReader, FrameWriter};
 use std::{
@@ -146,6 +147,33 @@ pub(crate) enum LaneRejectionClass {
     BirthHeartbeat,
     ReservationLost,
 }
+impl LaneRejectionClass {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Capacity,
+        Self::HelloTimeout,
+        Self::HelloParse,
+        Self::ClassMismatch,
+        Self::Admission,
+        Self::GroupFull,
+        Self::PairingTimeout,
+        Self::BirthHeartbeat,
+        Self::ReservationLost,
+    ];
+    pub(crate) fn metric_name(self) -> &'static str {
+        match self {
+            Self::Capacity => "stream.rtp_mux.capacity_rejected",
+            Self::HelloTimeout => "stream.rtp_mux.hello_timeout",
+            Self::HelloParse => "stream.rtp_mux.hello_parse_error",
+            Self::ClassMismatch => "stream.rtp_mux.class_mismatch",
+            Self::Admission => "stream.rtp_mux.admission_rejected",
+            Self::GroupFull => "stream.rtp_mux.group_full",
+            Self::PairingTimeout => "stream.rtp_mux.pairing_timeout",
+            Self::BirthHeartbeat => "stream.rtp_mux.birth_heartbeat_error",
+            Self::ReservationLost => "stream.rtp_mux.reservation_lost",
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub(crate) struct RejectedLaneContext {
     pub(crate) class: LaneRejectionClass,
@@ -171,6 +199,7 @@ pub(crate) struct LaneRejectionLog {
 }
 impl LaneRejectionLog {
     pub(crate) fn record(&self, context: RejectedLaneContext) {
+        counter!(context.class.metric_name()).increment(1);
         let mut summary = self.inner.summary.lock().unwrap();
         summary.total = summary.total.saturating_add(1);
         *summary.by_class.entry(context.class).or_default() = summary
@@ -181,6 +210,11 @@ impl LaneRejectionLog {
             .saturating_add(1);
         summary.first.get_or_insert_with(|| context.clone());
         summary.last = Some(context);
+    }
+    #[cfg(test)]
+    pub(crate) fn recorded(&self, class: LaneRejectionClass) -> u64 {
+        let summary = self.inner.summary.lock().unwrap();
+        summary.by_class.get(&class).copied().unwrap_or_default()
     }
     pub(crate) fn flush(&self) {
         let summary = {
@@ -402,23 +436,24 @@ impl PendingLaneRegistry {
         drop(state);
         PendingLaneWaitStep::Wait
     }
+    #[allow(clippy::result_large_err)]
     pub(crate) fn restore_ready(
         &self,
         nonce: PairingNonce,
         lane: PendingLane,
         expires_at: Instant,
-    ) {
+    ) -> Result<(), PendingLane> {
         let mut state = self.state.lock().unwrap();
         if state.entries.contains_key(&nonce) {
             drop(state);
-            drop(lane);
-            return;
+            return Err(lane);
         }
         state
             .entries
             .insert(nonce, PendingLaneEntry::Ready { lane, expires_at });
         drop(state);
         self.changed.notify_one();
+        Ok(())
     }
     pub(crate) fn cancel_reservation(
         &self,
@@ -493,6 +528,75 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
+
+    fn test_pending_lane(
+        registry: &Arc<PendingLaneRegistry>,
+        nonce: PairingNonce,
+        peer: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> PendingLane {
+        let (io, _peer_io) = tokio::io::duplex(64);
+        let (read, write) = tokio::io::split(io);
+        let mut tasks = tokio::task::JoinSet::new();
+        let (opener, accepter) = mux::spawn_mux_no_reconnection(
+            read,
+            write,
+            mux::MuxConfig::new(mux::Initiation::Server, Duration::from_secs(5)),
+            &mut tasks,
+        );
+        PendingLane {
+            pending: mux::PendingAcceptor::new(
+                LaneClass::Interactive,
+                nonce,
+                opener,
+                accepter,
+                tasks,
+            ),
+            peer,
+            local_addr,
+            group: GroupToken::generate(),
+            _permit: registry.try_acquire(peer.ip()).unwrap(),
+        }
+    }
+    #[test]
+    fn every_lane_rejection_class_has_its_own_metric() {
+        let mut seen: HashMap<&'static str, LaneRejectionClass> = HashMap::new();
+        for class in LaneRejectionClass::ALL {
+            if let Some(other) = seen.insert(class.metric_name(), class) {
+                panic!(
+                    "{:?} and {:?} both count into {:?}, so the counter cannot say which one fired",
+                    class,
+                    other,
+                    class.metric_name(),
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn restore_ready_hands_back_the_lane_it_cannot_restore() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut permit = Some(registry.try_acquire(peer.ip()).unwrap());
+        registry.admit(
+            nonce,
+            LaneClass::Bulk,
+            peer,
+            local,
+            GroupToken::generate(),
+            &mut permit,
+        );
+        let restored = registry.restore_ready(
+            nonce,
+            test_pending_lane(&registry, nonce, peer, local),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(
+            restored.is_err(),
+            "a lane that could not be restored was dropped inside the registry, so nothing upstream can record that it was lost",
+        );
+    }
 
     #[test]
     fn pending_lane_registry_try_acquire_within_limits() {

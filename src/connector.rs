@@ -90,6 +90,7 @@ struct Session {
     router: mux::ResponseRouterHandle,
     kill_tx: tokio::sync::mpsc::Sender<()>,
     streams: Mutex<Vec<std::sync::Weak<StreamRebind>>>,
+    successor: Mutex<Option<Arc<Session>>>,
 }
 
 impl Session {
@@ -115,6 +116,15 @@ impl Session {
         let mut streams = self.streams.lock().unwrap();
         streams.retain(|weak| weak.strong_count() > 0);
         streams.push(stream);
+    }
+    fn track_if_current(&self, stream: std::sync::Weak<StreamRebind>) -> bool {
+        let mut streams = self.streams.lock().unwrap();
+        if self.successor.lock().unwrap().is_some() {
+            return false;
+        }
+        streams.retain(|weak| weak.strong_count() > 0);
+        streams.push(stream);
+        true
     }
     fn kill(&self) {
         let _ = self.kill_tx.try_send(());
@@ -142,13 +152,13 @@ impl fmt::Debug for SessionGuard {
 }
 
 pub(crate) struct StreamRebind {
-    rebind: tokio::sync::mpsc::WeakSender<mux::DualStreamOpener>,
+    rebind: crate::migrating_write_half::RebindHandle,
     guard: Mutex<SessionGuard>,
 }
 
 impl StreamRebind {
     pub(crate) fn track(
-        rebind: tokio::sync::mpsc::WeakSender<mux::DualStreamOpener>,
+        rebind: crate::migrating_write_half::RebindHandle,
         guard: SessionGuard,
     ) -> Arc<Self> {
         let session = Arc::clone(guard.session());
@@ -156,10 +166,34 @@ impl StreamRebind {
             rebind,
             guard: Mutex::new(guard),
         });
-        session.track(Arc::downgrade(&handle));
+        if !session.track_if_current(Arc::downgrade(&handle)) {
+            let live = latest_generation(&session);
+            match Arc::ptr_eq(&live, &session) {
+                true => session.track(Arc::downgrade(&handle)),
+                false => {
+                    rebind_one(&handle, &live);
+                }
+            }
+        }
         handle
     }
 }
+
+fn latest_generation(session: &Arc<Session>) -> Arc<Session> {
+    let mut newest_live = Arc::clone(session);
+    let mut cursor = Arc::clone(session);
+    for _ in 0..MAX_SUCCESSOR_HOPS {
+        let Some(next) = cursor.successor.lock().unwrap().clone() else {
+            break;
+        };
+        cursor = next;
+        if cursor.opener.is_alive() {
+            newest_live = Arc::clone(&cursor);
+        }
+    }
+    newest_live
+}
+const MAX_SUCCESSOR_HOPS: usize = 8;
 
 impl fmt::Debug for StreamRebind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -169,6 +203,11 @@ impl fmt::Debug for StreamRebind {
 
 type SharedSessions = Arc<Mutex<HashMap<SocketAddr, Arc<Session>>>>;
 type SharedDraining = Arc<Mutex<HashMap<SocketAddr, std::sync::Weak<Session>>>>;
+
+fn live_session(sessions: &SharedSessions, addr: SocketAddr) -> Option<Arc<Session>> {
+    let session = sessions.lock().unwrap().get(&addr).cloned()?;
+    session.opener.is_alive().then_some(session)
+}
 
 struct ConnectedDualLaneBirth {
     opener: mux::DualStreamOpener,
@@ -182,6 +221,7 @@ struct ConnectedDualLaneBirth {
 struct AddrGroup {
     token: GroupToken,
     router: Option<mux::ResponseRouter>,
+    sessions: Vec<std::sync::Weak<Session>>,
 }
 
 type DualLaneDial = Pin<
@@ -313,8 +353,7 @@ impl RtpMuxConnector {
         addr: SocketAddr,
         lane: LaneClass,
     ) -> io::Result<OpenedStream> {
-        let session = self.sessions.lock().unwrap().get(&addr).cloned();
-        if let Some(session) = session {
+        if let Some(session) = live_session(&self.sessions, addr) {
             return Ok(session.open_stream(lane));
         }
         let (response, result) = oneshot::channel();
@@ -396,11 +435,6 @@ impl RtpMuxConnector {
     }
 
     pub async fn reset(&self) -> io::Result<()> {
-        for (_, weak) in self.draining.lock().unwrap().drain() {
-            if let Some(session) = weak.upgrade() {
-                session.kill();
-            }
-        }
         let (completed, done) = oneshot::channel();
         self.commands
             .send(ConnectorCommand::Reset { completed })
@@ -482,28 +516,58 @@ fn install_session(
         router,
         kill_tx,
         streams: Mutex::new(Vec::new()),
+        successor: Mutex::new(None),
     });
     spawn_session_watcher(supervisors, addr, session.id, supervisor, kill_rx);
+    let group = groups
+        .get_mut(&addr)
+        .expect("dial started without an address group");
+    group.sessions.retain(|weak| weak.strong_count() > 0);
+    group.sessions.push(Arc::downgrade(&session));
     session
 }
 
+fn prune_dead_addresses(
+    groups: &mut HashMap<SocketAddr, AddrGroup>,
+    explorers: &mut HashMap<SocketAddr, Explorer<SocketCandidate>>,
+    in_flight_dials: &HashSet<SocketAddr>,
+) {
+    groups.retain(|addr, group| {
+        group.sessions.retain(|weak| weak.strong_count() > 0);
+        in_flight_dials.contains(addr) || !group.sessions.is_empty()
+    });
+    explorers.retain(|addr, _| groups.contains_key(addr));
+}
+
+fn rebind_one(stream: &Arc<StreamRebind>, new: &Arc<Session>) -> bool {
+    if !stream.rebind.rebind(new.opener.clone()) {
+        return false;
+    }
+    *stream.guard.lock().unwrap() = new.guard();
+    new.track(Arc::downgrade(stream));
+    true
+}
+
 fn rebind_streams(old: &Session, new: &Arc<Session>) -> usize {
-    let handles: Vec<_> = old.streams.lock().unwrap().drain(..).collect();
+    if !new.opener.is_alive() {
+        return 0;
+    }
+    let handles: Vec<_> = {
+        let mut streams = old.streams.lock().unwrap();
+        let handles: Vec<_> = streams.drain(..).collect();
+        *old.successor.lock().unwrap() = Some(Arc::clone(new));
+        handles
+    };
     let mut moved = 0;
     for weak in handles {
         let Some(stream) = weak.upgrade() else {
             continue;
         };
-        let Some(tx) = stream.rebind.upgrade() else {
+        if !rebind_one(&stream, new) {
+            trace!(up = ?old.addr.peer_addr, "RTP mux stream writer gone before rebind");
             continue;
-        };
-        if tx.try_send(new.opener.clone()).is_ok() {
-            *stream.guard.lock().unwrap() = new.guard();
-            new.track(Arc::downgrade(&stream));
-            moved += 1;
-        } else {
-            warn!(up = ?old.addr.peer_addr, "RTP mux stream rebind channel saturated; stream stays on the draining session",);
         }
+        moved += 1;
     }
     moved
 }
@@ -553,6 +617,7 @@ async fn run_connector(
                 .or_insert_with(|| AddrGroup {
                     token: GroupToken::generate(),
                     router: None,
+                    sessions: Vec::new(),
                 })
                 .token;
             if let Some(ctx) = &explorer_ctx {
@@ -618,6 +683,7 @@ async fn run_connector(
                     Err(error) if error.is_cancelled() => trace!(?error, "Dual-lane MUX task cancelled"),
                     Err(error) => warn!(?error, "Dual-lane MUX supervision task failed to join"),
                 }
+                prune_dead_addresses(&mut groups, &mut explorers, &in_flight_dials);
             }
             Some((addr, result)) = pending_dials.next() => {
                 in_flight_dials.remove(&addr);
@@ -626,7 +692,7 @@ async fn run_connector(
                     Ok(mut birth) => {
                         let probe_tap = birth.probe_tap.take();
                         if let Some(explorer) = explorers.get_mut(&addr) {
-                            explorer.set_active(probe_tap.map(|tap| Box::new(tap) as Box<dyn ProbeIo>), Instant::now());
+                            explorer.set_active(probe_tap.map(|tap| (Box::new(tap) as Box<dyn ProbeIo>, birth.local_addr)), Instant::now());
                         }
                         let session = install_session(addr, birth, &mut groups, &mut supervisors);
                         if let Some(old) = &recycled_old {
@@ -655,6 +721,7 @@ async fn run_connector(
                                 let _ = waiter.response.send(Err(io::Error::new(kind, message.clone())));
                             }
                         }
+                        prune_dead_addresses(&mut groups, &mut explorers, &in_flight_dials);
                     }
                 }
             }
@@ -664,6 +731,11 @@ async fn run_connector(
                     ConnectorCommand::Reset { completed } => {
                         for (_, session) in sessions.lock().unwrap().drain() {
                             session.kill();
+                        }
+                        for (_, weak) in draining.lock().unwrap().drain() {
+                            if let Some(session) = weak.upgrade() {
+                                session.kill();
+                            }
                         }
                         for (_, waiters) in dial_waiters.drain() {
                             for waiter in waiters {
@@ -682,6 +754,10 @@ async fn run_connector(
                         if drainer_alive || in_flight_dials.contains(&addr) {
                             continue;
                         }
+                        if pending_dials.len() >= MAX_CONCURRENT_DUAL_DIALS {
+                            debug!(up = ?addr, pending = pending_dials.len(), "RTP mux recycle skipped; dial capacity is saturated");
+                            continue;
+                        }
                         if only_if_better && !explorers.get(&addr).is_some_and(Explorer::should_reoptimize) {
                             trace!(up = ?addr, "RTP mux reoptimize: no candidate beats the active tuple by margin");
                             continue;
@@ -697,17 +773,14 @@ async fn run_connector(
                         let _ = response.send(report);
                     }
                     ConnectorCommand::Connect { addr, lane, response } => {
-                        let session = sessions.lock().unwrap().get(&addr).cloned();
-                        if let Some(session) = session {
+                        if let Some(session) = live_session(&sessions, addr) {
                             if !response.is_closed() {
                                 let _ = response.send(Ok(session.open_stream(lane)));
                             }
                             continue;
                         }
                         let request = StreamRequest { lane, response };
-                        let waiters = dial_waiters.entry(addr).or_default();
-                        waiters.retain(|waiter| !waiter.response.is_closed());
-                        if waiters.len() >= MAX_DIAL_WAITERS_PER_ADDR {
+                        if live_dial_waiters(&mut dial_waiters, addr) >= MAX_DIAL_WAITERS_PER_ADDR {
                             let _ = request.response.send(Err(io::Error::new(io::ErrorKind::WouldBlock, format!("too many dial waiters for {addr} (max {MAX_DIAL_WAITERS_PER_ADDR})"))));
                             continue;
                         }
@@ -716,7 +789,7 @@ async fn run_connector(
                             let _ = request.response.send(Err(io::Error::new(io::ErrorKind::WouldBlock, "too many concurrent dual dials")));
                             continue;
                         }
-                        waiters.push(request);
+                        dial_waiters.entry(addr).or_default().push(request);
                         if !is_in_flight {
                             start_dial(addr, &mut groups, &mut pending_dials, &mut in_flight_dials, &mut explorers);
                         }
@@ -730,6 +803,19 @@ async fn run_connector(
 struct StreamRequest {
     lane: LaneClass,
     response: oneshot::Sender<io::Result<OpenedStream>>,
+}
+
+fn live_dial_waiters(
+    dial_waiters: &mut HashMap<SocketAddr, Vec<StreamRequest>>,
+    addr: SocketAddr,
+) -> usize {
+    match dial_waiters.get_mut(&addr) {
+        Some(waiters) => {
+            waiters.retain(|waiter| !waiter.response.is_closed());
+            waiters.len()
+        }
+        None => 0,
+    }
 }
 
 fn dual_supervisor_result(result: Option<Result<MuxError, tokio::task::JoinError>>) -> MuxError {
@@ -946,16 +1032,89 @@ mod tests {
         tokio::sync::mpsc::Sender<ConnectorCommand>,
         tokio::task::JoinHandle<()>,
     ) {
+        let (commands, coordinator, _sessions) = spawn_test_connector_with_sessions(dialer);
+        (commands, coordinator)
+    }
+
+    fn spawn_test_connector_with_sessions(
+        dialer: DualLaneDialer,
+    ) -> (
+        tokio::sync::mpsc::Sender<ConnectorCommand>,
+        tokio::task::JoinHandle<()>,
+        SharedSessions,
+    ) {
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let draining: SharedDraining = Arc::new(Mutex::new(HashMap::new()));
-        let coordinator = tokio::spawn(run_connector(command_rx, dialer, None, sessions, draining));
-        (commands, coordinator)
+        let coordinator = tokio::spawn(run_connector(
+            command_rx,
+            dialer,
+            None,
+            Arc::clone(&sessions),
+            draining,
+        ));
+        (commands, coordinator, sessions)
+    }
+
+    fn spawn_test_connector_with_explorer(
+        dialer: DualLaneDialer,
+    ) -> (
+        tokio::sync::mpsc::Sender<ConnectorCommand>,
+        tokio::task::JoinHandle<()>,
+        SharedSessions,
+    ) {
+        let (commands, command_rx) = tokio::sync::mpsc::channel(1);
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let draining: SharedDraining = Arc::new(Mutex::new(HashMap::new()));
+        let explorer = ExplorerContext {
+            config: ExplorerConfig {
+                enabled: true,
+                candidates: 1,
+                probe_mean_interval: Duration::from_secs(3600),
+                rotation_period: Duration::from_secs(3600),
+            },
+            bind: Arc::new(|_| SocketAddr::from(([127, 0, 0, 1], 0))),
+        };
+        let coordinator = tokio::spawn(run_connector(
+            command_rx,
+            dialer,
+            Some(explorer),
+            Arc::clone(&sessions),
+            draining,
+        ));
+        (commands, coordinator, sessions)
+    }
+
+    async fn explorer_candidates(
+        commands: &tokio::sync::mpsc::Sender<ConnectorCommand>,
+        addr: SocketAddr,
+    ) -> usize {
+        let (response, result) = oneshot::channel();
+        commands
+            .send(ConnectorCommand::ExplorerReport { addr, response })
+            .await
+            .unwrap();
+        result.await.unwrap().candidates.len()
     }
 
     async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
         for _ in 0..1000 {
             if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    async fn wait_for_candidates(
+        commands: &tokio::sync::mpsc::Sender<ConnectorCommand>,
+        addr: SocketAddr,
+        want: usize,
+        what: &str,
+    ) {
+        for _ in 0..1000 {
+            if explorer_candidates(commands, addr).await == want {
                 return;
             }
             tokio::task::yield_now().await;
@@ -1077,11 +1236,330 @@ mod tests {
         }
     }
 
+    async fn fake_dead_birth() -> ConnectedDualLaneBirth {
+        let lane = || {
+            let (local, peer) = tokio::io::duplex(64 * 1024);
+            drop(peer);
+            let (read, write) = tokio::io::split(local);
+            let mut tasks = JoinSet::new();
+            let (opener, accepter) =
+                spawn_mux_no_reconnection(read, write, client_mux_config(), &mut tasks);
+            (opener, accepter, tasks)
+        };
+        let (int_opener, int_accepter, int_tasks) = lane();
+        let (bulk_opener, bulk_accepter, bulk_tasks) = lane();
+        let mut supervisor = JoinSet::new();
+        let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
+            int_opener,
+            int_accepter,
+            int_tasks,
+            bulk_opener,
+            bulk_accepter,
+            bulk_tasks,
+            &mut supervisor,
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while opener.is_alive() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a dual-lane session with no peer left must go down");
+        ConnectedDualLaneBirth {
+            opener,
+            accepter,
+            local_addr: "192.0.2.100:40001".parse().unwrap(),
+            nonce: PairingNonce::generate(),
+            supervisor,
+            probe_tap: None,
+        }
+    }
+
+    fn one_address_group(addr: SocketAddr) -> HashMap<SocketAddr, AddrGroup> {
+        HashMap::from([(
+            addr,
+            AddrGroup {
+                token: GroupToken::generate(),
+                router: None,
+                sessions: Vec::new(),
+            },
+        )])
+    }
+
+    #[tokio::test]
+    async fn a_recycle_onto_a_dead_session_leaves_streams_where_they_are() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let mut groups = one_address_group(addr);
+        let mut supervisors = JoinSet::new();
+        let old = install_session(
+            addr,
+            fake_connected_birth(addr, None),
+            &mut groups,
+            &mut supervisors,
+        );
+        let dead = install_session(addr, fake_dead_birth().await, &mut groups, &mut supervisors);
+        let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
+        let _stream = StreamRebind::track(slot.handle(), old.guard());
+        assert_eq!(old.live_streams.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            rebind_streams(&old, &dead),
+            0,
+            "no stream may be moved onto a session that is already down"
+        );
+        assert!(
+            slot.take().is_none(),
+            "a live stream was repointed at a dead session"
+        );
+        assert_eq!(old.live_streams.load(Ordering::Relaxed), 1);
+        assert!(
+            old.successor.lock().unwrap().is_none(),
+            "a dead session must not be published as the successor",
+        );
+        let live = install_session(
+            addr,
+            fake_connected_birth(addr, None),
+            &mut groups,
+            &mut supervisors,
+        );
+        assert_eq!(rebind_streams(&old, &live), 1);
+        assert!(slot.take().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_connect_does_not_hand_out_a_stream_on_a_dead_session() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let dialer: DualLaneDialer = Arc::new({
+            let dials = Arc::clone(&dials);
+            move |addr, _group, _socket| {
+                dials.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
+            }
+        });
+        let (commands, coordinator, sessions) = spawn_test_connector_with_sessions(dialer);
+        let mut groups = one_address_group(addr);
+        let mut supervisors = JoinSet::new();
+        let dead = install_session(addr, fake_dead_birth().await, &mut groups, &mut supervisors);
+        let dead_id = dead.id;
+        sessions.lock().unwrap().insert(addr, dead);
+        let stream = enqueue(&commands, addr).await.await.unwrap().unwrap();
+        assert_eq!(
+            dials.load(Ordering::Relaxed),
+            1,
+            "a connect was served off a session that is already down instead of dialing",
+        );
+        assert_ne!(
+            sessions.lock().unwrap().get(&addr).unwrap().id,
+            dead_id,
+            "the dead session is still the one serving this address",
+        );
+        drop(stream);
+        stop(commands, coordinator).await;
+    }
+
+    #[tokio::test]
+    async fn a_late_tracked_stream_skips_a_successor_that_has_died() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let mut groups = one_address_group(addr);
+        let mut supervisors = JoinSet::new();
+        let old = install_session(
+            addr,
+            fake_connected_birth(addr, None),
+            &mut groups,
+            &mut supervisors,
+        );
+        let dead = install_session(addr, fake_dead_birth().await, &mut groups, &mut supervisors);
+        *old.successor.lock().unwrap() = Some(Arc::clone(&dead));
+        let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
+        let _stream = StreamRebind::track(slot.handle(), old.guard());
+        assert!(
+            slot.take().is_none(),
+            "the stream was repointed at a dead successor",
+        );
+        assert_eq!(
+            old.live_streams.load(Ordering::Relaxed),
+            1,
+            "the stream must stay on the generation that is still reachable",
+        );
+        assert_eq!(dead.live_streams.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stream_registering_during_the_drain_is_not_stranded() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let mut groups = one_address_group(addr);
+        let mut supervisors = JoinSet::new();
+        let old = install_session(
+            addr,
+            fake_connected_birth(addr, None),
+            &mut groups,
+            &mut supervisors,
+        );
+        let new = install_session(
+            addr,
+            fake_connected_birth(addr, None),
+            &mut groups,
+            &mut supervisors,
+        );
+        let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
+        let held = old.streams.lock().unwrap();
+        let registering = {
+            let old = Arc::clone(&old);
+            let handle = slot.handle();
+            std::thread::spawn(move || StreamRebind::track(handle, old.guard()))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        *old.successor.lock().unwrap() = Some(Arc::clone(&new));
+        drop(held);
+        let _stream = registering.join().unwrap();
+        assert!(
+            slot.take().is_some(),
+            "a stream that registered during the drain was left on the drained generation",
+        );
+        assert_eq!(new.live_streams.load(Ordering::Relaxed), 1);
+        assert_eq!(old.live_streams.load(Ordering::Relaxed), 0);
+    }
+
     fn counting_fake_dialer(attempts: Arc<AtomicUsize>) -> DualLaneDialer {
         Arc::new(move |addr, _group, _socket| {
             attempts.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
         })
+    }
+
+    #[tokio::test]
+    async fn a_dead_address_releases_its_group() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let (terminate_tx, terminate_rx) = oneshot::channel();
+        let terminate_rx = Arc::new(Mutex::new(Some(terminate_rx)));
+        let tokens: Arc<Mutex<Vec<GroupToken>>> = Arc::new(Mutex::new(Vec::new()));
+        let dialer: DualLaneDialer = Arc::new({
+            let tokens = Arc::clone(&tokens);
+            let terminate_rx = Arc::clone(&terminate_rx);
+            move |addr, group, _socket| {
+                tokens.lock().unwrap().push(group);
+                let terminate = terminate_rx.lock().unwrap().take();
+                Box::pin(async move { Ok(fake_connected_birth(addr, terminate)) })
+            }
+        });
+        let (commands, coordinator, sessions) = spawn_test_connector_with_sessions(dialer);
+        drop(enqueue(&commands, addr).await.await.unwrap().unwrap());
+        terminate_tx.send(()).unwrap();
+        wait_for(
+            || sessions.lock().unwrap().is_empty(),
+            "the dead session to be reaped",
+        )
+        .await;
+        drop(enqueue(&commands, addr).await.await.unwrap().unwrap());
+        let tokens = tokens.lock().unwrap().clone();
+        assert_eq!(tokens.len(), 2, "the second dial did not happen");
+        assert_ne!(
+            tokens[0], tokens[1],
+            "redial reused the group of the dead session, so its router leaked",
+        );
+        stop(commands, coordinator).await;
+    }
+
+    #[test]
+    fn counting_the_waiters_of_an_unknown_address_creates_no_entry() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let mut dial_waiters: HashMap<SocketAddr, Vec<StreamRequest>> = HashMap::new();
+        assert_eq!(live_dial_waiters(&mut dial_waiters, addr), 0);
+        assert!(
+            dial_waiters.is_empty(),
+            "counting left a waiter list behind; a rejected request starts no dial, and only a completing dial removes the entry, so every rejected address leaks one",
+        );
+    }
+
+    #[test]
+    fn counting_the_waiters_of_an_address_drops_the_closed_ones() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let mut dial_waiters: HashMap<SocketAddr, Vec<StreamRequest>> = HashMap::new();
+        let (live, _live_rx) = oneshot::channel();
+        let (closed, closed_rx) = oneshot::channel();
+        drop(closed_rx);
+        dial_waiters.insert(
+            addr,
+            vec![
+                StreamRequest {
+                    lane: LaneClass::Interactive,
+                    response: closed,
+                },
+                StreamRequest {
+                    lane: LaneClass::Interactive,
+                    response: live,
+                },
+            ],
+        );
+        assert_eq!(live_dial_waiters(&mut dial_waiters, addr), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dead_address_releases_its_explorer() {
+        let addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let (terminate_tx, terminate_rx) = oneshot::channel();
+        let terminate_rx = Arc::new(Mutex::new(Some(terminate_rx)));
+        let dialer: DualLaneDialer = Arc::new(move |addr, _group, _socket| {
+            let terminate = terminate_rx.lock().unwrap().take();
+            Box::pin(async move { Ok(fake_connected_birth(addr, terminate)) })
+        });
+        let (commands, coordinator, sessions) = spawn_test_connector_with_explorer(dialer);
+        drop(enqueue(&commands, addr).await.await.unwrap().unwrap());
+        wait_for_candidates(
+            &commands,
+            addr,
+            1,
+            "the explorer to mint its candidate tuple",
+        )
+        .await;
+        terminate_tx.send(()).unwrap();
+        wait_for(
+            || sessions.lock().unwrap().is_empty(),
+            "the dead session to be reaped",
+        )
+        .await;
+        wait_for_candidates(
+            &commands,
+            addr,
+            0,
+            "the dead address to release its explorer, which otherwise keeps minting sockets and probing an address with no session forever",
+        )
+        .await;
+        stop(commands, coordinator).await;
+    }
+
+    #[tokio::test]
+    async fn a_live_stream_keeps_its_group_alive() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let (terminate_tx, terminate_rx) = oneshot::channel();
+        let terminate_rx = Arc::new(Mutex::new(Some(terminate_rx)));
+        let tokens: Arc<Mutex<Vec<GroupToken>>> = Arc::new(Mutex::new(Vec::new()));
+        let dialer: DualLaneDialer = Arc::new({
+            let tokens = Arc::clone(&tokens);
+            let terminate_rx = Arc::clone(&terminate_rx);
+            move |addr, group, _socket| {
+                tokens.lock().unwrap().push(group);
+                let terminate = terminate_rx.lock().unwrap().take();
+                Box::pin(async move { Ok(fake_connected_birth(addr, terminate)) })
+            }
+        });
+        let (commands, coordinator, sessions) = spawn_test_connector_with_sessions(dialer);
+        let held = enqueue(&commands, addr).await.await.unwrap().unwrap();
+        terminate_tx.send(()).unwrap();
+        wait_for(
+            || sessions.lock().unwrap().is_empty(),
+            "the dead session to be reaped",
+        )
+        .await;
+        drop(enqueue(&commands, addr).await.await.unwrap().unwrap());
+        let recorded = tokens.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2, "the second dial did not happen");
+        assert_eq!(
+            recorded[0], recorded[1],
+            "the group was dropped while a stream still routed responses through it",
+        );
+        drop(held);
+        stop(commands, coordinator).await;
     }
 
     #[tokio::test]
@@ -1250,6 +1728,63 @@ mod tests {
         assert_eq!(
             rejected.await.unwrap().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
+        );
+        reset(&commands).await;
+        for response in responses {
+            assert_eq!(
+                response.await.unwrap().unwrap_err().kind(),
+                io::ErrorKind::ConnectionAborted,
+            );
+        }
+        stop(commands, coordinator).await;
+    }
+
+    #[tokio::test]
+    async fn recycle_respects_concurrent_dial_capacity() {
+        let live_addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let dialer: DualLaneDialer = Arc::new({
+            let dial_count = Arc::clone(&dial_count);
+            move |addr, _group, _socket| {
+                dial_count.fetch_add(1, Ordering::SeqCst);
+                if addr == live_addr {
+                    Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
+                } else {
+                    Box::pin(std::future::pending())
+                }
+            }
+        });
+        let (commands, coordinator, sessions) = spawn_test_connector_with_sessions(dialer);
+        drop(enqueue(&commands, live_addr).await.await.unwrap().unwrap());
+        let mut responses = Vec::new();
+        for port in 10_000..10_000 + MAX_CONCURRENT_DUAL_DIALS as u16 {
+            responses.push(enqueue(&commands, SocketAddr::from(([192, 0, 2, 2], port))).await);
+        }
+        wait_for(
+            || dial_count.load(Ordering::SeqCst) == MAX_CONCURRENT_DUAL_DIALS + 1,
+            "all admitted dials to start",
+        )
+        .await;
+        let old_id = sessions.lock().unwrap().get(&live_addr).unwrap().id;
+        commands
+            .send(ConnectorCommand::Recycle {
+                addr: live_addr,
+                only_if_better: false,
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            dial_count.load(Ordering::SeqCst),
+            MAX_CONCURRENT_DUAL_DIALS + 1,
+            "recycle dialed past the concurrent dial capacity",
+        );
+        assert_eq!(
+            sessions.lock().unwrap().get(&live_addr).unwrap().id,
+            old_id,
+            "the session was replaced despite the dial budget being full",
         );
         reset(&commands).await;
         for response in responses {
@@ -1468,6 +2003,43 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
+    #[tokio::test]
+    async fn a_stream_opened_before_a_recycle_lands_on_the_new_session() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let opened = connector.connect(addr).await.unwrap();
+        let old = connector.probe_session(addr).unwrap();
+        connector.reset_addr(addr);
+        wait_for(
+            || {
+                connector
+                    .probe_session(addr)
+                    .is_some_and(|probe| probe.id() != old.id())
+            },
+            "replacement session after recycle",
+        )
+        .await;
+        let new = connector.probe_session(addr).unwrap();
+        assert_eq!(
+            new.live_streams(),
+            Some(0),
+            "the recycle could not have migrated an untracked stream",
+        );
+        let stream = opened.into_stream();
+        assert_eq!(
+            new.live_streams(),
+            Some(1),
+            "the late-tracked stream must land on the live generation",
+        );
+        assert!(
+            old.live_streams().is_none_or(|live| live == 0),
+            "the drained generation must not keep the stream: {:?}",
+            old.live_streams(),
+        );
+        drop(stream);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn failed_recycle_dial_keeps_streams_on_the_old_session() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
@@ -1532,6 +2104,34 @@ mod tests {
         let tokens = tokens.lock().unwrap();
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0], tokens[1], "recycle must reuse the group token");
+    }
+
+    #[tokio::test]
+    async fn reset_clears_the_draining_generation() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        drop(connector.connect(addr).await.unwrap());
+        let old_id = connector.probe_session(addr).unwrap().id();
+        connector.reset_addr(addr);
+        wait_for(
+            || {
+                connector
+                    .probe_session(addr)
+                    .is_some_and(|p| p.id() != old_id)
+            },
+            "replacement session after recycle",
+        )
+        .await;
+        assert!(
+            !connector.draining.lock().unwrap().is_empty(),
+            "the recycle did not record a draining generation",
+        );
+        connector.reset().await.unwrap();
+        assert!(
+            connector.draining.lock().unwrap().is_empty(),
+            "reset left a stale draining entry, which gates the address forever",
+        );
     }
 
     #[tokio::test(start_paused = true)]

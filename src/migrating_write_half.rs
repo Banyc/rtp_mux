@@ -7,6 +7,56 @@ use std::{
 };
 pub(crate) const WRITE_QUEUE_CAPACITY: usize = 8;
 pub(crate) const WRITE_MAX_CHUNK: usize = 64 * 1024;
+pub(crate) struct RebindSlot {
+    latest: Arc<Mutex<Option<mux::DualStreamOpener>>>,
+    wake: tokio::sync::mpsc::Sender<()>,
+}
+#[derive(Clone)]
+pub(crate) struct RebindHandle {
+    latest: Arc<Mutex<Option<mux::DualStreamOpener>>>,
+    wake: tokio::sync::mpsc::WeakSender<()>,
+}
+impl RebindSlot {
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, tokio::sync::mpsc::Receiver<()>) {
+        let (wake, wake_rx) = tokio::sync::mpsc::channel(1);
+        let slot = Self {
+            latest: Arc::new(Mutex::new(None)),
+            wake,
+        };
+        (slot, wake_rx)
+    }
+    #[cfg(test)]
+    pub(crate) fn take(&self) -> Option<mux::DualStreamOpener> {
+        self.latest.lock().unwrap().take()
+    }
+    pub(crate) fn handle(&self) -> RebindHandle {
+        RebindHandle {
+            latest: Arc::clone(&self.latest),
+            wake: self.wake.downgrade(),
+        }
+    }
+}
+impl RebindHandle {
+    pub(crate) fn rebind(&self, opener: mux::DualStreamOpener) -> bool {
+        let Some(wake) = self.wake.upgrade() else {
+            return false;
+        };
+        *self.latest.lock().unwrap() = Some(opener);
+        !matches!(
+            wake.try_send(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(()))
+        )
+    }
+    pub(crate) fn is_alive(&self) -> bool {
+        self.wake.upgrade().is_some()
+    }
+}
+impl fmt::Debug for RebindHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RebindHandle")
+    }
+}
 pub(crate) enum WriteCommand {
     Data(Vec<u8>),
     Flush(tokio::sync::oneshot::Sender<Result<(), BackgroundWriteError>>),
@@ -48,7 +98,7 @@ pub struct MigratingWriteHalf {
     shutdown_started: bool,
     shutdown_complete: bool,
     name: mux::StreamName,
-    _rebind_tx: tokio::sync::mpsc::Sender<mux::DualStreamOpener>,
+    _rebind: RebindSlot,
     _background_writer: tokio::task::JoinHandle<()>,
 }
 impl fmt::Debug for MigratingWriteHalf {
@@ -57,13 +107,17 @@ impl fmt::Debug for MigratingWriteHalf {
     }
 }
 impl MigratingWriteHalf {
-    pub(crate) fn new_with_rebind(
-        mut writer: MigratingStreamWriter,
-    ) -> (Self, tokio::sync::mpsc::Sender<mux::DualStreamOpener>) {
+    pub(crate) fn new_with_rebind(mut writer: MigratingStreamWriter) -> (Self, RebindHandle) {
         let name = writer.name_handle();
         let (write_tx, mut write_rx) =
             tokio::sync::mpsc::channel::<WriteCommand>(WRITE_QUEUE_CAPACITY);
-        let (rebind_tx, mut rebind_rx) = tokio::sync::mpsc::channel::<mux::DualStreamOpener>(1);
+        let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let rebind = RebindSlot {
+            latest: Arc::new(Mutex::new(None)),
+            wake: wake_tx,
+        };
+        let handle = rebind.handle();
+        let latest = Arc::clone(&rebind.latest);
         let background_error: Arc<Mutex<Option<BackgroundWriteError>>> = Arc::new(Mutex::new(None));
         let background_error_clone = Arc::clone(&background_error);
         let background_writer = tokio::spawn(async move {
@@ -71,10 +125,13 @@ impl MigratingWriteHalf {
             loop {
                 let command = tokio::select! {
                     biased;
-                    opener = rebind_rx.recv(), if rebind_open => {
-                        match opener {
-                            Some(opener) => {
-                                let _ = writer.rebind(opener).await;
+                    wake = wake_rx.recv(), if rebind_open => {
+                        match wake {
+                            Some(()) => {
+                                let opener = latest.lock().unwrap().take();
+                                if let Some(opener) = opener {
+                                    let _ = writer.rebind(opener).await;
+                                }
                             }
                             None => rebind_open = false,
                         }
@@ -129,10 +186,10 @@ impl MigratingWriteHalf {
             shutdown_started: false,
             shutdown_complete: false,
             name,
-            _rebind_tx: rebind_tx.clone(),
+            _rebind: rebind,
             _background_writer: background_writer,
         };
-        (half, rebind_tx)
+        (half, handle)
     }
     pub fn name_handle(&self) -> mux::StreamName {
         self.name.clone()

@@ -61,7 +61,7 @@ async fn recycle_dial_lands_on_the_surrendered_candidate_port() {
             .unwrap()
             .candidates
             .iter()
-            .map(|c| c.local_addr.unwrap().port())
+            .map(|c| c.local_addr.port())
             .collect();
         connector.reset_addr(addr);
         wait_until(
@@ -86,7 +86,7 @@ async fn recycle_dial_lands_on_the_surrendered_candidate_port() {
             .unwrap()
             .candidates
             .iter()
-            .map(|c| c.local_addr.unwrap().port())
+            .map(|c| c.local_addr.port())
             .collect();
         assert!(
             !after.contains(&session_port),

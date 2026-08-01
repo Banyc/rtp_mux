@@ -172,11 +172,9 @@ impl TupleStats {
         }
         if self.outstanding.is_none() && now >= self.next_probe_at {
             let nonce = rand::random();
-            if io
-                .send_probe(nonce, now.duration_since(epoch).as_micros() as u64)
-                .is_ok()
-            {
-                self.outstanding = Some((nonce, now));
+            match io.send_probe(nonce, now.duration_since(epoch).as_micros() as u64) {
+                Ok(()) => self.outstanding = Some((nonce, now)),
+                Err(_) => self.record(None),
             }
             let mean = if self.dead() {
                 mean * DEAD_CADENCE_FACTOR
@@ -193,7 +191,7 @@ impl TupleStats {
             self.next_probe_at
         }
     }
-    fn report(&self, local_addr: Option<SocketAddr>) -> TupleReport {
+    fn report(&self, local_addr: SocketAddr) -> TupleReport {
         TupleReport {
             local_addr,
             rtt: self.rtt,
@@ -211,7 +209,7 @@ fn poisson_interval(mean: Duration) -> Duration {
 
 #[derive(Debug, Clone)]
 pub struct TupleReport {
-    pub local_addr: Option<SocketAddr>,
+    pub local_addr: SocketAddr,
     pub rtt: Option<Duration>,
     pub loss: Option<f64>,
     pub alive: bool,
@@ -230,7 +228,7 @@ struct Candidate<C> {
 pub(crate) struct Explorer<C> {
     config: ExplorerConfig,
     candidates: Vec<Candidate<C>>,
-    active: Option<(Box<dyn ProbeIo>, TupleStats)>,
+    active: Option<Candidate<Box<dyn ProbeIo>>>,
     next_rotation_at: Instant,
     refill_after: Instant,
     epoch: Instant,
@@ -264,8 +262,16 @@ impl<C: ProbeIo> Explorer<C> {
             stats: TupleStats::new(now, self.config.probe_mean_interval),
         });
     }
-    pub(crate) fn set_active(&mut self, io: Option<Box<dyn ProbeIo>>, now: Instant) {
-        self.active = io.map(|io| (io, TupleStats::new(now, self.config.probe_mean_interval)));
+    pub(crate) fn set_active(
+        &mut self,
+        active: Option<(Box<dyn ProbeIo>, SocketAddr)>,
+        now: Instant,
+    ) {
+        self.active = active.map(|(io, local_addr)| Candidate {
+            io,
+            local_addr,
+            stats: TupleStats::new(now, self.config.probe_mean_interval),
+        });
     }
     pub(crate) fn tick(&mut self, now: Instant) {
         let mean = self.config.probe_mean_interval;
@@ -274,8 +280,10 @@ impl<C: ProbeIo> Explorer<C> {
                 .stats
                 .drive(&mut candidate.io, now, mean, self.epoch);
         }
-        if let Some((io, stats)) = &mut self.active {
-            stats.drive(io.as_mut(), now, mean, self.epoch);
+        if let Some(active) = &mut self.active {
+            active
+                .stats
+                .drive(active.io.as_mut(), now, mean, self.epoch);
         }
         if now >= self.next_rotation_at {
             self.next_rotation_at = now + self.config.rotation_period;
@@ -290,14 +298,15 @@ impl<C: ProbeIo> Explorer<C> {
             .candidates
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.stats.samples > 0)
-            .max_by(|(_, a), (_, b)| {
-                let cost = |c: &Candidate<C>| match c.stats.score() {
-                    Some(score) => score.cost(),
-                    None => f64::INFINITY,
+            .filter_map(|(index, c)| {
+                let cost = if c.stats.dead() {
+                    f64::INFINITY
+                } else {
+                    c.stats.score()?.cost()
                 };
-                cost(a).total_cmp(&cost(b))
+                Some((index, cost))
             })
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(index, _)| index);
         if let Some(index) = worst {
             self.candidates.swap_remove(index);
@@ -325,7 +334,7 @@ impl<C: ProbeIo> Explorer<C> {
         Some((candidate.io, candidate.local_addr, score))
     }
     pub(crate) fn should_reoptimize(&self) -> bool {
-        let Some(active) = self.active.as_ref().and_then(|(_, stats)| stats.score()) else {
+        let Some(active) = self.active.as_ref().and_then(|active| active.stats.score()) else {
             return false;
         };
         self.best_score()
@@ -337,7 +346,10 @@ impl<C: ProbeIo> Explorer<C> {
             .iter()
             .map(|c| c.stats.next_wakeup(now))
             .min();
-        let active = self.active.as_ref().map(|(_, s)| s.next_wakeup(now));
+        let active = self
+            .active
+            .as_ref()
+            .map(|active| active.stats.next_wakeup(now));
         let refill = (self.deficit() > 0).then_some(self.refill_after);
         [candidates, active, refill, Some(self.next_rotation_at)]
             .into_iter()
@@ -349,9 +361,12 @@ impl<C: ProbeIo> Explorer<C> {
             candidates: self
                 .candidates
                 .iter()
-                .map(|c| c.stats.report(Some(c.local_addr)))
+                .map(|c| c.stats.report(c.local_addr))
                 .collect(),
-            active: self.active.as_ref().map(|(_, stats)| stats.report(None)),
+            active: self
+                .active
+                .as_ref()
+                .map(|active| active.stats.report(active.local_addr)),
         }
     }
 }
@@ -369,9 +384,16 @@ mod tests {
     struct FakeIo {
         sent: Arc<Mutex<Vec<u64>>>,
         echoes: Arc<Mutex<VecDeque<u64>>>,
+        send_fails: bool,
     }
 
     impl FakeIo {
+        fn broken() -> Self {
+            Self {
+                send_fails: true,
+                ..Self::default()
+            }
+        }
         // Echo every probe sent since the last call.
         fn echo_all(&self) {
             let mut sent = self.sent.lock().unwrap();
@@ -381,6 +403,9 @@ mod tests {
 
     impl ProbeIo for FakeIo {
         fn send_probe(&mut self, nonce: u64, _timestamp_micros: u64) -> io::Result<()> {
+            if self.send_fails {
+                return Err(io::Error::from(io::ErrorKind::NetworkUnreachable));
+            }
             self.sent.lock().unwrap().push(nonce);
             Ok(())
         }
@@ -507,7 +532,18 @@ mod tests {
         assert_eq!(explorer.deficit(), 1);
         let report = explorer.report();
         assert_eq!(report.candidates.len(), 1);
-        assert_eq!(report.candidates[0].local_addr, Some(local(1000)));
+        assert_eq!(report.candidates[0].local_addr, local(1000));
+    }
+    #[test]
+    fn a_report_names_the_active_tuple() {
+        let now = Instant::now();
+        let mut explorer: Explorer<FakeIo> = Explorer::new(config(), now);
+        explorer.set_active(Some((Box::new(FakeIo::default()), local(3000))), now);
+        let report = explorer.report();
+        assert_eq!(
+            report.active.expect("an active tuple was set").local_addr,
+            local(3000),
+        );
     }
     #[test]
     fn rotation_never_retires_unmeasured_candidates() {
@@ -520,13 +556,63 @@ mod tests {
         assert_eq!(explorer.deficit(), 0);
     }
     #[test]
+    fn rotation_retires_a_dead_tuple_before_a_warming_one() {
+        let mut now = Instant::now();
+        let mut explorer = Explorer::new(config(), now);
+        let dead = FakeIo::default();
+        explorer.add_candidate(dead.clone(), local(1000), now);
+        for _ in 0..DEAD_CONSECUTIVE_LOSSES {
+            probe_cycle(&mut explorer, &mut now, &[]);
+        }
+        let warming = FakeIo::default();
+        explorer.add_candidate(warming.clone(), local(2000), now);
+        probe_cycle(
+            &mut explorer,
+            &mut now,
+            &[(&warming, Duration::from_millis(5))],
+        );
+        explorer.next_rotation_at = now;
+        explorer.tick(now);
+        let report = explorer.report();
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(
+            report.candidates[0].local_addr,
+            local(2000),
+            "rotation must retire the dead tuple, not the warming one",
+        );
+    }
+    #[test]
+    fn a_candidate_that_cannot_send_is_retired_like_a_lost_one() {
+        let mut now = Instant::now();
+        let mut explorer = Explorer::new(config(), now);
+        let good = FakeIo::default();
+        explorer.add_candidate(FakeIo::broken(), local(1000), now);
+        explorer.add_candidate(good.clone(), local(2000), now);
+        for _ in 0..DEAD_CONSECUTIVE_LOSSES {
+            probe_cycle(
+                &mut explorer,
+                &mut now,
+                &[(&good, Duration::from_millis(5))],
+            );
+        }
+        explorer.next_rotation_at = now;
+        explorer.tick(now);
+        let report = explorer.report();
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(
+            report.candidates[0].local_addr,
+            local(2000),
+            "an unsendable candidate held its slot instead of being retired",
+        );
+    }
+    #[test]
     fn reoptimize_requires_a_margin_win_over_the_active_tuple() {
         let mut now = Instant::now();
         let (mut explorer, fast, slow) = warmed_pair(&mut now);
         let ms = Duration::from_millis;
         assert!(!explorer.should_reoptimize());
         let active = FakeIo::default();
-        explorer.set_active(Some(Box::new(active.clone())), now);
+        explorer.set_active(Some((Box::new(active.clone()), local(9000))), now);
         for _ in 0..MIN_SAMPLES {
             probe_cycle(
                 &mut explorer,
@@ -538,7 +624,7 @@ mod tests {
             !explorer.should_reoptimize(),
             "11ms -> 10ms is within margin"
         );
-        explorer.set_active(Some(Box::new(active.clone())), now);
+        explorer.set_active(Some((Box::new(active.clone()), local(9000))), now);
         for _ in 0..MIN_SAMPLES {
             probe_cycle(
                 &mut explorer,
@@ -550,7 +636,7 @@ mod tests {
             explorer.should_reoptimize(),
             "100ms -> 10ms clears the margin"
         );
-        explorer.set_active(Some(Box::new(FakeIo::default())), now);
+        explorer.set_active(Some((Box::new(FakeIo::default()), local(9000))), now);
         assert!(!explorer.should_reoptimize());
     }
     #[test]

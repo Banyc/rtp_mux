@@ -52,8 +52,9 @@ impl AcceptErrorBackoff {
         if fatal { Err(error) } else { Ok(()) }
     }
 
-    pub(crate) fn accepted(&mut self, listener: &str, addr: SocketAddr) {
-        if self.error_count > 0 && !self.logged {
+    pub(crate) fn accepted(&mut self, listener: &str, addr: SocketAddr) -> bool {
+        let recovered = self.logged;
+        if recovered {
             tracing::warn!(
                 error_count = self.error_count,
                 first_error = %self.first_error.as_deref().unwrap_or("?"),
@@ -65,5 +66,56 @@ impl AcceptErrorBackoff {
             );
         }
         *self = Self::default();
+        recovered
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    fn addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1)
+    }
+
+    fn transient(backoff: &mut AcceptErrorBackoff) {
+        backoff
+            .failed_dispatching(
+                "t",
+                addr(),
+                io::Error::from(io::ErrorKind::ConnectionAborted),
+            )
+            .expect("a non-fatal accept error is not returned to the caller");
+    }
+
+    #[test]
+    fn a_warned_error_streak_logs_its_recovery() {
+        let mut backoff = AcceptErrorBackoff::default();
+        for _ in 0..WARN_AFTER_CONSECUTIVE {
+            transient(&mut backoff);
+        }
+        assert!(
+            backoff.accepted("t", addr()),
+            "the listener recovered from a warned error streak without saying so, \
+             leaving the warning open with nothing to retire it",
+        );
+    }
+
+    #[test]
+    fn an_unwarned_error_streak_recovers_quietly() {
+        let mut backoff = AcceptErrorBackoff::default();
+        transient(&mut backoff);
+        assert!(
+            !backoff.accepted("t", addr()),
+            "a listener that hiccuped once warned on recovery, so a flapping listener warns on every accept",
+        );
+    }
+
+    #[test]
+    fn a_clean_listener_never_warns_on_accept() {
+        let mut backoff = AcceptErrorBackoff::default();
+        assert!(!backoff.accepted("t", addr()));
     }
 }

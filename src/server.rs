@@ -114,6 +114,7 @@ impl RtpMuxServer {
         let rejections = LaneRejectionLog::default();
         let mut interactive_backoff = AcceptErrorBackoff::default();
         let mut bulk_backoff = AcceptErrorBackoff::default();
+        let mut rejection_log = rejection_log_ticker();
         {
             let registry = Arc::clone(&registry);
             let rejections = rejections.clone();
@@ -136,7 +137,7 @@ impl RtpMuxServer {
                         Err(error) => warn!(?error, ?addr, "MUX supervision task failed to join"),
                     }
                 }
-                () = tokio::time::sleep(ADMISSION_REJECTION_LOG_INTERVAL) => rejections.flush(),
+                _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig {
                     handshake: false,
                     fec: self.fec,
@@ -257,6 +258,12 @@ impl RtpMuxServer {
     }
 }
 
+fn rejection_log_ticker() -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(ADMISSION_REJECTION_LOG_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
+}
+
 async fn finish_frame_delivery_accept(
     accept: io::Result<rtp::udp::FrameDeliveryAccept>,
 ) -> io::Result<rtp::udp::FrameDeliveryIo> {
@@ -300,7 +307,6 @@ fn spawn_lane_accept(
                         elapsed,
                     );
                     drop(permit);
-                    counter!("stream.rtp_mux.hello_timeout").increment(1);
                     return;
                 }
                 Ok(Err(error)) => {
@@ -319,7 +325,6 @@ fn spawn_lane_accept(
                     )
                     .await;
                     drop(permit);
-                    counter!("stream.rtp_mux.hello_timeout").increment(1);
                     return;
                 }
             };
@@ -339,7 +344,6 @@ fn spawn_lane_accept(
             )
             .await;
             drop(permit);
-            counter!("stream.rtp_mux.class_mismatch").increment(1);
             return;
         }
         if groups.is_full(&group) {
@@ -357,7 +361,6 @@ fn spawn_lane_accept(
             )
             .await;
             drop(permit);
-            counter!("stream.rtp_mux.group_full").increment(1);
             return;
         }
         let mut permit = Some(permit);
@@ -379,7 +382,6 @@ fn spawn_lane_accept(
                         failure,
                     )
                     .await;
-                    counter!("stream.rtp_mux.birth_heartbeat_error").increment(1);
                     return;
                 }
                 let mut tasks = JoinSet::new();
@@ -389,7 +391,14 @@ fn spawn_lane_accept(
                     peer,
                     local_addr,
                 };
-                let _ = registry.finish_reservation(nonce, lane);
+                finish_reservation_or_reject(
+                    &registry,
+                    &rejections,
+                    nonce,
+                    lane,
+                    expected_class,
+                    started.elapsed(),
+                );
             }
             PendingLaneAdmission::Wait {
                 changed,
@@ -410,7 +419,6 @@ fn spawn_lane_accept(
                         failure,
                     )
                     .await;
-                    counter!("stream.rtp_mux.birth_heartbeat_error").increment(1);
                     return;
                 }
                 match registry
@@ -446,7 +454,6 @@ fn spawn_lane_accept(
                             started.elapsed(),
                         )
                         .await;
-                        counter!("stream.rtp_mux.pairing_timeout").increment(1);
                     }
                     PendingLaneWait::ReservationLost(reason) => {
                         signal_rejected_lane(
@@ -462,7 +469,6 @@ fn spawn_lane_accept(
                             started.elapsed(),
                         )
                         .await;
-                        counter!("stream.rtp_mux.pairing_timeout").increment(1);
                     }
                 }
             }
@@ -471,7 +477,14 @@ fn spawn_lane_accept(
                 expires_at,
             } => {
                 if let Err(failure) = write_birth_heartbeat_result(&mut write).await {
-                    registry.restore_ready(nonce, other, expires_at);
+                    restore_ready_or_reject(
+                        &registry,
+                        &rejections,
+                        nonce,
+                        other,
+                        expires_at,
+                        started.elapsed(),
+                    );
                     reject_birth_heartbeat(
                         read,
                         write,
@@ -486,7 +499,6 @@ fn spawn_lane_accept(
                         failure,
                     )
                     .await;
-                    counter!("stream.rtp_mux.birth_heartbeat_error").increment(1);
                     return;
                 }
                 let mut tasks = JoinSet::new();
@@ -515,7 +527,6 @@ fn spawn_lane_accept(
                 )
                 .await;
                 drop(permit);
-                counter!("stream.rtp_mux.pairing_timeout").increment(1);
             }
         }
     });
@@ -575,6 +586,58 @@ fn reject_timed_out_birth_heartbeat<R, W>(
     drop(writer);
     context.reason = format!("{}: deadline elapsed", context.reason);
     record_rejected_lane(rejections, context, elapsed);
+}
+
+fn restore_ready_or_reject(
+    registry: &PendingLaneRegistry,
+    rejections: &LaneRejectionLog,
+    nonce: PairingNonce,
+    lane: PendingLane,
+    expires_at: Instant,
+    elapsed: Duration,
+) {
+    let (peer, local_addr, class) = (lane.peer, lane.local_addr, lane.pending.class);
+    let Err(lane) = registry.restore_ready(nonce, lane, expires_at) else {
+        return;
+    };
+    drop(lane);
+    record_rejected_lane(
+        rejections,
+        RejectedLaneContext {
+            class: LaneRejectionClass::ReservationLost,
+            peer,
+            local_addr,
+            expected_class: Some(class),
+            reason: "pairing slot was reclaimed before the partner could be restored".to_string(),
+        },
+        elapsed,
+    );
+}
+
+fn finish_reservation_or_reject(
+    registry: &PendingLaneRegistry,
+    rejections: &LaneRejectionLog,
+    nonce: PairingNonce,
+    lane: PreparedLane,
+    expected_class: LaneClass,
+    elapsed: Duration,
+) {
+    let (peer, local_addr) = (lane.peer, lane.local_addr);
+    let Err(lane) = registry.finish_reservation(nonce, lane) else {
+        return;
+    };
+    drop(lane);
+    record_rejected_lane(
+        rejections,
+        RejectedLaneContext {
+            class: LaneRejectionClass::ReservationLost,
+            peer,
+            local_addr,
+            expected_class: Some(expected_class),
+            reason: "reservation vanished before the built lane could claim it".to_string(),
+        },
+        elapsed,
+    );
 }
 
 async fn signal_rejected_lane(
@@ -645,7 +708,6 @@ async fn run_pending_lane_expiry(registry: Arc<PendingLaneRegistry>, rejections:
                         }
                     }
                 }
-                counter!("stream.rtp_mux.pairing_timeout").increment(1);
             }
             () = changed => {}
         }
@@ -712,7 +774,7 @@ fn pair_lanes(
         }
         Err(error) => {
             warn!(?error, ?nonce, dn_interactive = ?addrs.interactive_peer, dn_interactive_local = ?addrs.interactive_local, dn_bulk = ?addrs.bulk_peer, dn_bulk_local = ?addrs.bulk_local, "RTP mux dual-lane pairing failed");
-            counter!("stream.rtp_mux.pairing_timeout").increment(1);
+            counter!("stream.rtp_mux.pairing_failed").increment(1);
         }
     }
 }
@@ -747,9 +809,9 @@ async fn run_dual_mux_accepter(
                 writer,
                 source_lane,
             } => {
-                let (writer, rebind_tx) =
+                let (writer, rebind) =
                     crate::migrating_write_half::MigratingWriteHalf::new_with_rebind(writer);
-                member.register_writer(&rebind_tx);
+                member.register_writer(rebind);
                 ServerStream::MigratingDuplex {
                     reader,
                     writer,
@@ -946,5 +1008,122 @@ mod tests {
         assert!(read_dropped.load(Ordering::SeqCst));
         assert!(writer_dropped.load(Ordering::SeqCst));
         assert_eq!(io_polls.load(Ordering::SeqCst), io_polls_at_timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_rejection_log_timer_fires_while_the_accept_loop_stays_busy() {
+        let mut ticker = rejection_log_ticker();
+        let mut fired = 0_u32;
+        let deadline = tokio::time::Instant::now() + ADMISSION_REJECTION_LOG_INTERVAL * 3;
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                _ = ticker.tick() => fired += 1,
+                () = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+        }
+        assert!(
+            fired >= 2,
+            "the rejection summary timer fired {fired} times over three logging intervals of a busy accept loop, so a rejection flood is never logged",
+        );
+    }
+
+    fn prepared_lane(
+        nonce: PairingNonce,
+        peer: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> PreparedLane {
+        let (io, _peer_io) = tokio::io::duplex(64);
+        let (read, write) = tokio::io::split(io);
+        let mut tasks = JoinSet::new();
+        let (opener, accepter) = spawn_mux_no_reconnection(
+            read,
+            write,
+            mux::MuxConfig::new(mux::Initiation::Server, Duration::from_secs(5)),
+            &mut tasks,
+        );
+        PreparedLane {
+            pending: mux::PendingAcceptor::new(
+                LaneClass::Interactive,
+                nonce,
+                opener,
+                accepter,
+                tasks,
+            ),
+            peer,
+            local_addr,
+        }
+    }
+
+    fn pending_lane(
+        registry: &Arc<PendingLaneRegistry>,
+        nonce: PairingNonce,
+        peer: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> PendingLane {
+        let PreparedLane {
+            pending,
+            peer,
+            local_addr,
+        } = prepared_lane(nonce, peer, local_addr);
+        PendingLane {
+            pending,
+            peer,
+            local_addr,
+            group: mux::GroupToken::generate(),
+            _permit: registry.try_acquire(peer.ip()).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_partner_that_cannot_be_restored_is_recorded_not_silently_dropped() {
+        let registry = PendingLaneRegistry::new();
+        let rejections = LaneRejectionLog::default();
+        let peer: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let local_addr: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut permit = Some(registry.try_acquire(peer.ip()).unwrap());
+        registry.admit(
+            nonce,
+            LaneClass::Bulk,
+            peer,
+            local_addr,
+            mux::GroupToken::generate(),
+            &mut permit,
+        );
+        restore_ready_or_reject(
+            &registry,
+            &rejections,
+            nonce,
+            pending_lane(&registry, nonce, peer, local_addr),
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            rejections.recorded(LaneRejectionClass::ReservationLost),
+            1,
+            "a live lane that could not be restored vanished without a rejection, so the totals under-count by exactly the lanes lost to this race",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lane_whose_reservation_vanished_is_recorded_not_silently_dropped() {
+        let registry = PendingLaneRegistry::new();
+        let rejections = LaneRejectionLog::default();
+        let peer: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let local_addr: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        finish_reservation_or_reject(
+            &registry,
+            &rejections,
+            nonce,
+            prepared_lane(nonce, peer, local_addr),
+            LaneClass::Interactive,
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            rejections.recorded(LaneRejectionClass::ReservationLost),
+            1,
+            "a fully built lane was dropped without recording a rejection, so the peer sees a bare close and the operator sees nothing",
+        );
     }
 }

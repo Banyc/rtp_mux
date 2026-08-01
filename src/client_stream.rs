@@ -22,7 +22,9 @@ enum ReaderState {
     ReadySpliced {
         reader: SplicedReader,
     },
-    Failed,
+    Failed {
+        reason: &'static str,
+    },
 }
 pub struct ClientStream {
     write: MigratingWriteHalf,
@@ -38,7 +40,7 @@ impl ClientStream {
         reader: tokio::sync::oneshot::Receiver<StreamReader>,
         addr: SocketAddrPair,
     ) -> Self {
-        let (write, _rebind_tx) = MigratingWriteHalf::new_with_rebind(writer);
+        let (write, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
         let name = write.name_handle();
         Self {
             write,
@@ -56,8 +58,8 @@ impl ClientStream {
         router: mux::ResponseRouterHandle,
         session: crate::connector::SessionGuard,
     ) -> Self {
-        let (write, rebind_tx) = MigratingWriteHalf::new_with_rebind(writer);
-        let session = crate::connector::StreamRebind::track(rebind_tx.downgrade(), session);
+        let (write, rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        let session = crate::connector::StreamRebind::track(rebind, session);
         let name = write.name_handle();
         let (spliced_tx, spliced_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -91,48 +93,48 @@ impl fmt::Debug for ClientStream {
             .finish_non_exhaustive()
     }
 }
+fn poll_reader_state(
+    state: &mut ReaderState,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+) -> Poll<io::Result<()>> {
+    loop {
+        match state {
+            ReaderState::Pending { rx } => match Pin::new(rx).poll(cx) {
+                Poll::Ready(Ok(reader)) => *state = ReaderState::Ready { reader },
+                Poll::Ready(Err(_)) => {
+                    *state = ReaderState::Failed {
+                        reason: "gen-0 reader channel closed before write",
+                    };
+                    continue;
+                }
+                Poll::Pending => return Poll::Pending,
+            },
+            ReaderState::PendingSpliced { rx } => match Pin::new(rx).poll(cx) {
+                Poll::Ready(Ok(reader)) => *state = ReaderState::ReadySpliced { reader },
+                Poll::Ready(Err(_)) => {
+                    *state = ReaderState::Failed {
+                        reason: "response splice channel closed before write",
+                    };
+                    continue;
+                }
+                Poll::Pending => return Poll::Pending,
+            },
+            ReaderState::Ready { reader } => return Pin::new(reader).poll_read(cx, buf),
+            ReaderState::ReadySpliced { reader } => return Pin::new(reader).poll_read(cx, buf),
+            ReaderState::Failed { reason } => {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, *reason)));
+            }
+        }
+    }
+}
 impl AsyncRead for ClientStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        loop {
-            match &mut self.reader_state {
-                ReaderState::Pending { rx } => match Pin::new(rx).poll(cx) {
-                    Poll::Ready(Ok(reader)) => self.reader_state = ReaderState::Ready { reader },
-                    Poll::Ready(Err(_)) => {
-                        self.reader_state = ReaderState::Failed;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "gen-0 reader channel closed before write",
-                        )));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                },
-                ReaderState::PendingSpliced { rx } => match Pin::new(rx).poll(cx) {
-                    Poll::Ready(Ok(reader)) => {
-                        self.reader_state = ReaderState::ReadySpliced { reader }
-                    }
-                    Poll::Ready(Err(_)) => {
-                        self.reader_state = ReaderState::Failed;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "response splice channel closed before write",
-                        )));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                },
-                ReaderState::Ready { reader } => return Pin::new(reader).poll_read(cx, buf),
-                ReaderState::ReadySpliced { reader } => return Pin::new(reader).poll_read(cx, buf),
-                ReaderState::Failed => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "gen-0 reader channel closed before write",
-                    )));
-                }
-            }
-        }
+        poll_reader_state(&mut self.reader_state, cx, buf)
     }
 }
 impl AsyncWrite for ClientStream {
@@ -171,6 +173,29 @@ mod tests {
     use tokio::{io::AsyncWriteExt, task::JoinSet};
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_reader_keeps_reporting_the_cause_it_first_gave() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<SplicedReader>();
+        drop(tx);
+        let mut state = ReaderState::PendingSpliced { rx };
+        let mut storage = [0u8; 8];
+        let mut poll_once = |state: &mut ReaderState| {
+            let mut buf = ReadBuf::new(&mut storage);
+            let waker = std::task::Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            match poll_reader_state(state, &mut cx, &mut buf) {
+                Poll::Ready(Err(e)) => e.to_string(),
+                _ => panic!("a closed splice channel fails the read"),
+            }
+        };
+        let first = poll_once(&mut state);
+        let second = poll_once(&mut state);
+        assert_eq!(
+            first, second,
+            "the reader reported one cause and then a different one, so a read loop only ever sees the wrong half of the diagnosis",
+        );
+    }
 
     async fn make_dual_pair() -> (
         mux::DualStreamOpener,
