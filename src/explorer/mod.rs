@@ -1,18 +1,15 @@
+mod path_score;
+mod tuple_stats;
+
 use std::{
     io,
     net::SocketAddr,
     time::{Duration, Instant},
 };
 
-const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-const PROBE_POLL_TICK: Duration = Duration::from_millis(5);
-const DEAD_CONSECUTIVE_LOSSES: u32 = 3;
-const DEAD_CADENCE_FACTOR: u32 = 3;
-const MIN_SAMPLES: u32 = 3;
-const EWMA_ALPHA: f64 = 0.3;
-const REOPT_RTT_MARGIN: f64 = 0.25;
-const REOPT_LOSS_MARGIN: f64 = 0.10;
-const REOPT_LOSS_TOLERANCE: f64 = 0.02;
+use tuple_stats::TupleStats;
+pub use path_score::{PathScore, ReoptRule, ReoptVerdict};
+pub use tuple_stats::TupleReport;
 
 #[derive(Debug, Clone)]
 pub struct ExplorerConfig {
@@ -83,207 +80,6 @@ impl ProbeIo for SocketCandidate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PathScore {
-    pub rtt: Duration,
-    pub loss: f64,
-}
-
-impl PathScore {
-    fn cost(&self) -> f64 {
-        self.rtt.as_secs_f64() / (1.0 - self.loss).max(0.05)
-    }
-    fn beats_by_margin(&self, active: &PathScore) -> Option<ReoptRule> {
-        let rtt_wins = self.rtt.as_secs_f64()
-            <= active.rtt.as_secs_f64() * (1.0 - REOPT_RTT_MARGIN)
-            && self.loss <= active.loss + REOPT_LOSS_TOLERANCE;
-        let loss_wins = self.loss + REOPT_LOSS_MARGIN <= active.loss
-            && self.rtt.as_secs_f64() <= active.rtt.as_secs_f64() * (1.0 + REOPT_RTT_MARGIN);
-        match (rtt_wins, loss_wins) {
-            (true, _) => Some(ReoptRule::Rtt),
-            (false, true) => Some(ReoptRule::Loss),
-            (false, false) => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReoptRule {
-    Rtt,
-    Loss,
-}
-
-impl ReoptRule {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Rtt => "rtt_margin",
-            Self::Loss => "loss_margin",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ReoptVerdict {
-    Migrate {
-        rule: ReoptRule,
-        active: PathScore,
-        best: PathScore,
-    },
-    ActiveUnmeasured,
-    NoLiveCandidate {
-        active: PathScore,
-    },
-    WithinMargin {
-        active: PathScore,
-        best: PathScore,
-    },
-}
-
-impl ReoptVerdict {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Migrate { .. } => "margin_win",
-            Self::ActiveUnmeasured => "active_unmeasured",
-            Self::NoLiveCandidate { .. } => "no_live_candidate",
-            Self::WithinMargin { .. } => "within_margin",
-        }
-    }
-    pub fn wants_migration(&self) -> bool {
-        matches!(self, Self::Migrate { .. })
-    }
-    pub fn active(&self) -> Option<PathScore> {
-        match self {
-            Self::Migrate { active, .. }
-            | Self::NoLiveCandidate { active }
-            | Self::WithinMargin { active, .. } => Some(*active),
-            Self::ActiveUnmeasured => None,
-        }
-    }
-    pub fn best(&self) -> Option<PathScore> {
-        match self {
-            Self::Migrate { best, .. } | Self::WithinMargin { best, .. } => Some(*best),
-            Self::ActiveUnmeasured | Self::NoLiveCandidate { .. } => None,
-        }
-    }
-    pub fn rule(&self) -> Option<ReoptRule> {
-        match self {
-            Self::Migrate { rule, .. } => Some(*rule),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct TupleStats {
-    rtt: Option<Duration>,
-    loss: Option<f64>,
-    samples: u32,
-    consecutive_losses: u32,
-    outstanding: Option<(u64, Instant)>,
-    next_probe_at: Instant,
-}
-
-impl TupleStats {
-    fn new(now: Instant, mean: Duration) -> Self {
-        let stagger = mean.mul_f64(0.5 + 0.5 * rand::random::<f64>());
-        Self {
-            rtt: None,
-            loss: None,
-            samples: 0,
-            consecutive_losses: 0,
-            outstanding: None,
-            next_probe_at: now + stagger,
-        }
-    }
-    fn dead(&self) -> bool {
-        self.consecutive_losses >= DEAD_CONSECUTIVE_LOSSES
-    }
-    fn alive(&self) -> bool {
-        self.samples >= MIN_SAMPLES && self.rtt.is_some() && !self.dead()
-    }
-    fn score(&self) -> Option<PathScore> {
-        self.alive().then(|| PathScore {
-            rtt: self.rtt.expect("alive implies a measured rtt"),
-            loss: self.loss.unwrap_or(0.0),
-        })
-    }
-    fn record(&mut self, rtt: Option<Duration>) {
-        self.samples = self.samples.saturating_add(1);
-        let loss_sample = if rtt.is_some() { 0.0 } else { 1.0 };
-        self.loss = Some(match self.loss {
-            None => loss_sample,
-            Some(prev) => prev * (1.0 - EWMA_ALPHA) + loss_sample * EWMA_ALPHA,
-        });
-        match rtt {
-            Some(sample) => {
-                self.consecutive_losses = 0;
-                self.rtt = Some(match self.rtt {
-                    None => sample,
-                    Some(prev) => prev.mul_f64(1.0 - EWMA_ALPHA) + sample.mul_f64(EWMA_ALPHA),
-                });
-            }
-            None => self.consecutive_losses = self.consecutive_losses.saturating_add(1),
-        }
-    }
-    fn drive(&mut self, io: &mut dyn ProbeIo, now: Instant, mean: Duration, epoch: Instant) {
-        while let Some(nonce) = io.try_recv_echo() {
-            if let Some((expected, sent_at)) = self.outstanding
-                && nonce == expected
-            {
-                self.outstanding = None;
-                self.record(Some(now.duration_since(sent_at)));
-            }
-        }
-        if let Some((_, sent_at)) = self.outstanding
-            && now.duration_since(sent_at) >= PROBE_TIMEOUT
-        {
-            self.outstanding = None;
-            self.record(None);
-        }
-        if self.outstanding.is_none() && now >= self.next_probe_at {
-            let nonce = rand::random();
-            match io.send_probe(nonce, now.duration_since(epoch).as_micros() as u64) {
-                Ok(()) => self.outstanding = Some((nonce, now)),
-                Err(_) => self.record(None),
-            }
-            let mean = if self.dead() {
-                mean * DEAD_CADENCE_FACTOR
-            } else {
-                mean
-            };
-            self.next_probe_at = now + poisson_interval(mean);
-        }
-    }
-    fn next_wakeup(&self, now: Instant) -> Instant {
-        if self.outstanding.is_some() {
-            now + PROBE_POLL_TICK
-        } else {
-            self.next_probe_at
-        }
-    }
-    fn report(&self, local_addr: SocketAddr) -> TupleReport {
-        TupleReport {
-            local_addr,
-            rtt: self.rtt,
-            loss: self.loss,
-            alive: self.alive(),
-        }
-    }
-}
-
-fn poisson_interval(mean: Duration) -> Duration {
-    let u: f64 = rand::random::<f64>().clamp(f64::MIN_POSITIVE, 1.0);
-    let interval = mean.mul_f64(-u.ln());
-    interval.clamp(mean / 4, mean * 4)
-}
-
-#[derive(Debug, Clone)]
-pub struct TupleReport {
-    pub local_addr: SocketAddr,
-    pub rtt: Option<Duration>,
-    pub loss: Option<f64>,
-    pub alive: bool,
-}
 #[derive(Debug, Clone, Default)]
 pub struct ExplorerReport {
     pub candidates: Vec<TupleReport>,
@@ -449,6 +245,7 @@ impl<C: ProbeIo> Explorer<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::tuple_stats::{DEAD_CONSECUTIVE_LOSSES, MIN_SAMPLES, PROBE_POLL_TICK, PROBE_TIMEOUT};
 
     use std::{
         collections::VecDeque,

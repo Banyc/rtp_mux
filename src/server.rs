@@ -23,11 +23,11 @@ use tracing::{info, instrument, trace, warn};
 use crate::{
     accept_error::AcceptErrorBackoff,
     admission::{
-        AdmittedLane, ExpiredPendingLane, LaneRejectionClass, LaneRejectionLog, PendingLane,
-        PendingLaneAdmission, PendingLaneRegistry, PendingLaneWait, PreparedLane,
-        RejectedLaneContext,
+        AdmittedLane, ExpiredPendingLane, PendingLane, PendingLaneAdmission, PendingLaneRegistry,
+        PendingLaneWait, PreparedLane,
     },
     group::{GroupMember, SessionGroupRegistry},
+    lane_rejection::{LaneRejectionClass, LaneRejectionLog, RejectedLaneContext},
     shared::{ADMISSION_REJECTION_LOG_INTERVAL, HELLO_DEADLINE, bulk_lane_addr, server_mux_config},
     stream::{ServerStream, SocketAddrPair},
 };
@@ -137,50 +137,14 @@ impl RtpMuxServer {
                 }
                 _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig { handshake: false, fec: self.fec, mss: rtp::udp::MssConfig::Default, fec_tuning: FecTuning::default() }) => {
-                    let stream = match finish_frame_delivery_accept(result).await {
-                        Ok(stream) => { interactive_backoff.accepted("rtp_mux_interactive", addr); stream }
-                        Err(error) => {
-                            match interactive_backoff.failed_dispatching("rtp_mux_interactive", addr, error) {
-                                Ok(()) => { interactive_backoff.pause().await; continue; }
-                                Err(source) => return Err(ServeError::Accept { source, addr }),
-                            }
-                        }
-                    };
-                    counter!("stream.rtp_mux.rtp.accepts").increment(1);
-                    let peer = stream.peer_addr;
-                    let read = stream.read;
-                    let write = stream.write;
-                    let permit = match registry.try_acquire(peer.ip()) {
-                        Ok(permit) => permit,
-                        Err(reason) => {
-                            rejections.record(RejectedLaneContext { class: LaneRejectionClass::Capacity, peer, local_addr: addr, expected_class: Some(LaneClass::Interactive), reason: reason.to_string() });
-                            continue;
-                        }
-                    };
-                    spawn_lane_accept(AdmittedLane { read, write, config: server_mux_config(), expected_class: LaneClass::Interactive, peer, local_addr: addr, permit }, env.clone(), Arc::clone(&registry), Arc::clone(&groups), rejections.clone());
+                    if let Err(source) = handle_lane_accept(result, &mut interactive_backoff, "rtp_mux_interactive", addr, LaneClass::Interactive, &env, &registry, &groups, &rejections).await {
+                        return Err(source);
+                    }
                 }
                 result = self.bulk_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig { handshake: false, fec: self.fec, mss: rtp::udp::MssConfig::Default, fec_tuning: FecTuning::default() }) => {
-                    let stream = match finish_frame_delivery_accept(result).await {
-                        Ok(stream) => { bulk_backoff.accepted("rtp_mux_bulk", bulk_addr); stream }
-                        Err(error) => {
-                            match bulk_backoff.failed_dispatching("rtp_mux_bulk", bulk_addr, error) {
-                                Ok(()) => { bulk_backoff.pause().await; continue; }
-                                Err(source) => { return Err(ServeError::Accept { source, addr: bulk_addr }); }
-                            }
-                        }
-                    };
-                    counter!("stream.rtp_mux.rtp.accepts").increment(1);
-                    let peer = stream.peer_addr;
-                    let read = stream.read;
-                    let write = stream.write;
-                    let permit = match registry.try_acquire(peer.ip()) {
-                        Ok(permit) => permit,
-                        Err(reason) => {
-                            rejections.record(RejectedLaneContext { class: LaneRejectionClass::Capacity, peer, local_addr: bulk_addr, expected_class: Some(LaneClass::Bulk), reason: reason.to_string() });
-                            continue;
-                        }
-                    };
-                    spawn_lane_accept(AdmittedLane { read, write, config: server_mux_config(), expected_class: LaneClass::Bulk, peer, local_addr: bulk_addr, permit }, env.clone(), Arc::clone(&registry), Arc::clone(&groups), rejections.clone());
+                    if let Err(source) = handle_lane_accept(result, &mut bulk_backoff, "rtp_mux_bulk", bulk_addr, LaneClass::Bulk, &env, &registry, &groups, &rejections).await {
+                        return Err(source);
+                    }
                 }
             }
         }
@@ -197,6 +161,67 @@ async fn finish_frame_delivery_accept(
     accept: io::Result<rtp::udp::FrameDeliveryAccept>,
 ) -> io::Result<rtp::udp::FrameDeliveryIo> {
     accept?.await.map_err(io::Error::other)?
+}
+
+async fn handle_lane_accept(
+    accept: io::Result<rtp::udp::FrameDeliveryAccept>,
+    backoff: &mut AcceptErrorBackoff,
+    backoff_name: &'static str,
+    addr: SocketAddr,
+    lane: LaneClass,
+    env: &StreamHandler,
+    registry: &Arc<PendingLaneRegistry>,
+    groups: &Arc<SessionGroupRegistry>,
+    rejections: &LaneRejectionLog,
+) -> Result<(), ServeError> {
+    let stream = match finish_frame_delivery_accept(accept).await {
+        Ok(stream) => {
+            backoff.accepted(backoff_name, addr);
+            stream
+        }
+        Err(error) => {
+            match backoff.failed_dispatching(backoff_name, addr, error) {
+                Ok(()) => {
+                    backoff.pause().await;
+                    return Ok(());
+                }
+                Err(source) => return Err(ServeError::Accept { source, addr }),
+            }
+        }
+    };
+    counter!("stream.rtp_mux.rtp.accepts").increment(1);
+    let peer = stream.peer_addr;
+    let read = stream.read;
+    let write = stream.write;
+    let permit = match registry.try_acquire(peer.ip()) {
+        Ok(permit) => permit,
+        Err(reason) => {
+            rejections.record(RejectedLaneContext {
+                class: LaneRejectionClass::Capacity,
+                peer,
+                local_addr: addr,
+                expected_class: Some(lane),
+                reason: reason.to_string(),
+            });
+            return Ok(());
+        }
+    };
+    spawn_lane_accept(
+        AdmittedLane {
+            read,
+            write,
+            config: server_mux_config(),
+            expected_class: lane,
+            peer,
+            local_addr: addr,
+            permit,
+        },
+        env.clone(),
+        Arc::clone(registry),
+        Arc::clone(groups),
+        rejections.clone(),
+    );
+    Ok(())
 }
 
 fn spawn_lane_accept(

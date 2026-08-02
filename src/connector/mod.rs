@@ -1,10 +1,10 @@
+mod dial;
+mod session;
+
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
-    future::Future,
     io,
     net::SocketAddr,
-    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -13,11 +13,7 @@ use std::{
 };
 
 use futures::stream::{FuturesUnordered, StreamExt as _};
-use metrics::counter;
-use mux::{
-    GroupToken, LaneClass, MuxError, PairingNonce, StreamReader,
-    spawn_mux_no_reconnection_with_first_receive_deadline_and_ready,
-};
+use mux::{GroupToken, LaneClass, MuxError, StreamReader};
 use tokio::{sync::oneshot, task::JoinSet};
 use tracing::{debug, info, trace, warn};
 
@@ -26,13 +22,18 @@ use crate::{
     explorer::{
         Explorer, ExplorerConfig, ExplorerReport, ProbeIo, ReoptRule, ReoptVerdict, SocketCandidate,
     },
-    shared::{
-        BIRTH_LIVENESS_DEADLINE, BIRTH_LIVENESS_GRACE, MAX_CONCURRENT_DUAL_DIALS,
-        MAX_DIAL_WAITERS_PER_ADDR, MAX_DUAL_CONNECT_ATTEMPTS, client_mux_config,
-    },
+    shared::{MAX_CONCURRENT_DUAL_DIALS, MAX_DIAL_WAITERS_PER_ADDR},
     stream::SocketAddrPair,
-    traffic::{SessionStats, SessionTraffic},
+    traffic::SessionStats,
 };
+
+use dial::{
+    connect_dual_lane, dual_supervisor_result, ConnectedDualLaneBirth, DualLaneDial, DualLaneDialer,
+};
+use session::{
+    Session, SharedDraining, SharedSessions, live_session, prune_dead_addresses, rebind_streams,
+};
+pub(crate) use session::{SessionGuard, StreamRebind};
 
 const SESSION_LINGER: Duration = Duration::from_secs(3);
 
@@ -82,173 +83,11 @@ impl OpenedStream {
     }
 }
 
-struct Session {
-    id: u64,
-    opener: mux::DualStreamOpener,
-    addr: SocketAddrPair,
-    nonce: PairingNonce,
-    connected_at: Instant,
-    opened_streams: AtomicU64,
-    live_streams: AtomicU64,
-    traffic: Arc<SessionTraffic>,
-    router: mux::ResponseRouterHandle,
-    kill_tx: tokio::sync::mpsc::Sender<()>,
-    streams: Mutex<Vec<std::sync::Weak<StreamRebind>>>,
-    successor: Mutex<Option<Arc<Session>>>,
-}
-
-impl Session {
-    fn open_stream(self: &Arc<Self>, lane: LaneClass) -> OpenedStream {
-        let stream_id = rand::random::<u64>();
-        let (writer, reader) = self.opener.open_migrating_with_reader(stream_id, lane);
-        self.opened_streams.fetch_add(1, Ordering::Relaxed);
-        counter!("stream.rtp_mux.rtp_connects").increment(1);
-        counter!("stream.rtp_mux.mux_connects").increment(1);
-        OpenedStream {
-            writer,
-            reader,
-            addr: self.addr,
-            response: (stream_id, self.router.clone()),
-            guard: self.guard(),
-        }
-    }
-    fn guard(self: &Arc<Self>) -> SessionGuard {
-        self.live_streams.fetch_add(1, Ordering::Relaxed);
-        SessionGuard(Arc::clone(self))
-    }
-    fn track(&self, stream: std::sync::Weak<StreamRebind>) {
-        let mut streams = self.streams.lock().unwrap();
-        streams.retain(|weak| weak.strong_count() > 0);
-        streams.push(stream);
-    }
-    fn track_if_current(&self, stream: std::sync::Weak<StreamRebind>) -> bool {
-        let mut streams = self.streams.lock().unwrap();
-        if self.successor.lock().unwrap().is_some() {
-            return false;
-        }
-        streams.retain(|weak| weak.strong_count() > 0);
-        streams.push(stream);
-        true
-    }
-    fn kill(&self) {
-        let _ = self.kill_tx.try_send(());
-    }
-    fn stats(&self) -> SessionStats {
-        SessionStats {
-            live_streams: self.live_streams.load(Ordering::Relaxed),
-            opened_streams: self.opened_streams.load(Ordering::Relaxed),
-            tx_bytes: self.traffic.tx_bytes(),
-            rx_bytes: self.traffic.rx_bytes(),
-            uptime: self.connected_at.elapsed(),
-        }
-    }
-}
-
-pub(crate) struct SessionGuard(Arc<Session>);
-
-impl SessionGuard {
-    fn session(&self) -> &Arc<Session> {
-        &self.0
-    }
-}
-
-impl Drop for SessionGuard {
-    fn drop(&mut self) {
-        self.0.live_streams.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-impl fmt::Debug for SessionGuard {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SessionGuard")
-    }
-}
-
-pub(crate) struct StreamRebind {
-    rebind: crate::migrating_write_half::RebindHandle,
-    guard: Mutex<SessionGuard>,
-}
-
-impl StreamRebind {
-    pub(crate) fn track(
-        rebind: crate::migrating_write_half::RebindHandle,
-        guard: SessionGuard,
-    ) -> Arc<Self> {
-        let session = Arc::clone(guard.session());
-        let handle = Arc::new(Self {
-            rebind,
-            guard: Mutex::new(guard),
-        });
-        if !session.track_if_current(Arc::downgrade(&handle)) {
-            let live = latest_generation(&session);
-            match Arc::ptr_eq(&live, &session) {
-                true => session.track(Arc::downgrade(&handle)),
-                false => {
-                    rebind_one(&handle, &live);
-                }
-            }
-        }
-        handle
-    }
-}
-
-fn latest_generation(session: &Arc<Session>) -> Arc<Session> {
-    let mut newest_live = Arc::clone(session);
-    let mut cursor = Arc::clone(session);
-    for _ in 0..MAX_SUCCESSOR_HOPS {
-        let Some(next) = cursor.successor.lock().unwrap().clone() else {
-            break;
-        };
-        cursor = next;
-        if cursor.opener.is_alive() {
-            newest_live = Arc::clone(&cursor);
-        }
-    }
-    newest_live
-}
-const MAX_SUCCESSOR_HOPS: usize = 8;
-
-impl fmt::Debug for StreamRebind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("StreamRebind")
-    }
-}
-
-type SharedSessions = Arc<Mutex<HashMap<SocketAddr, Arc<Session>>>>;
-type SharedDraining = Arc<Mutex<HashMap<SocketAddr, std::sync::Weak<Session>>>>;
-
-fn live_session(sessions: &SharedSessions, addr: SocketAddr) -> Option<Arc<Session>> {
-    let session = sessions.lock().unwrap().get(&addr).cloned()?;
-    session.opener.is_alive().then_some(session)
-}
-
-struct ConnectedDualLaneBirth {
-    opener: mux::DualStreamOpener,
-    accepter: mux::DualStreamAccepter,
-    local_addr: SocketAddr,
-    nonce: PairingNonce,
-    supervisor: JoinSet<MuxError>,
-    probe_tap: Option<rtp::probe::ProbeTap>,
-    traffic: Arc<SessionTraffic>,
-}
-
 struct AddrGroup {
     token: GroupToken,
     router: Option<mux::ResponseRouter>,
     sessions: Vec<std::sync::Weak<Session>>,
 }
-
-type DualLaneDial = Pin<
-    Box<dyn Future<Output = (SocketAddr, io::Result<ConnectedDualLaneBirth>)> + Send + 'static>,
->;
-type DualLaneDialResult =
-    Pin<Box<dyn Future<Output = io::Result<ConnectedDualLaneBirth>> + Send + 'static>>;
-type DualLaneDialer = Arc<
-    dyn Fn(SocketAddr, GroupToken, Option<tokio_udp::UdpSocket>) -> DualLaneDialResult
-        + Send
-        + Sync
-        + 'static,
->;
 
 struct ExplorerContext {
     config: ExplorerConfig,
@@ -566,51 +405,6 @@ fn install_session(
     session
 }
 
-fn prune_dead_addresses(
-    groups: &mut HashMap<SocketAddr, AddrGroup>,
-    explorers: &mut HashMap<SocketAddr, Explorer<SocketCandidate>>,
-    in_flight_dials: &HashSet<SocketAddr>,
-) {
-    groups.retain(|addr, group| {
-        group.sessions.retain(|weak| weak.strong_count() > 0);
-        in_flight_dials.contains(addr) || !group.sessions.is_empty()
-    });
-    explorers.retain(|addr, _| groups.contains_key(addr));
-}
-
-fn rebind_one(stream: &Arc<StreamRebind>, new: &Arc<Session>) -> bool {
-    if !stream.rebind.rebind(new.opener.clone()) {
-        return false;
-    }
-    *stream.guard.lock().unwrap() = new.guard();
-    new.track(Arc::downgrade(stream));
-    true
-}
-
-fn rebind_streams(old: &Session, new: &Arc<Session>) -> usize {
-    if !new.opener.is_alive() {
-        return 0;
-    }
-    let handles: Vec<_> = {
-        let mut streams = old.streams.lock().unwrap();
-        let handles: Vec<_> = streams.drain(..).collect();
-        *old.successor.lock().unwrap() = Some(Arc::clone(new));
-        handles
-    };
-    let mut moved = 0;
-    for weak in handles {
-        let Some(stream) = weak.upgrade() else {
-            continue;
-        };
-        if !rebind_one(&stream, new) {
-            trace!(up = ?old.addr.peer_addr, "RTP mux stream writer gone before rebind");
-            continue;
-        }
-        moved += 1;
-    }
-    moved
-}
-
 async fn refill_candidates(
     explorer: &mut Explorer<SocketCandidate>,
     ctx: &ExplorerContext,
@@ -831,201 +625,15 @@ fn live_dial_waiters(
     }
 }
 
-fn dual_supervisor_result(result: Option<Result<MuxError, tokio::task::JoinError>>) -> MuxError {
-    match result {
-        Some(Ok(error)) => error,
-        Some(Err(source)) => MuxError::TaskJoin {
-            task: "dual_lane",
-            source,
-        },
-        None => MuxError::TaskStopped { task: "dual_lane" },
-    }
-}
-
-async fn connect_dual_lane(
-    addr: SocketAddr,
-    bind: BindSelector,
-    bulk_addr: BulkAddrSelector,
-    fec: bool,
-    group: GroupToken,
-    socket: Option<tokio_udp::UdpSocket>,
-) -> io::Result<ConnectedDualLaneBirth> {
-    let mut socket = socket;
-    retry_dual_connect(addr, || {
-        connect_dual_lane_once(
-            addr,
-            Arc::clone(&bind),
-            Arc::clone(&bulk_addr),
-            fec,
-            group,
-            socket.take(),
-        )
-    })
-    .await
-}
-
-async fn retry_dual_connect<F, Fut>(
-    addr: SocketAddr,
-    mut once: F,
-) -> io::Result<ConnectedDualLaneBirth>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = io::Result<ConnectedDualLaneBirth>>,
-{
-    let started = Instant::now();
-    let mut failures = Vec::new();
-    let mut last_kind = io::ErrorKind::Other;
-    for attempt in 1..=MAX_DUAL_CONNECT_ATTEMPTS {
-        let attempt_started = Instant::now();
-        match once().await {
-            Ok(birth) => {
-                if attempt > 1 {
-                    info!(?addr, attempt, failures = %failures.join(";"), elapsed_ms = started.elapsed().as_millis(), "RTP mux dual-lane birth recovered after retry");
-                }
-                return Ok(birth);
-            }
-            Err(error) => {
-                let will_retry = attempt < MAX_DUAL_CONNECT_ATTEMPTS;
-                last_kind = error.kind();
-                failures.push(format!(
-                    "attempt={attempt}, elapsed_ms={}, error={error}",
-                    attempt_started.elapsed().as_millis(),
-                ));
-                debug!(
-                    ?error,
-                    ?addr,
-                    attempt,
-                    max_attempts = MAX_DUAL_CONNECT_ATTEMPTS,
-                    will_retry,
-                    elapsed_ms = attempt_started.elapsed().as_millis(),
-                    "RTP mux dual-lane birth failed"
-                );
-                if will_retry {
-                    tokio::time::sleep(Duration::from_millis(25 * attempt as u64)).await;
-                }
-            }
-        }
-    }
-    Err(io::Error::new(
-        last_kind,
-        format!(
-            "RTP mux dual-lane birth failed after {} attempts in {} ms: {}",
-            failures.len(),
-            started.elapsed().as_millis(),
-            failures.join("; "),
-        ),
-    ))
-}
-
-async fn connect_dual_lane_once(
-    addr: SocketAddr,
-    bind: BindSelector,
-    bulk_addr: BulkAddrSelector,
-    fec: bool,
-    group: GroupToken,
-    socket: Option<tokio_udp::UdpSocket>,
-) -> io::Result<ConnectedDualLaneBirth> {
-    let bind_addr = bind(addr);
-    let bulk_addr = bulk_addr(addr)?;
-    let config = || rtp::udp::FrameDeliveryConnectConfig {
-        log_config: None,
-        handshake: false,
-        fec,
-        mss: rtp::udp::MssConfig::Default,
-        fec_tuning: rtp::transmission::fec_tuning::FecTuning::default(),
-    };
-    let mut interactive = match socket {
-        Some(socket) => {
-            rtp::udp::FrameDeliveryIo::connect_with_socket(socket, addr, config()).await?
-        }
-        None => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, config()).await?,
-    };
-    let interactive_local = interactive.local_addr;
-    let probe_tap = interactive.probe_tap.take();
-    let bulk =
-        rtp::udp::FrameDeliveryIo::connect(SocketAddr::new(bind_addr.ip(), 0), bulk_addr, config())
-            .await?;
-    let nonce = PairingNonce::generate();
-    let interactive_reader = interactive.read;
-    let mut interactive_writer = interactive.write;
-    let bulk_reader = bulk.read;
-    let mut bulk_writer = bulk.write;
-    if let Err(error) = mux::write_lane_hello(
-        &mut interactive_writer,
-        LaneClass::Interactive,
-        nonce,
-        group,
-    )
-    .await
-    {
-        return Err(io::Error::other(format!(
-            "interactive lane hello: {error:?}"
-        )));
-    }
-    if let Err(error) = mux::write_lane_hello(&mut bulk_writer, LaneClass::Bulk, nonce, group).await
-    {
-        let _ = interactive_writer.send_kill_and_abort().await;
-        return Err(io::Error::other(format!("bulk lane hello: {error:?}")));
-    }
-    let traffic = Arc::new(SessionTraffic::default());
-    let interactive_reader = traffic.count_read(interactive_reader);
-    let interactive_writer = traffic.count_write(interactive_writer);
-    let bulk_reader = traffic.count_read(bulk_reader);
-    let bulk_writer = traffic.count_write(bulk_writer);
-    let mut interactive_tasks = JoinSet::new();
-    let (interactive_opener, interactive_accepter, interactive_ready) =
-        spawn_mux_no_reconnection_with_first_receive_deadline_and_ready(
-            interactive_reader,
-            interactive_writer,
-            client_mux_config(),
-            BIRTH_LIVENESS_DEADLINE,
-            &mut interactive_tasks,
-        );
-    let mut bulk_tasks = JoinSet::new();
-    let (bulk_opener, bulk_accepter, bulk_ready) =
-        spawn_mux_no_reconnection_with_first_receive_deadline_and_ready(
-            bulk_reader,
-            bulk_writer,
-            client_mux_config(),
-            BIRTH_LIVENESS_DEADLINE,
-            &mut bulk_tasks,
-        );
-    let mut supervisor = JoinSet::new();
-    let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
-        interactive_opener,
-        interactive_accepter,
-        interactive_tasks,
-        bulk_opener,
-        bulk_accepter,
-        bulk_tasks,
-        &mut supervisor,
-    );
-    let birth_deadline = tokio::time::sleep(BIRTH_LIVENESS_DEADLINE + BIRTH_LIVENESS_GRACE);
-    tokio::pin!(birth_deadline);
-    tokio::select! {
-        biased;
-        result = supervisor.join_next() => { let error = dual_supervisor_result(result); return Err(io::Error::new(io::ErrorKind::BrokenPipe, format!("dual-lane birth liveness failed: {error:?}"))); }
-        ready = async { tokio::try_join!(interactive_ready, bulk_ready) } => { if ready.is_err() { return Err(io::Error::new(io::ErrorKind::BrokenPipe, "dual-lane birth readiness channel closed")); } }
-        () = &mut birth_deadline => { return Err(io::Error::new(io::ErrorKind::TimedOut, "dual-lane birth liveness deadline exceeded")); }
-    }
-    Ok(ConnectedDualLaneBirth {
-        opener,
-        accepter,
-        local_addr: interactive_local,
-        nonce,
-        supervisor,
-        probe_tap,
-        traffic,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
-    use crate::shared::server_mux_config;
-    use mux::spawn_mux_no_reconnection;
+    use crate::shared::{client_mux_config, server_mux_config};
+    use crate::traffic::SessionTraffic;
+    use mux::{PairingNonce, spawn_mux_no_reconnection};
+    use super::dial::retry_dual_connect;
 
     fn spawn_test_connector(
         dialer: DualLaneDialer,
@@ -1159,7 +767,7 @@ mod tests {
             .unwrap();
     }
 
-    fn fake_connected_birth(
+    pub(super) fn fake_connected_birth(
         addr: SocketAddr,
         terminate: Option<oneshot::Receiver<()>>,
     ) -> ConnectedDualLaneBirth {
@@ -1238,7 +846,7 @@ mod tests {
         }
     }
 
-    async fn fake_dead_birth() -> ConnectedDualLaneBirth {
+    pub(super) async fn fake_dead_birth() -> ConnectedDualLaneBirth {
         let lane = || {
             let (local, peer) = tokio::io::duplex(64 * 1024);
             drop(peer);
@@ -1278,7 +886,7 @@ mod tests {
         }
     }
 
-    fn one_address_group(addr: SocketAddr) -> HashMap<SocketAddr, AddrGroup> {
+    pub(super) fn one_address_group(addr: SocketAddr) -> HashMap<SocketAddr, AddrGroup> {
         HashMap::from([(
             addr,
             AddrGroup {
@@ -1287,45 +895,6 @@ mod tests {
                 sessions: Vec::new(),
             },
         )])
-    }
-
-    #[tokio::test]
-    async fn a_recycle_onto_a_dead_session_leaves_streams_where_they_are() {
-        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
-        let mut groups = one_address_group(addr);
-        let mut supervisors = JoinSet::new();
-        let old = install_session(
-            addr,
-            fake_connected_birth(addr, None),
-            &mut groups,
-            &mut supervisors,
-        );
-        let dead = install_session(addr, fake_dead_birth().await, &mut groups, &mut supervisors);
-        let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
-        let _stream = StreamRebind::track(slot.handle(), old.guard());
-        assert_eq!(old.live_streams.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            rebind_streams(&old, &dead),
-            0,
-            "no stream may be moved onto a session that is already down"
-        );
-        assert!(
-            slot.take().is_none(),
-            "a live stream was repointed at a dead session"
-        );
-        assert_eq!(old.live_streams.load(Ordering::Relaxed), 1);
-        assert!(
-            old.successor.lock().unwrap().is_none(),
-            "a dead session must not be published as the successor",
-        );
-        let live = install_session(
-            addr,
-            fake_connected_birth(addr, None),
-            &mut groups,
-            &mut supervisors,
-        );
-        assert_eq!(rebind_streams(&old, &live), 1);
-        assert!(slot.take().is_some());
     }
 
     #[tokio::test]
@@ -1358,69 +927,6 @@ mod tests {
         );
         drop(stream);
         stop(commands, coordinator).await;
-    }
-
-    #[tokio::test]
-    async fn a_late_tracked_stream_skips_a_successor_that_has_died() {
-        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
-        let mut groups = one_address_group(addr);
-        let mut supervisors = JoinSet::new();
-        let old = install_session(
-            addr,
-            fake_connected_birth(addr, None),
-            &mut groups,
-            &mut supervisors,
-        );
-        let dead = install_session(addr, fake_dead_birth().await, &mut groups, &mut supervisors);
-        *old.successor.lock().unwrap() = Some(Arc::clone(&dead));
-        let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
-        let _stream = StreamRebind::track(slot.handle(), old.guard());
-        assert!(
-            slot.take().is_none(),
-            "the stream was repointed at a dead successor",
-        );
-        assert_eq!(
-            old.live_streams.load(Ordering::Relaxed),
-            1,
-            "the stream must stay on the generation that is still reachable",
-        );
-        assert_eq!(dead.live_streams.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn a_stream_registering_during_the_drain_is_not_stranded() {
-        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
-        let mut groups = one_address_group(addr);
-        let mut supervisors = JoinSet::new();
-        let old = install_session(
-            addr,
-            fake_connected_birth(addr, None),
-            &mut groups,
-            &mut supervisors,
-        );
-        let new = install_session(
-            addr,
-            fake_connected_birth(addr, None),
-            &mut groups,
-            &mut supervisors,
-        );
-        let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
-        let held = old.streams.lock().unwrap();
-        let registering = {
-            let old = Arc::clone(&old);
-            let handle = slot.handle();
-            std::thread::spawn(move || StreamRebind::track(handle, old.guard()))
-        };
-        std::thread::sleep(Duration::from_millis(50));
-        *old.successor.lock().unwrap() = Some(Arc::clone(&new));
-        drop(held);
-        let _stream = registering.join().unwrap();
-        assert!(
-            slot.take().is_some(),
-            "a stream that registered during the drain was left on the drained generation",
-        );
-        assert_eq!(new.live_streams.load(Ordering::Relaxed), 1);
-        assert_eq!(old.live_streams.load(Ordering::Relaxed), 0);
     }
 
     fn counting_fake_dialer(attempts: Arc<AtomicUsize>) -> DualLaneDialer {
