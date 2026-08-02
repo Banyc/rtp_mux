@@ -93,13 +93,83 @@ impl PathScore {
     fn cost(&self) -> f64 {
         self.rtt.as_secs_f64() / (1.0 - self.loss).max(0.05)
     }
-    fn beats_by_margin(&self, active: &PathScore) -> bool {
+    fn beats_by_margin(&self, active: &PathScore) -> Option<ReoptRule> {
         let rtt_wins = self.rtt.as_secs_f64()
             <= active.rtt.as_secs_f64() * (1.0 - REOPT_RTT_MARGIN)
             && self.loss <= active.loss + REOPT_LOSS_TOLERANCE;
         let loss_wins = self.loss + REOPT_LOSS_MARGIN <= active.loss
             && self.rtt.as_secs_f64() <= active.rtt.as_secs_f64() * (1.0 + REOPT_RTT_MARGIN);
-        rtt_wins || loss_wins
+        match (rtt_wins, loss_wins) {
+            (true, _) => Some(ReoptRule::Rtt),
+            (false, true) => Some(ReoptRule::Loss),
+            (false, false) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReoptRule {
+    Rtt,
+    Loss,
+}
+
+impl ReoptRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rtt => "rtt_margin",
+            Self::Loss => "loss_margin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReoptVerdict {
+    Migrate {
+        rule: ReoptRule,
+        active: PathScore,
+        best: PathScore,
+    },
+    ActiveUnmeasured,
+    NoLiveCandidate {
+        active: PathScore,
+    },
+    WithinMargin {
+        active: PathScore,
+        best: PathScore,
+    },
+}
+
+impl ReoptVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Migrate { .. } => "margin_win",
+            Self::ActiveUnmeasured => "active_unmeasured",
+            Self::NoLiveCandidate { .. } => "no_live_candidate",
+            Self::WithinMargin { .. } => "within_margin",
+        }
+    }
+    pub fn wants_migration(&self) -> bool {
+        matches!(self, Self::Migrate { .. })
+    }
+    pub fn active(&self) -> Option<PathScore> {
+        match self {
+            Self::Migrate { active, .. }
+            | Self::NoLiveCandidate { active }
+            | Self::WithinMargin { active, .. } => Some(*active),
+            Self::ActiveUnmeasured => None,
+        }
+    }
+    pub fn best(&self) -> Option<PathScore> {
+        match self {
+            Self::Migrate { best, .. } | Self::WithinMargin { best, .. } => Some(*best),
+            Self::ActiveUnmeasured | Self::NoLiveCandidate { .. } => None,
+        }
+    }
+    pub fn rule(&self) -> Option<ReoptRule> {
+        match self {
+            Self::Migrate { rule, .. } => Some(*rule),
+            _ => None,
+        }
     }
 }
 
@@ -333,12 +403,17 @@ impl<C: ProbeIo> Explorer<C> {
             .expect("best_index only returns scored candidates");
         Some((candidate.io, candidate.local_addr, score))
     }
-    pub(crate) fn should_reoptimize(&self) -> bool {
+    pub(crate) fn reoptimize_verdict(&self) -> ReoptVerdict {
         let Some(active) = self.active.as_ref().and_then(|active| active.stats.score()) else {
-            return false;
+            return ReoptVerdict::ActiveUnmeasured;
         };
-        self.best_score()
-            .is_some_and(|best| best.beats_by_margin(&active))
+        let Some(best) = self.best_score() else {
+            return ReoptVerdict::NoLiveCandidate { active };
+        };
+        match best.beats_by_margin(&active) {
+            Some(rule) => ReoptVerdict::Migrate { rule, active, best },
+            None => ReoptVerdict::WithinMargin { active, best },
+        }
     }
     pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Instant> {
         let candidates = self
@@ -487,7 +562,11 @@ mod tests {
         let mut explorer = Explorer::new(config(), Instant::now());
         explorer.add_candidate(FakeIo::default(), local(1000), Instant::now());
         assert!(explorer.take_best().is_none());
-        assert!(!explorer.should_reoptimize());
+        assert_eq!(
+            explorer.reoptimize_verdict(),
+            ReoptVerdict::ActiveUnmeasured,
+            "no active session means nothing to beat"
+        );
     }
     #[test]
     fn loss_marks_a_candidate_dead_and_ineligible() {
@@ -533,6 +612,32 @@ mod tests {
         let report = explorer.report();
         assert_eq!(report.candidates.len(), 1);
         assert_eq!(report.candidates[0].local_addr, local(1000));
+    }
+    #[test]
+    fn a_declined_reoptimize_distinguishes_its_two_no_op_cases() {
+        let mut now = Instant::now();
+        let mut explorer: Explorer<FakeIo> = Explorer::new(config(), now);
+        let active = FakeIo::default();
+        explorer.set_active(Some((Box::new(active.clone()), local(9000))), now);
+        assert_eq!(
+            explorer.reoptimize_verdict(),
+            ReoptVerdict::ActiveUnmeasured,
+            "the active tuple has not reached MIN_SAMPLES yet"
+        );
+        for _ in 0..MIN_SAMPLES {
+            probe_cycle(
+                &mut explorer,
+                &mut now,
+                &[(&active, Duration::from_millis(9))],
+            );
+        }
+        let verdict = explorer.reoptimize_verdict();
+        assert!(
+            matches!(verdict, ReoptVerdict::NoLiveCandidate { .. }),
+            "a measured active with no candidates: {verdict:?}"
+        );
+        assert!(verdict.active().is_some(), "the active score is reportable");
+        assert!(verdict.best().is_none(), "there is no best to report");
     }
     #[test]
     fn a_report_names_the_active_tuple() {
@@ -610,7 +715,7 @@ mod tests {
         let mut now = Instant::now();
         let (mut explorer, fast, slow) = warmed_pair(&mut now);
         let ms = Duration::from_millis;
-        assert!(!explorer.should_reoptimize());
+        assert!(!explorer.reoptimize_verdict().wants_migration());
         let active = FakeIo::default();
         explorer.set_active(Some((Box::new(active.clone()), local(9000))), now);
         for _ in 0..MIN_SAMPLES {
@@ -621,8 +726,12 @@ mod tests {
             );
         }
         assert!(
-            !explorer.should_reoptimize(),
-            "11ms -> 10ms is within margin"
+            matches!(
+                explorer.reoptimize_verdict(),
+                ReoptVerdict::WithinMargin { .. }
+            ),
+            "11ms - 10ms is within margin: {:?}",
+            explorer.reoptimize_verdict()
         );
         explorer.set_active(Some((Box::new(active.clone()), local(9000))), now);
         for _ in 0..MIN_SAMPLES {
@@ -632,22 +741,46 @@ mod tests {
                 &[(&fast, ms(10)), (&active, ms(100)), (&slow, ms(200))],
             );
         }
+        let verdict = explorer.reoptimize_verdict();
         assert!(
-            explorer.should_reoptimize(),
-            "100ms -> 10ms clears the margin"
+            matches!(
+                verdict,
+                ReoptVerdict::Migrate {
+                    rule: ReoptRule::Rtt,
+                    ..
+                }
+            ),
+            "100ms - 10ms clears the rtt margin: {verdict:?}"
         );
+        let (active, best) = (verdict.active().unwrap(), verdict.best().unwrap());
+        assert!(active.rtt > best.rtt * 2, "{active:?} vs {best:?}");
         explorer.set_active(Some((Box::new(FakeIo::default()), local(9000))), now);
-        assert!(!explorer.should_reoptimize());
+        assert!(!explorer.reoptimize_verdict().wants_migration());
     }
     #[test]
     fn margin_math_matches_the_documented_constants() {
         let ms = |n: u64| Duration::from_millis(n);
         let score = |rtt, loss| PathScore { rtt, loss };
-        assert!(score(ms(75), 0.0).beats_by_margin(&score(ms(100), 0.0)));
-        assert!(!score(ms(80), 0.0).beats_by_margin(&score(ms(100), 0.0)));
-        assert!(!score(ms(70), 0.10).beats_by_margin(&score(ms(100), 0.0)));
-        assert!(score(ms(100), 0.0).beats_by_margin(&score(ms(100), 0.15)));
-        assert!(!score(ms(200), 0.0).beats_by_margin(&score(ms(100), 0.15)));
+        assert_eq!(
+            score(ms(75), 0.0).beats_by_margin(&score(ms(100), 0.0)),
+            Some(ReoptRule::Rtt)
+        );
+        assert_eq!(
+            score(ms(80), 0.0).beats_by_margin(&score(ms(100), 0.0)),
+            None
+        );
+        assert_eq!(
+            score(ms(70), 0.10).beats_by_margin(&score(ms(100), 0.0)),
+            None
+        );
+        assert_eq!(
+            score(ms(100), 0.0).beats_by_margin(&score(ms(100), 0.15)),
+            Some(ReoptRule::Loss)
+        );
+        assert_eq!(
+            score(ms(200), 0.0).beats_by_margin(&score(ms(100), 0.15)),
+            None
+        );
     }
     #[test]
     fn wakeups_poll_finely_only_while_a_probe_is_outstanding() {

@@ -8,6 +8,7 @@ mod migrating_write_half;
 mod server;
 mod shared;
 mod stream;
+mod traffic;
 
 pub use client_stream::ClientStream;
 pub use connector::{
@@ -19,3 +20,4 @@ pub use migrating_write_half::MigratingWriteHalf;
 pub use mux::LaneClass;
 pub use server::{RtpMuxServer, ServeError};
 pub use stream::{ServerStream, SocketAddrPair};
+pub use traffic::SessionStats;

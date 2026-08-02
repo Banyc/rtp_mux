@@ -23,12 +23,15 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     client_stream::ClientStream,
-    explorer::{Explorer, ExplorerConfig, ExplorerReport, ProbeIo, SocketCandidate},
+    explorer::{
+        Explorer, ExplorerConfig, ExplorerReport, ProbeIo, ReoptRule, ReoptVerdict, SocketCandidate,
+    },
     shared::{
         BIRTH_LIVENESS_DEADLINE, BIRTH_LIVENESS_GRACE, MAX_CONCURRENT_DUAL_DIALS,
         MAX_DIAL_WAITERS_PER_ADDR, MAX_DUAL_CONNECT_ATTEMPTS, client_mux_config,
     },
     stream::SocketAddrPair,
+    traffic::{SessionStats, SessionTraffic},
 };
 
 const SESSION_LINGER: Duration = Duration::from_secs(3);
@@ -87,6 +90,7 @@ struct Session {
     connected_at: Instant,
     opened_streams: AtomicU64,
     live_streams: AtomicU64,
+    traffic: Arc<SessionTraffic>,
     router: mux::ResponseRouterHandle,
     kill_tx: tokio::sync::mpsc::Sender<()>,
     streams: Mutex<Vec<std::sync::Weak<StreamRebind>>>,
@@ -128,6 +132,15 @@ impl Session {
     }
     fn kill(&self) {
         let _ = self.kill_tx.try_send(());
+    }
+    fn stats(&self) -> SessionStats {
+        SessionStats {
+            live_streams: self.live_streams.load(Ordering::Relaxed),
+            opened_streams: self.opened_streams.load(Ordering::Relaxed),
+            tx_bytes: self.traffic.tx_bytes(),
+            rx_bytes: self.traffic.rx_bytes(),
+            uptime: self.connected_at.elapsed(),
+        }
     }
 }
 
@@ -216,6 +229,7 @@ struct ConnectedDualLaneBirth {
     nonce: PairingNonce,
     supervisor: JoinSet<MuxError>,
     probe_tap: Option<rtp::probe::ProbeTap>,
+    traffic: Arc<SessionTraffic>,
 }
 
 struct AddrGroup {
@@ -241,6 +255,27 @@ struct ExplorerContext {
     bind: BindSelector,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecycleTrigger {
+    Forced,
+    BetterPath,
+}
+
+impl RecycleTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Forced => "forced",
+            Self::BetterPath => "better_path",
+        }
+    }
+}
+
+struct Recycling {
+    old: Arc<Session>,
+    trigger: RecycleTrigger,
+    verdict: Option<ReoptVerdict>,
+}
+
 enum ConnectorCommand {
     Connect {
         addr: SocketAddr,
@@ -249,7 +284,7 @@ enum ConnectorCommand {
     },
     Recycle {
         addr: SocketAddr,
-        only_if_better: bool,
+        trigger: RecycleTrigger,
     },
     ExplorerReport {
         addr: SocketAddr,
@@ -290,6 +325,9 @@ impl SessionProbe {
         self.inner
             .upgrade()
             .map(|session| session.live_streams.load(Ordering::Relaxed))
+    }
+    pub fn stats(&self) -> Option<SessionStats> {
+        self.inner.upgrade().map(|session| session.stats())
     }
 }
 
@@ -388,14 +426,10 @@ impl RtpMuxConnector {
     }
 
     pub fn reset_addr(&self, addr: SocketAddr) {
-        self.request_recycle(addr, false);
+        self.request_recycle(addr, RecycleTrigger::Forced);
     }
 
-    pub fn reoptimize(&self, addr: SocketAddr) {
-        self.request_recycle(addr, true);
-    }
-
-    fn request_recycle(&self, addr: SocketAddr, only_if_better: bool) {
+    fn request_recycle(&self, addr: SocketAddr, trigger: RecycleTrigger) {
         if let Some(prev) = self
             .draining
             .lock()
@@ -403,13 +437,12 @@ impl RtpMuxConnector {
             .get(&addr)
             .and_then(std::sync::Weak::upgrade)
         {
-            info!(up = ?prev.addr.peer_addr, live_streams = prev.live_streams.load(Ordering::Relaxed), "RTP mux session recycle skipped; previous generation still draining",);
+            info!(up = ?prev.addr.peer_addr, trigger = trigger.as_str(), draining = %prev.stats(), "RTP mux session recycle skipped; previous generation still draining");
             return;
         }
-        let _ = self.commands.try_send(ConnectorCommand::Recycle {
-            addr,
-            only_if_better,
-        });
+        let _ = self
+            .commands
+            .try_send(ConnectorCommand::Recycle { addr, trigger });
     }
 
     pub async fn explorer_report(&self, addr: SocketAddr) -> io::Result<ExplorerReport> {
@@ -446,6 +479,10 @@ impl RtpMuxConnector {
                 "RTP mux connector dropped reset acknowledgement",
             )
         })
+    }
+
+    pub fn reoptimize(&self, addr: SocketAddr) {
+        self.request_recycle(addr, RecycleTrigger::BetterPath);
     }
 }
 
@@ -485,6 +522,7 @@ fn install_session(
         nonce,
         supervisor,
         probe_tap: _,
+        traffic,
     } = birth;
     let group = groups
         .get_mut(&addr)
@@ -513,6 +551,7 @@ fn install_session(
         connected_at: Instant::now(),
         opened_streams: AtomicU64::new(0),
         live_streams: AtomicU64::new(0),
+        traffic,
         router,
         kill_tx,
         streams: Mutex::new(Vec::new()),
@@ -604,7 +643,7 @@ async fn run_connector(
     let mut in_flight_dials: HashSet<SocketAddr> = HashSet::new();
     let mut dial_waiters: HashMap<SocketAddr, Vec<StreamRequest>> = HashMap::new();
     let mut groups: HashMap<SocketAddr, AddrGroup> = HashMap::new();
-    let mut recycling: HashMap<SocketAddr, Arc<Session>> = HashMap::new();
+    let mut recycling: HashMap<SocketAddr, Recycling> = HashMap::new();
     let mut explorers: HashMap<SocketAddr, Explorer<SocketCandidate>> = HashMap::new();
     let start_dial =
         |addr: SocketAddr,
@@ -625,7 +664,10 @@ async fn run_connector(
                     .entry(addr)
                     .or_insert_with(|| Explorer::new(ctx.config.clone(), Instant::now()));
             }
-            let socket = explorers.get_mut(&addr).and_then(|explorer| { explorer.take_best().map(|(candidate, local_addr, score)| { info!(up = ?addr, up_local = ?local_addr, probe_rtt = ?score.rtt, probe_loss = score.loss, "RTP mux dial inherits explorer candidate tuple"); candidate.into_socket() }) });
+            let socket = explorers.get_mut(&addr).and_then(|explorer| explorer.take_best().map(|(candidate, local_addr, score)| {
+            info!(up = ?addr, up_local = ?local_addr, probe_rtt = ?score.rtt, probe_loss = score.loss, "RTP mux dial inherits explorer candidate tuple");
+            candidate.into_socket()
+        }));
             in_flight_dials.insert(addr);
             let dialer = Arc::clone(&dialer);
             pending_dials.push(Box::pin(async move {
@@ -641,21 +683,13 @@ async fn run_connector(
             explorers.values().filter_map(|e| e.next_wakeup(now)).min()
         };
         tokio::select! {
-            () = async {
-                match explorer_wakeup {
-                    Some(at) => tokio::time::sleep_until(at.into()).await,
-                    None => std::future::pending().await,
-                }
-            },
-            if explorer_wakeup.is_some() => {
-                let now = Instant::now();
-                for explorer in explorers.values_mut() {
-                    explorer.tick(now);
-                }
-                if let Some(ctx) = &explorer_ctx {
-                    for (addr, explorer) in explorers.iter_mut() {
-                        if explorer.wants_refill(now) {
-                            refill_candidates(explorer, ctx, *addr).await;
+            () = async { match explorer_wakeup { Some(at) => tokio::time::sleep_until(at.into()).await, None => std::future::pending().await } } => {
+                if explorer_wakeup.is_some() {
+                    let now = Instant::now();
+                    for explorer in explorers.values_mut() { explorer.tick(now); }
+                    if let Some(ctx) = &explorer_ctx {
+                        for (addr, explorer) in explorers.iter_mut() {
+                            if explorer.wants_refill(now) { refill_candidates(explorer, ctx, *addr).await; }
                         }
                     }
                 }
@@ -663,25 +697,17 @@ async fn run_connector(
             Some(res) = supervisors.join_next() => {
                 match res {
                     Ok((addr, session_id, error)) => {
-                        let session = {
-                            let mut map = sessions.lock().unwrap();
-                            match map.get(&addr) {
-                                Some(session) if session.id == session_id => map.remove(&addr), _ => None,
-                            }
-                        };
+                        let session = { let mut map = sessions.lock().unwrap(); match map.get(&addr) { Some(session) if session.id == session_id => map.remove(&addr), _ => None } };
                         match session {
                             Some(session) => {
-                                warn!(event = "rtp_mux_session_terminated", ?error, nonce = ?session.nonce, up = ?session.addr.peer_addr, up_local = ?session.addr.local_addr, opened_streams = session.opened_streams.load(Ordering::Relaxed), live_streams = session.live_streams.load(Ordering::Relaxed), uptime_ms = session.connected_at.elapsed().as_millis(), "RTP mux dual-lane session terminated");
-                                if let Some(explorer) = explorers.get_mut(&addr) {
-                                    explorer.set_active(None, Instant::now());
-                                }
+                                warn!(event = "rtp_mux_session_terminated", ?error, nonce = ?session.nonce, up = ?session.addr.peer_addr, up_local = ?session.addr.local_addr, mux = %session.stats(), "RTP mux dual-lane session terminated");
+                                if let Some(explorer) = explorers.get_mut(&addr) { explorer.set_active(None, Instant::now()); }
                             }
-                            None => debug!(?error, up = ?addr,
-                                "RTP mux dual-lane session ended after recycle or reset",),
+                            None => debug!(?error, up = ?addr, "RTP mux dual-lane session ended after recycle or reset"),
                         }
                     }
-                    Err(error) if error.is_cancelled() => trace!(?error, "Dual-lane MUX task cancelled"),
-                    Err(error) => warn!(?error, "Dual-lane MUX supervision task failed to join"),
+                    Err(error) if error.is_cancelled() => trace!(?error, "Dual-Lane MUX task cancelled"),
+                    Err(error) => warn!(?error, "Dual-Lane MUX supervision task failed to join"),
                 }
                 prune_dead_addresses(&mut groups, &mut explorers, &in_flight_dials);
             }
@@ -695,25 +721,21 @@ async fn run_connector(
                             explorer.set_active(probe_tap.map(|tap| (Box::new(tap) as Box<dyn ProbeIo>, birth.local_addr)), Instant::now());
                         }
                         let session = install_session(addr, birth, &mut groups, &mut supervisors);
-                        if let Some(old) = &recycled_old {
+                        if let Some(Recycling { old, trigger, verdict }) = &recycled_old {
                             let moved = rebind_streams(old, &session);
-                            info!(up = ?old.addr.peer_addr, up_local = ?old.addr.local_addr, live_streams = old.live_streams.load(Ordering::Relaxed), migrated_streams = moved, uptime_ms = old.connected_at.elapsed().as_millis(), "RTP mux session recycled");
+                            info!(up = ?old.addr.peer_addr, up_local = ?old.addr.local_addr, new_local = ?session.addr.local_addr, trigger = trigger.as_str(), rule = verdict.and_then(|v| v.rule()).map(ReoptRule::as_str), self_rtt = ?verdict.and_then(|v| v.active()).map(|s| s.rtt), self_loss = verdict.and_then(|v| v.active()).map(|s| s.loss), best_rtt = ?verdict.and_then(|v| v.best()).map(|s| s.rtt), best_loss = verdict.and_then(|v| v.best()).map(|s| s.loss), old_mux = %old.stats(), migrated_streams = moved, "RTP mux session recycled");
                             draining.lock().unwrap().insert(addr, Arc::downgrade(old));
                         }
                         if let Some(waiters) = dial_waiters.remove(&addr) {
                             for waiter in waiters {
-                                if waiter.response.is_closed() {
-                                    continue;
-                                }
+                                if waiter.response.is_closed() { continue; }
                                 let _ = waiter.response.send(Ok(session.open_stream(waiter.lane)));
                             }
                         }
                         sessions.lock().unwrap().insert(addr, session);
                     }
                     Err(error) => {
-                        if recycled_old.is_some() {
-                            warn!(?error, up = ?addr, "RTP mux recycle dial failed; streams stay on the old session");
-                        }
+                        if recycled_old.is_some() { warn!(?error, up = ?addr, "RTP mux recycle dial failed; streams stay on the old session"); }
                         let kind = error.kind();
                         let message = error.to_string();
                         if let Some(waiters) = dial_waiters.remove(&addr) {
@@ -729,19 +751,9 @@ async fn run_connector(
                 let Some(command) = command else { break };
                 match command {
                     ConnectorCommand::Reset { completed } => {
-                        for (_, session) in sessions.lock().unwrap().drain() {
-                            session.kill();
-                        }
-                        for (_, weak) in draining.lock().unwrap().drain() {
-                            if let Some(session) = weak.upgrade() {
-                                session.kill();
-                            }
-                        }
-                        for (_, waiters) in dial_waiters.drain() {
-                            for waiter in waiters {
-                                let _ = waiter.response.send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connector reset")));
-                            }
-                        }
+                        for (_, session) in sessions.lock().unwrap().drain() { session.kill(); }
+                        for (_, weak) in draining.lock().unwrap().drain() { if let Some(session) = weak.upgrade() { session.kill(); } }
+                        for (_, waiters) in dial_waiters.drain() { for waiter in waiters { let _ = waiter.response.send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connector reset"))); } }
                         in_flight_dials.clear();
                         pending_dials = FuturesUnordered::new();
                         recycling.clear();
@@ -749,23 +761,26 @@ async fn run_connector(
                         explorers.clear();
                         let _ = completed.send(());
                     }
-                    ConnectorCommand::Recycle { addr, only_if_better } => {
+                    ConnectorCommand::Recycle { addr, trigger } => {
                         let drainer_alive = draining.lock().unwrap().get(&addr).and_then(std::sync::Weak::upgrade).is_some();
-                        if drainer_alive || in_flight_dials.contains(&addr) {
-                            continue;
-                        }
+                        if drainer_alive || in_flight_dials.contains(&addr) { continue; }
                         if pending_dials.len() >= MAX_CONCURRENT_DUAL_DIALS {
-                            debug!(up = ?addr, pending = pending_dials.len(), "RTP mux recycle skipped; dial capacity is saturated");
+                            debug!(up = ?addr, trigger = trigger.as_str(), pending = pending_dials.len(), "RTP mux recycle skipped; dial capacity is saturated");
                             continue;
                         }
-                        if only_if_better && !explorers.get(&addr).is_some_and(Explorer::should_reoptimize) {
-                            trace!(up = ?addr, "RTP mux reoptimize: no candidate beats the active tuple by margin");
-                            continue;
-                        }
-                        let Some(old) = sessions.lock().unwrap().get(&addr).cloned() else {
-                            continue;
+                        let verdict = match trigger {
+                            RecycleTrigger::Forced => None,
+                            RecycleTrigger::BetterPath => {
+                                let verdict = explorers.get(&addr).map(Explorer::reoptimize_verdict).unwrap_or(ReoptVerdict::ActiveUnmeasured);
+                                if !verdict.wants_migration() {
+                                    debug!(up = ?addr, outcome = verdict.as_str(), self_rtt = ?verdict.active().map(|s| s.rtt), self_loss = verdict.active().map(|s| s.loss), best_rtt = ?verdict.best().map(|s| s.rtt), best_loss = verdict.best().map(|s| s.loss), mux = live_session(&sessions, addr).map(|s| s.stats().to_string()), "RTP mux reoptimize declined");
+                                    continue;
+                                }
+                                Some(verdict)
+                            }
                         };
-                        recycling.insert(addr, old);
+                        let Some(old) = sessions.lock().unwrap().get(&addr).cloned() else { continue; };
+                        recycling.insert(addr, Recycling { old, trigger, verdict });
                         start_dial(addr, &mut groups, &mut pending_dials, &mut in_flight_dials, &mut explorers);
                     }
                     ConnectorCommand::ExplorerReport { addr, response } => {
@@ -774,9 +789,7 @@ async fn run_connector(
                     }
                     ConnectorCommand::Connect { addr, lane, response } => {
                         if let Some(session) = live_session(&sessions, addr) {
-                            if !response.is_closed() {
-                                let _ = response.send(Ok(session.open_stream(lane)));
-                            }
+                            if !response.is_closed() { let _ = response.send(Ok(session.open_stream(lane))); }
                             continue;
                         }
                         let request = StreamRequest { lane, response };
@@ -954,6 +967,11 @@ async fn connect_dual_lane_once(
         let _ = interactive_writer.send_kill_and_abort().await;
         return Err(io::Error::other(format!("bulk lane hello: {error:?}")));
     }
+    let traffic = Arc::new(SessionTraffic::default());
+    let interactive_reader = traffic.count_read(interactive_reader);
+    let interactive_writer = traffic.count_write(interactive_writer);
+    let bulk_reader = traffic.count_read(bulk_reader);
+    let bulk_writer = traffic.count_write(bulk_writer);
     let mut interactive_tasks = JoinSet::new();
     let (interactive_opener, interactive_accepter, interactive_ready) =
         spawn_mux_no_reconnection_with_first_receive_deadline_and_ready(
@@ -986,27 +1004,9 @@ async fn connect_dual_lane_once(
     tokio::pin!(birth_deadline);
     tokio::select! {
         biased;
-        result = supervisor.join_next() => {
-            let error = dual_supervisor_result(result);
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("dual-lane birth liveness failed: {error:?}"),
-            ));
-        }
-        ready = async { tokio::try_join!(interactive_ready, bulk_ready) } => {
-            if ready.is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "dual-lane birth readiness channel closed",
-                ));
-            }
-        }
-        () = &mut birth_deadline => {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "dual-lane birth liveness deadline exceeded",
-            ));
-        }
+        result = supervisor.join_next() => { let error = dual_supervisor_result(result); return Err(io::Error::new(io::ErrorKind::BrokenPipe, format!("dual-lane birth liveness failed: {error:?}"))); }
+        ready = async { tokio::try_join!(interactive_ready, bulk_ready) } => { if ready.is_err() { return Err(io::Error::new(io::ErrorKind::BrokenPipe, "dual-lane birth readiness channel closed")); } }
+        () = &mut birth_deadline => { return Err(io::Error::new(io::ErrorKind::TimedOut, "dual-lane birth liveness deadline exceeded")); }
     }
     Ok(ConnectedDualLaneBirth {
         opener,
@@ -1015,6 +1015,7 @@ async fn connect_dual_lane_once(
         nonce,
         supervisor,
         probe_tap,
+        traffic,
     })
 }
 
@@ -1233,6 +1234,7 @@ mod tests {
             nonce: PairingNonce::generate(),
             supervisor,
             probe_tap: None,
+            traffic: Arc::new(SessionTraffic::default()),
         }
     }
 
@@ -1272,6 +1274,7 @@ mod tests {
             nonce: PairingNonce::generate(),
             supervisor,
             probe_tap: None,
+            traffic: Arc::new(SessionTraffic::default()),
         }
     }
 
@@ -1769,7 +1772,7 @@ mod tests {
         commands
             .send(ConnectorCommand::Recycle {
                 addr: live_addr,
-                only_if_better: false,
+                trigger: RecycleTrigger::Forced,
             })
             .await
             .unwrap();
@@ -1790,7 +1793,7 @@ mod tests {
         for response in responses {
             assert_eq!(
                 response.await.unwrap().unwrap_err().kind(),
-                io::ErrorKind::ConnectionAborted,
+                io::ErrorKind::ConnectionAborted
             );
         }
         stop(commands, coordinator).await;

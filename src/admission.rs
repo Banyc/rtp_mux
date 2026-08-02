@@ -320,6 +320,7 @@ impl PendingLaneRegistry {
         self.changed.notify_one();
         PendingLaneAdmission::Reserved
     }
+    #[allow(clippy::result_large_err)]
     pub(crate) fn finish_reservation(
         &self,
         nonce: PairingNonce,
@@ -544,17 +545,19 @@ mod tests {
             mux::MuxConfig::new(mux::Initiation::Server, Duration::from_secs(5)),
             &mut tasks,
         );
+        let group = GroupToken::generate();
         PendingLane {
             pending: mux::PendingAcceptor::new(
                 LaneClass::Interactive,
                 nonce,
+                group,
                 opener,
                 accepter,
                 tasks,
             ),
             peer,
             local_addr,
-            group: GroupToken::generate(),
+            group,
             _permit: registry.try_acquire(peer.ip()).unwrap(),
         }
     }

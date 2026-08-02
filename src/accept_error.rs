@@ -1,6 +1,12 @@
-use std::{io, net::SocketAddr, time::Instant};
+use std::{
+    io,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 const WARN_AFTER_CONSECUTIVE: u64 = 3;
+const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(1);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(100);
 
 fn is_fatal(kind: io::ErrorKind) -> bool {
     matches!(
@@ -50,6 +56,22 @@ impl AcceptErrorBackoff {
             );
         }
         if fatal { Err(error) } else { Ok(()) }
+    }
+
+    fn retry_delay(&self) -> Duration {
+        let Some(over) = self.error_count.checked_sub(WARN_AFTER_CONSECUTIVE) else {
+            return Duration::ZERO;
+        };
+        let delay = RETRY_BACKOFF_BASE * 2u32.pow(over.min(16) as u32);
+        delay.min(RETRY_BACKOFF_MAX)
+    }
+
+    pub(crate) async fn pause(&self) {
+        let delay = self.retry_delay();
+        match delay.is_zero() {
+            true => tokio::task::yield_now().await,
+            false => tokio::time::sleep(delay).await,
+        }
     }
 
     pub(crate) fn accepted(&mut self, listener: &str, addr: SocketAddr) -> bool {
@@ -117,5 +139,43 @@ mod tests {
     fn a_clean_listener_never_warns_on_accept() {
         let mut backoff = AcceptErrorBackoff::default();
         assert!(!backoff.accepted("t", addr()));
+    }
+
+    #[test]
+    fn a_persistent_error_streak_stops_spinning() {
+        let mut backoff = AcceptErrorBackoff::default();
+        transient(&mut backoff);
+        assert_eq!(
+            backoff.retry_delay(),
+            Duration::ZERO,
+            "one bad peer delayed the next good one"
+        );
+        for _ in 1..WARN_AFTER_CONSECUTIVE {
+            transient(&mut backoff);
+        }
+        let first = backoff.retry_delay();
+        assert!(
+            first > Duration::ZERO,
+            "a listener that keeps failing is retried with no delay at all",
+        );
+        for _ in 0..32 {
+            transient(&mut backoff);
+        }
+        assert_eq!(
+            backoff.retry_delay(),
+            RETRY_BACKOFF_MAX,
+            "the delay must climb to a cap and stay there",
+        );
+    }
+
+    #[test]
+    fn recovery_clears_the_backoff() {
+        let mut backoff = AcceptErrorBackoff::default();
+        for _ in 0..WARN_AFTER_CONSECUTIVE + 4 {
+            transient(&mut backoff);
+        }
+        assert!(backoff.retry_delay() > Duration::ZERO);
+        backoff.accepted("t", addr());
+        assert_eq!(backoff.retry_delay(), Duration::ZERO);
     }
 }

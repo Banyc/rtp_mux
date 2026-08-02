@@ -126,37 +126,22 @@ impl RtpMuxServer {
             });
         }
         loop {
-            trace!("Waiting for RTP mux lane");
+            trace!("Waiting for RTP mux Lane");
             tokio::select! {
                 Some(result) = self.mux.join_next() => {
                     match result {
                         Ok(error) => warn!(?error, ?addr, "MUX error"),
-                        Err(error) if error.is_cancelled() => {
-                            trace!(?error, "MUX task cancelled (normal shutdown/reset)")
-                        }
+                        Err(error) if error.is_cancelled() => { trace!(?error, "MUX task cancelled (normal shutdown/reset)"); }
                         Err(error) => warn!(?error, ?addr, "MUX supervision task failed to join"),
                     }
                 }
                 _ = rejection_log.tick() => rejections.flush(),
-                result = self.interactive_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig {
-                    handshake: false,
-                    fec: self.fec,
-                    mss: rtp::udp::MssConfig::Default,
-                    fec_tuning: FecTuning::default(),
-                }) => {
+                result = self.interactive_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig { handshake: false, fec: self.fec, mss: rtp::udp::MssConfig::Default, fec_tuning: FecTuning::default() }) => {
                     let stream = match finish_frame_delivery_accept(result).await {
-                        Ok(stream) => {
-                            interactive_backoff.accepted("rtp_mux_interactive", addr);
-                            stream
-                        }
+                        Ok(stream) => { interactive_backoff.accepted("rtp_mux_interactive", addr); stream }
                         Err(error) => {
-                            match interactive_backoff
-                                .failed_dispatching("rtp_mux_interactive", addr, error)
-                            {
-                                Ok(()) => {
-                                    tokio::task::yield_now().await;
-                                    continue;
-                                }
+                            match interactive_backoff.failed_dispatching("rtp_mux_interactive", addr, error) {
+                                Ok(()) => { interactive_backoff.pause().await; continue; }
                                 Err(source) => return Err(ServeError::Accept { source, addr }),
                             }
                         }
@@ -168,55 +153,19 @@ impl RtpMuxServer {
                     let permit = match registry.try_acquire(peer.ip()) {
                         Ok(permit) => permit,
                         Err(reason) => {
-                            rejections.record(RejectedLaneContext {
-                                class: LaneRejectionClass::Capacity,
-                                peer,
-                                local_addr: addr,
-                                expected_class: Some(LaneClass::Interactive),
-                                reason: reason.to_string(),
-                            });
+                            rejections.record(RejectedLaneContext { class: LaneRejectionClass::Capacity, peer, local_addr: addr, expected_class: Some(LaneClass::Interactive), reason: reason.to_string() });
                             continue;
                         }
                     };
-                    spawn_lane_accept(
-                        AdmittedLane {
-                            read,
-                            write,
-                            config: server_mux_config(),
-                            expected_class: LaneClass::Interactive,
-                            peer,
-                            local_addr: addr,
-                            permit,
-                        },
-                        env.clone(),
-                        Arc::clone(&registry),
-                        Arc::clone(&groups),
-                        rejections.clone(),
-                    );
+                    spawn_lane_accept(AdmittedLane { read, write, config: server_mux_config(), expected_class: LaneClass::Interactive, peer, local_addr: addr, permit }, env.clone(), Arc::clone(&registry), Arc::clone(&groups), rejections.clone());
                 }
-                result = self.bulk_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig {
-                    handshake: false,
-                    fec: self.fec,
-                    mss: rtp::udp::MssConfig::Default,
-                    fec_tuning: FecTuning::default(),
-                }) => {
+                result = self.bulk_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig { handshake: false, fec: self.fec, mss: rtp::udp::MssConfig::Default, fec_tuning: FecTuning::default() }) => {
                     let stream = match finish_frame_delivery_accept(result).await {
-                        Ok(stream) => {
-                            bulk_backoff.accepted("rtp_mux_bulk", bulk_addr);
-                            stream
-                        }
+                        Ok(stream) => { bulk_backoff.accepted("rtp_mux_bulk", bulk_addr); stream }
                         Err(error) => {
                             match bulk_backoff.failed_dispatching("rtp_mux_bulk", bulk_addr, error) {
-                                Ok(()) => {
-                                    tokio::task::yield_now().await;
-                                    continue;
-                                }
-                                Err(source) => {
-                                    return Err(ServeError::Accept {
-                                        source,
-                                        addr: bulk_addr,
-                                    })
-                                }
+                                Ok(()) => { bulk_backoff.pause().await; continue; }
+                                Err(source) => { return Err(ServeError::Accept { source, addr: bulk_addr }); }
                             }
                         }
                     };
@@ -227,31 +176,11 @@ impl RtpMuxServer {
                     let permit = match registry.try_acquire(peer.ip()) {
                         Ok(permit) => permit,
                         Err(reason) => {
-                            rejections.record(RejectedLaneContext {
-                                class: LaneRejectionClass::Capacity,
-                                peer,
-                                local_addr: bulk_addr,
-                                expected_class: Some(LaneClass::Bulk),
-                                reason: reason.to_string(),
-                            });
+                            rejections.record(RejectedLaneContext { class: LaneRejectionClass::Capacity, peer, local_addr: bulk_addr, expected_class: Some(LaneClass::Bulk), reason: reason.to_string() });
                             continue;
                         }
                     };
-                    spawn_lane_accept(
-                        AdmittedLane {
-                            read,
-                            write,
-                            config: server_mux_config(),
-                            expected_class: LaneClass::Bulk,
-                            peer,
-                            local_addr: bulk_addr,
-                            permit,
-                        },
-                        env.clone(),
-                        Arc::clone(&registry),
-                        Arc::clone(&groups),
-                        rejections.clone(),
-                    );
+                    spawn_lane_accept(AdmittedLane { read, write, config: server_mux_config(), expected_class: LaneClass::Bulk, peer, local_addr: bulk_addr, permit }, env.clone(), Arc::clone(&registry), Arc::clone(&groups), rejections.clone());
                 }
             }
         }
@@ -387,7 +316,9 @@ fn spawn_lane_accept(
                 let mut tasks = JoinSet::new();
                 let (opener, accepter) = spawn_mux_no_reconnection(read, write, config, &mut tasks);
                 let lane = PreparedLane {
-                    pending: mux::PendingAcceptor::new(class, nonce, opener, accepter, tasks),
+                    pending: mux::PendingAcceptor::new(
+                        class, nonce, group, opener, accepter, tasks,
+                    ),
                     peer,
                     local_addr,
                 };
@@ -431,7 +362,7 @@ fn spawn_lane_accept(
                             spawn_mux_no_reconnection(read, write, config, &mut tasks);
                         let lane = PendingLane {
                             pending: mux::PendingAcceptor::new(
-                                class, nonce, opener, accepter, tasks,
+                                class, nonce, group, opener, accepter, tasks,
                             ),
                             peer,
                             local_addr,
@@ -504,7 +435,9 @@ fn spawn_lane_accept(
                 let mut tasks = JoinSet::new();
                 let (opener, accepter) = spawn_mux_no_reconnection(read, write, config, &mut tasks);
                 let lane = PendingLane {
-                    pending: mux::PendingAcceptor::new(class, nonce, opener, accepter, tasks),
+                    pending: mux::PendingAcceptor::new(
+                        class, nonce, group, opener, accepter, tasks,
+                    ),
                     peer,
                     local_addr,
                     group,
@@ -1029,6 +962,7 @@ mod tests {
 
     fn prepared_lane(
         nonce: PairingNonce,
+        group: mux::GroupToken,
         peer: SocketAddr,
         local_addr: SocketAddr,
     ) -> PreparedLane {
@@ -1045,6 +979,7 @@ mod tests {
             pending: mux::PendingAcceptor::new(
                 LaneClass::Interactive,
                 nonce,
+                group,
                 opener,
                 accepter,
                 tasks,
@@ -1064,7 +999,7 @@ mod tests {
             pending,
             peer,
             local_addr,
-        } = prepared_lane(nonce, peer, local_addr);
+        } = prepared_lane(nonce, mux::GroupToken::generate(), peer, local_addr);
         PendingLane {
             pending,
             peer,
@@ -1116,14 +1051,14 @@ mod tests {
             &registry,
             &rejections,
             nonce,
-            prepared_lane(nonce, peer, local_addr),
+            prepared_lane(nonce, mux::GroupToken::generate(), peer, local_addr),
             LaneClass::Interactive,
             Duration::from_millis(1),
         );
         assert_eq!(
             rejections.recorded(LaneRejectionClass::ReservationLost),
             1,
-            "a fully built lane was dropped without recording a rejection, so the peer sees a bare close and the operator sees nothing",
+            "a fully built lane was dropped without recording a rejection, so the peer sees a bare close and the operator sees nothing"
         );
     }
 }

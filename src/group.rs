@@ -81,12 +81,22 @@ impl SessionGroupRegistry {
         state
             .writers
             .retain(crate::migrating_write_half::RebindHandle::is_alive);
-        if opener.is_alive() {
+        let waiting = state.writers.len();
+        let joiner_alive = opener.is_alive();
+        if joiner_alive {
             for writer in &state.writers {
                 writer.rebind(opener.clone());
             }
         }
         drop(state);
+        if waiting != 0 {
+            tracing::info!(
+                seq,
+                streams = waiting,
+                joiner_alive,
+                "RTP mux group rebind; a newer session joined the group",
+            );
+        }
         Ok(GroupMember { group, seq })
     }
 }
@@ -97,11 +107,20 @@ impl GroupMember {
     }
     pub(crate) fn register_writer(&self, writer: crate::migrating_write_half::RebindHandle) {
         let mut state = self.group.state.lock().unwrap();
-        if state.newest_seq != self.seq
-            && let Some(opener) = &state.newest_opener
-            && opener.is_alive()
-        {
-            writer.rebind(opener.clone());
+        if state.newest_seq != self.seq {
+            let target = state
+                .newest_opener
+                .as_ref()
+                .filter(|opener| opener.is_alive());
+            if let Some(opener) = target {
+                writer.rebind(opener.clone());
+            }
+            tracing::debug!(
+                seq = self.seq,
+                newest_seq = state.newest_seq,
+                rebound = target.is_some(),
+                "RTP mux group rebind; a stream opened on a stale member"
+            );
         }
         if state.writers.len() >= state.next_purge {
             state
@@ -120,14 +139,23 @@ mod tests {
     use tokio::task::JoinSet;
 
     fn test_opener(tasks: &mut JoinSet<mux::MuxError>) -> DualStreamOpener {
-        let mut lane = || {
-            let (a, _b) = tokio::io::duplex(4096);
+        let lane = || {
+            let (a, peer) = tokio::io::duplex(4096);
             let (r, w) = tokio::io::split(a);
-            spawn_mux_no_reconnection(r, w, crate::shared::server_mux_config(), tasks)
+            let mut spawner = JoinSet::new();
+            let (opener, accepter) =
+                spawn_mux_no_reconnection(r, w, crate::shared::server_mux_config(), &mut spawner);
+            (opener, accepter, spawner, peer)
         };
-        let (int_op, int_acc) = lane();
-        let (bulk_op, bulk_acc) = lane();
-        let (opener, _accepter) = mux::spawn_dual_mux_paired(int_op, int_acc, bulk_op, bulk_acc);
+        let (int_op, int_acc, int_s, int_peer) = lane();
+        let (bulk_op, bulk_acc, bulk_s, bulk_peer) = lane();
+        let (opener, _accepter) = mux::spawn_dual_mux_paired_supervised(
+            int_op, int_acc, int_s, bulk_op, bulk_acc, bulk_s, tasks,
+        );
+        tasks.spawn(async move {
+            let _keep_peers_alive = (int_peer, bulk_peer);
+            std::future::pending::<mux::MuxError>().await
+        });
         opener
     }
 
