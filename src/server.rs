@@ -18,7 +18,7 @@ use rtp::{
 };
 use thiserror::Error;
 use tokio::{net::ToSocketAddrs, task::JoinSet};
-use tracing::{info, instrument, trace, warn};
+use tracing::{error, info, instrument, trace, warn};
 
 use crate::{
     accept_error::AcceptErrorBackoff,
@@ -130,19 +130,20 @@ impl RtpMuxServer {
             tokio::select! {
                 Some(result) = self.mux.join_next() => {
                     match result {
+                        Ok(MuxError::TaskStopped { task: "lane_accept" }) => trace!(?addr, "Lane accept task stopped"),
                         Ok(error) => warn!(?error, ?addr, "MUX error"),
                         Err(error) if error.is_cancelled() => { trace!(?error, "MUX task cancelled (normal shutdown/reset)"); }
-                        Err(error) => warn!(?error, ?addr, "MUX supervision task failed to join"),
+                        Err(error) => error!(?error, ?addr, "MUX supervision task failed to join"),
                     }
                 }
                 _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig { handshake: false, fec: self.fec, mss: rtp::udp::MssConfig::Default, fec_tuning: FecTuning::default() }) => {
-                    if let Err(source) = handle_lane_accept(result, &mut interactive_backoff, "rtp_mux_interactive", addr, LaneClass::Interactive, &env, &registry, &groups, &rejections).await {
+                    if let Err(source) = handle_lane_accept(result, &mut interactive_backoff, "rtp_mux_interactive", addr, LaneClass::Interactive, &env, &registry, &groups, &rejections, &mut self.mux).await {
                         return Err(source);
                     }
                 }
                 result = self.bulk_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig { handshake: false, fec: self.fec, mss: rtp::udp::MssConfig::Default, fec_tuning: FecTuning::default() }) => {
-                    if let Err(source) = handle_lane_accept(result, &mut bulk_backoff, "rtp_mux_bulk", bulk_addr, LaneClass::Bulk, &env, &registry, &groups, &rejections).await {
+                    if let Err(source) = handle_lane_accept(result, &mut bulk_backoff, "rtp_mux_bulk", bulk_addr, LaneClass::Bulk, &env, &registry, &groups, &rejections, &mut self.mux).await {
                         return Err(source);
                     }
                 }
@@ -173,6 +174,7 @@ async fn handle_lane_accept(
     registry: &Arc<PendingLaneRegistry>,
     groups: &Arc<SessionGroupRegistry>,
     rejections: &LaneRejectionLog,
+    mux: &mut JoinSet<MuxError>,
 ) -> Result<(), ServeError> {
     let stream = match finish_frame_delivery_accept(accept).await {
         Ok(stream) => {
@@ -220,6 +222,7 @@ async fn handle_lane_accept(
         Arc::clone(registry),
         Arc::clone(groups),
         rejections.clone(),
+        mux,
     );
     Ok(())
 }
@@ -230,6 +233,7 @@ fn spawn_lane_accept(
     registry: Arc<PendingLaneRegistry>,
     groups: Arc<SessionGroupRegistry>,
     rejections: LaneRejectionLog,
+    mux: &mut JoinSet<MuxError>,
 ) {
     let AdmittedLane {
         mut read,
@@ -240,7 +244,7 @@ fn spawn_lane_accept(
         local_addr,
         permit,
     } = admitted;
-    tokio::spawn(async move {
+    mux.spawn(async move {
         let started = Instant::now();
         let (class, nonce, group) =
             match tokio::time::timeout(HELLO_DEADLINE, read_lane_hello(&mut read)).await {
@@ -261,10 +265,11 @@ fn spawn_lane_accept(
                         elapsed,
                     );
                     drop(permit);
-                    return;
+                    return MuxError::TaskStopped { task: "lane_accept" };
                 }
                 Ok(Err(error)) => {
                     let elapsed = started.elapsed();
+                    drop(permit);
                     signal_rejected_lane(
                         &mut write,
                         &rejections,
@@ -278,12 +283,12 @@ fn spawn_lane_accept(
                         elapsed,
                     )
                     .await;
-                    drop(permit);
-                    return;
+                    return MuxError::TaskStopped { task: "lane_accept" };
                 }
             };
         let elapsed = started.elapsed();
         if class != expected_class {
+            drop(permit);
             signal_rejected_lane(
                 &mut write,
                 &rejections,
@@ -297,10 +302,10 @@ fn spawn_lane_accept(
                 elapsed,
             )
             .await;
-            drop(permit);
-            return;
+            return MuxError::TaskStopped { task: "lane_accept" };
         }
         if groups.is_full(&group) {
+            drop(permit);
             signal_rejected_lane(
                 &mut write,
                 &rejections,
@@ -314,8 +319,7 @@ fn spawn_lane_accept(
                 elapsed,
             )
             .await;
-            drop(permit);
-            return;
+            return MuxError::TaskStopped { task: "lane_accept" };
         }
         let mut permit = Some(permit);
         match registry.admit(nonce, class, peer, local_addr, group, &mut permit) {
@@ -336,7 +340,7 @@ fn spawn_lane_accept(
                         failure,
                     )
                     .await;
-                    return;
+                    return MuxError::TaskStopped { task: "lane_accept" };
                 }
                 let mut tasks = JoinSet::new();
                 let (opener, accepter) = spawn_mux_no_reconnection(read, write, config, &mut tasks);
@@ -375,7 +379,7 @@ fn spawn_lane_accept(
                         failure,
                     )
                     .await;
-                    return;
+                    return MuxError::TaskStopped { task: "lane_accept" };
                 }
                 match registry
                     .wait_for_pair(nonce, class, peer, expires_at, changed)
@@ -397,6 +401,7 @@ fn spawn_lane_accept(
                         pair_lanes_inner(lane, other, env.clone(), nonce, &groups);
                     }
                     PendingLaneWait::Timeout => {
+                        drop(permit.take());
                         signal_rejected_lane(
                             &mut write,
                             &rejections,
@@ -412,6 +417,7 @@ fn spawn_lane_accept(
                         .await;
                     }
                     PendingLaneWait::ReservationLost(reason) => {
+                        drop(permit.take());
                         signal_rejected_lane(
                             &mut write,
                             &rejections,
@@ -455,7 +461,7 @@ fn spawn_lane_accept(
                         failure,
                     )
                     .await;
-                    return;
+                    return MuxError::TaskStopped { task: "lane_accept" };
                 }
                 let mut tasks = JoinSet::new();
                 let (opener, accepter) = spawn_mux_no_reconnection(read, write, config, &mut tasks);
@@ -471,6 +477,7 @@ fn spawn_lane_accept(
                 pair_lanes_inner(lane, other, env.clone(), nonce, &groups);
             }
             PendingLaneAdmission::Reject(reason) => {
+                drop(permit);
                 signal_rejected_lane(
                     &mut write,
                     &rejections,
@@ -484,8 +491,10 @@ fn spawn_lane_accept(
                     started.elapsed(),
                 )
                 .await;
-                drop(permit);
             }
+        }
+        MuxError::TaskStopped {
+            task: "lane_accept",
         }
     });
 }
@@ -604,7 +613,7 @@ async fn signal_rejected_lane(
     context: RejectedLaneContext,
     elapsed: Duration,
 ) {
-    let _ = writer.send_kill_and_abort().await;
+    let _ = tokio::time::timeout(HELLO_DEADLINE, writer.send_kill_and_abort()).await;
     record_rejected_lane(rejections, context, elapsed);
 }
 
