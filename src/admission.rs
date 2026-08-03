@@ -224,15 +224,14 @@ impl PendingLaneRegistry {
         self.changed.notify_one();
         PendingLaneAdmission::Reserved
     }
-    #[allow(clippy::result_large_err)]
     pub(crate) fn finish_reservation(
         &self,
         nonce: PairingNonce,
         lane: PreparedLane,
-    ) -> Result<(), PreparedLane> {
+    ) -> Result<(), Box<PreparedLane>> {
         let mut state = self.state.lock().unwrap();
         let Some(entry) = state.entries.remove(&nonce) else {
-            return Err(lane);
+            return Err(Box::new(lane));
         };
         let PendingLaneEntry::Building {
             peer,
@@ -245,7 +244,7 @@ impl PendingLaneRegistry {
         } = entry
         else {
             state.entries.insert(nonce, entry);
-            return Err(lane);
+            return Err(Box::new(lane));
         };
         if peer != lane.peer || class != lane.pending.class {
             state.entries.insert(
@@ -260,7 +259,7 @@ impl PendingLaneRegistry {
                     permit,
                 },
             );
-            return Err(lane);
+            return Err(Box::new(lane));
         }
         let lane = PendingLane {
             pending: lane.pending,
@@ -341,17 +340,16 @@ impl PendingLaneRegistry {
         drop(state);
         PendingLaneWaitStep::Wait
     }
-    #[allow(clippy::result_large_err)]
     pub(crate) fn restore_ready(
         &self,
         nonce: PairingNonce,
         lane: PendingLane,
         expires_at: Instant,
-    ) -> Result<(), PendingLane> {
+    ) -> Result<(), Box<PendingLane>> {
         let mut state = self.state.lock().unwrap();
         if state.entries.contains_key(&nonce) {
             drop(state);
-            return Err(lane);
+            return Err(Box::new(lane));
         }
         state
             .entries
