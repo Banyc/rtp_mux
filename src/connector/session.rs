@@ -42,8 +42,8 @@ impl Session {
         let stream_id = rand::random::<u64>();
         let (writer, reader) = self.opener.open_migrating_with_reader(stream_id, lane);
         self.opened_streams.fetch_add(1, Ordering::Relaxed);
-        counter!("stream.rtp_mux.rtp_connects").increment(1);
-        counter!("stream.rtp_mux.mux_connects").increment(1);
+        counter!("stream.rtp_mux.rtp.connects").increment(1);
+        counter!("stream.rtp_mux.mux.connects").increment(1);
         OpenedStream {
             writer,
             reader,

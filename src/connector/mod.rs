@@ -15,7 +15,7 @@ use std::{
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use mux::{GroupToken, LaneClass, MuxError, StreamReader};
 use tokio::{sync::oneshot, task::JoinSet};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     client_stream::ClientStream,
@@ -501,7 +501,7 @@ async fn run_connector(
                         }
                     }
                     Err(error) if error.is_cancelled() => trace!(?error, "Dual-Lane MUX task cancelled"),
-                    Err(error) => warn!(?error, "Dual-Lane MUX supervision task failed to join"),
+                    Err(error) => error!(?error, "Dual-Lane MUX supervision task failed to join"),
                 }
                 prune_dead_addresses(&mut groups, &mut explorers, &in_flight_dials);
             }
@@ -545,8 +545,24 @@ async fn run_connector(
                 let Some(command) = command else { break };
                 match command {
                     ConnectorCommand::Reset { completed } => {
-                        for (_, session) in sessions.lock().unwrap().drain() { session.kill(); }
-                        for (_, weak) in draining.lock().unwrap().drain() { if let Some(session) = weak.upgrade() { session.kill(); } }
+                        let sessions_to_kill: Vec<_> = sessions
+                            .lock()
+                            .unwrap()
+                            .drain()
+                            .map(|(_, session)| session)
+                            .collect();
+                        for session in sessions_to_kill {
+                            session.kill();
+                        }
+                        let draining_to_kill: Vec<_> = draining
+                            .lock()
+                            .unwrap()
+                            .drain()
+                            .filter_map(|(_, weak)| weak.upgrade())
+                            .collect();
+                        for session in draining_to_kill {
+                            session.kill();
+                        }
                         for (_, waiters) in dial_waiters.drain() { for waiter in waiters { let _ = waiter.response.send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connector reset"))); } }
                         in_flight_dials.clear();
                         pending_dials = FuturesUnordered::new();
