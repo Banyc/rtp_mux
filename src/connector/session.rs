@@ -206,8 +206,6 @@ pub(crate) fn rebind_streams(old: &Session, new: &Arc<Session>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::connector::install_session;
     use crate::connector::tests::{fake_connected_birth, fake_dead_birth, one_address_group};
@@ -298,12 +296,17 @@ mod tests {
         );
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
         let held = old.streams.lock().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let registering = {
             let old = Arc::clone(&old);
             let handle = slot.handle();
-            std::thread::spawn(move || StreamRebind::track(handle, old.guard()))
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                StreamRebind::track(handle, old.guard())
+            })
         };
-        std::thread::sleep(Duration::from_millis(50));
+        barrier.wait();
         *old.successor.lock().unwrap() = Some(Arc::clone(&new));
         drop(held);
         let _stream = registering.join().unwrap();
