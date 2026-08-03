@@ -14,7 +14,6 @@ use mux::{
 };
 use rtp::{
     socket::{FrameReader, FrameWriter},
-    transmission::fec_tuning::FecTuning,
 };
 use thiserror::Error;
 use tokio::{net::ToSocketAddrs, task::JoinSet};
@@ -137,12 +136,12 @@ impl RtpMuxServer {
                     }
                 }
                 _ = rejection_log.tick() => rejections.flush(),
-                result = self.interactive_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig { handshake: false, fec: self.fec, mss: rtp::udp::MssConfig::Default, fec_tuning: FecTuning::default() }) => {
+                result = self.interactive_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
                     if let Err(source) = handle_lane_accept(result, &mut interactive_backoff, "rtp_mux_interactive", addr, LaneClass::Interactive, &env, &registry, &groups, &rejections, &mut self.mux).await {
                         return Err(source);
                     }
                 }
-                result = self.bulk_listener.accept_frame_delivery(rtp::udp::FrameDeliveryAcceptConfig { handshake: false, fec: self.fec, mss: rtp::udp::MssConfig::Default, fec_tuning: FecTuning::default() }) => {
+                result = self.bulk_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
                     if let Err(source) = handle_lane_accept(result, &mut bulk_backoff, "rtp_mux_bulk", bulk_addr, LaneClass::Bulk, &env, &registry, &groups, &rejections, &mut self.mux).await {
                         return Err(source);
                     }

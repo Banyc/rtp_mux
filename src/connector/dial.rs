@@ -144,12 +144,10 @@ async fn connect_dual_lane_once(
 ) -> io::Result<ConnectedDualLaneBirth> {
     let bind_addr = bind(addr);
     let bulk_addr = bulk_addr(addr)?;
-    let config = || rtp::udp::FrameDeliveryConnectConfig {
-        log_config: None,
+    let config = || rtp::udp::ConnectConfig {
         handshake: false,
         fec,
-        mss: rtp::udp::MssConfig::Default,
-        fec_tuning: rtp::transmission::fec_tuning::FecTuning::default(),
+        ..rtp::udp::ConnectConfig::default()
     };
     let mut interactive = match socket {
         Some(socket) => {

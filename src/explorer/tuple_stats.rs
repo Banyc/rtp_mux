@@ -66,9 +66,9 @@ impl TupleStats {
         }
     }
     pub(crate) fn drive(&mut self, io: &mut dyn ProbeIo, now: Instant, mean: Duration, epoch: Instant) {
-        while let Some(nonce) = io.try_recv_echo() {
+        while let Some(echo) = io.try_recv_echo() {
             if let Some((expected, sent_at)) = self.outstanding
-                && nonce == expected
+                && echo.nonce == expected
             {
                 self.outstanding = None;
                 self.record(Some(now.duration_since(sent_at)));
@@ -82,7 +82,11 @@ impl TupleStats {
         }
         if self.outstanding.is_none() && now >= self.next_probe_at {
             let nonce = rand::random();
-            match io.send_probe(nonce, now.duration_since(epoch).as_micros() as u64) {
+            let echo = rtp::probe::ProbeEcho {
+                nonce,
+                timestamp_micros: now.duration_since(epoch).as_micros() as u64,
+            };
+            match io.send_probe(echo) {
                 Ok(()) => self.outstanding = Some((nonce, now)),
                 Err(_) => self.record(None),
             }

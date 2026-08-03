@@ -31,14 +31,14 @@ impl Default for ExplorerConfig {
 }
 
 pub(crate) trait ProbeIo: Send {
-    fn send_probe(&mut self, nonce: u64, timestamp_micros: u64) -> io::Result<()>;
-    fn try_recv_echo(&mut self) -> Option<u64>;
+    fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()>;
+    fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho>;
 }
 impl ProbeIo for rtp::probe::ProbeTap {
-    fn send_probe(&mut self, nonce: u64, timestamp_micros: u64) -> io::Result<()> {
-        rtp::probe::ProbeTap::send_probe(self, nonce, timestamp_micros)
+    fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
+        rtp::probe::ProbeTap::send_probe(self, echo)
     }
-    fn try_recv_echo(&mut self) -> Option<u64> {
+    fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
         rtp::probe::ProbeTap::try_recv_echo(self)
     }
 }
@@ -64,17 +64,15 @@ impl SocketCandidate {
 }
 
 impl ProbeIo for SocketCandidate {
-    fn send_probe(&mut self, nonce: u64, timestamp_micros: u64) -> io::Result<()> {
-        self.socket
-            .try_send(&rtp::probe::encode_probe(nonce, timestamp_micros))
-            .map(drop)
+    fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
+        self.socket.try_send(&rtp::probe::encode_probe(echo)).map(drop)
     }
-    fn try_recv_echo(&mut self) -> Option<u64> {
+    fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
         let mut buf = [0u8; 64];
         loop {
             let n = self.socket.try_recv(&mut buf).ok()?;
-            if let Some((nonce, _timestamp)) = rtp::probe::decode_echo(&buf[..n]) {
-                return Some(nonce);
+            if let Some(echo) = rtp::probe::decode_echo(&buf[..n]) {
+                return Some(echo);
             }
         }
     }
@@ -274,16 +272,23 @@ mod tests {
     }
 
     impl ProbeIo for FakeIo {
-        fn send_probe(&mut self, nonce: u64, _timestamp_micros: u64) -> io::Result<()> {
+        fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
             if self.send_fails {
                 return Err(io::Error::from(io::ErrorKind::NetworkUnreachable));
             }
-            self.sent.lock().unwrap().push(nonce);
+            self.sent.lock().unwrap().push(echo.nonce);
             Ok(())
         }
 
-        fn try_recv_echo(&mut self) -> Option<u64> {
-            self.echoes.lock().unwrap().pop_front()
+        fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
+            self.echoes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map(|nonce| rtp::probe::ProbeEcho {
+                    nonce,
+                    timestamp_micros: 0,
+                })
         }
     }
 
