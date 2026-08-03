@@ -4,9 +4,11 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::Duration,
 };
 pub(crate) const WRITE_QUEUE_CAPACITY: usize = 8;
 pub(crate) const WRITE_MAX_CHUNK: usize = 64 * 1024;
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct RebindSlot {
     latest: Arc<Mutex<Option<mux::DualStreamOpener>>>,
     wake: tokio::sync::mpsc::Sender<()>,
@@ -99,11 +101,16 @@ pub struct MigratingWriteHalf {
     shutdown_complete: bool,
     name: mux::StreamName,
     _rebind: RebindSlot,
-    _background_writer: tokio::task::JoinHandle<()>,
+    background_writer: tokio::task::JoinHandle<()>,
 }
 impl fmt::Debug for MigratingWriteHalf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MigratingWriteHalf").finish_non_exhaustive()
+    }
+}
+impl Drop for MigratingWriteHalf {
+    fn drop(&mut self) {
+        self.background_writer.abort();
     }
 }
 impl MigratingWriteHalf {
@@ -130,7 +137,11 @@ impl MigratingWriteHalf {
                             Some(()) => {
                                 let opener = latest.lock().unwrap().take();
                                 if let Some(opener) = opener {
-                                    let _ = writer.rebind(opener).await;
+                                    if let Err(error) = writer.rebind(opener).await {
+                                        *background_error_clone.lock().unwrap() =
+                                            Some(BackgroundWriteError::from_debug(error));
+                                        break;
+                                    }
                                 }
                             }
                             None => rebind_open = false,
@@ -165,10 +176,13 @@ impl MigratingWriteHalf {
                         }
                     }
                     WriteCommand::Shutdown(reply) => {
-                        let result = writer
-                            .finalize()
-                            .await
-                            .map_err(BackgroundWriteError::from_debug);
+                        let result =
+                            match tokio::time::timeout(FINALIZE_TIMEOUT, writer.finalize()).await {
+                                Ok(result) => result.map_err(BackgroundWriteError::from_debug),
+                                Err(_) => Err(BackgroundWriteError::from_debug(
+                                    "shutdown finalize timed out",
+                                )),
+                            };
                         if let Err(error) = &result {
                             *background_error_clone.lock().unwrap() = Some(error.clone());
                         }
@@ -177,7 +191,7 @@ impl MigratingWriteHalf {
                     }
                 }
             }
-            let _ = writer.finalize().await;
+            let _ = tokio::time::timeout(FINALIZE_TIMEOUT, writer.finalize()).await;
         });
         let half = Self {
             write_tx: tokio_util::sync::PollSender::new(write_tx),
@@ -187,7 +201,7 @@ impl MigratingWriteHalf {
             shutdown_complete: false,
             name,
             _rebind: rebind,
-            _background_writer: background_writer,
+            background_writer,
         };
         (half, handle)
     }
