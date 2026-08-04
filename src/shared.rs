@@ -4,6 +4,7 @@ use mux::{Initiation, MuxConfig};
 
 pub(crate) const PAIRING_DEADLINE: Duration = Duration::from_secs(10);
 pub(crate) const HELLO_DEADLINE: Duration = Duration::from_secs(5);
+/// Birth liveness: the dual-lane hello handshake and first receive must complete within these deadlines.
 pub(crate) const BIRTH_LIVENESS_DEADLINE: Duration = Duration::from_millis(2500);
 pub(crate) const BIRTH_LIVENESS_GRACE: Duration = Duration::from_millis(250);
 pub(crate) const MAX_DUAL_CONNECT_ATTEMPTS: usize = 3;

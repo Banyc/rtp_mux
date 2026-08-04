@@ -15,10 +15,10 @@ use tokio::task::JoinSet;
 use tracing::{debug, info};
 
 use crate::{
+    byte_count::SessionByteCounters,
     shared::{
         BIRTH_LIVENESS_DEADLINE, BIRTH_LIVENESS_GRACE, MAX_DUAL_CONNECT_ATTEMPTS, client_mux_config,
     },
-    traffic::SessionTraffic,
 };
 
 use super::{BindSelector, BulkAddrSelector};
@@ -29,8 +29,8 @@ pub(crate) struct ConnectedDualLaneBirth {
     pub(crate) local_addr: SocketAddr,
     pub(crate) nonce: PairingNonce,
     pub(crate) supervisor: JoinSet<MuxError>,
-    pub(crate) probe_tap: Option<rtp::probe::ProbeTap>,
-    pub(crate) traffic: Arc<SessionTraffic>,
+    pub(crate) probe_tap: Option<rtp::path_probe::EchoDemux>,
+    pub(crate) traffic: Arc<SessionByteCounters>,
 }
 
 pub(crate) type DualLaneDial = Pin<
@@ -181,7 +181,7 @@ async fn connect_dual_lane_once(
         let _ = interactive_writer.send_kill_and_abort().await;
         return Err(io::Error::other(format!("bulk lane hello: {error:?}")));
     }
-    let traffic = Arc::new(SessionTraffic::default());
+    let traffic = Arc::new(SessionByteCounters::default());
     let interactive_reader = traffic.count_read(interactive_reader);
     let interactive_writer = traffic.count_write(interactive_writer);
     let bulk_reader = traffic.count_read(bulk_reader);

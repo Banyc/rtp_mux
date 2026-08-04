@@ -14,10 +14,10 @@ use mux::{LaneClass, PairingNonce};
 use tracing::trace;
 
 use crate::{
-    explorer::{Explorer, SocketCandidate},
+    byte_count::{SessionByteCounters, SessionStats},
+    explorer::{PathExplorer, SocketCandidate},
     migrating_write_half::RebindHandle,
     stream::SocketAddrPair,
-    traffic::{SessionStats, SessionTraffic},
 };
 
 use super::{AddrGroup, OpenedStream};
@@ -30,7 +30,7 @@ pub(crate) struct Session {
     pub(crate) connected_at: Instant,
     pub(crate) opened_streams: AtomicU64,
     pub(crate) live_streams: AtomicU64,
-    pub(crate) traffic: Arc<SessionTraffic>,
+    pub(crate) traffic: Arc<SessionByteCounters>,
     pub(crate) router: mux::ResponseRouterHandle,
     pub(crate) kill_tx: tokio::sync::mpsc::Sender<()>,
     pub(crate) streams: Mutex<Vec<std::sync::Weak<StreamRebind>>>,
@@ -161,7 +161,7 @@ pub(crate) fn live_session(sessions: &SharedSessions, addr: SocketAddr) -> Optio
 
 pub(crate) fn prune_dead_addresses(
     groups: &mut HashMap<SocketAddr, AddrGroup>,
-    explorers: &mut HashMap<SocketAddr, Explorer<SocketCandidate>>,
+    explorers: &mut HashMap<SocketAddr, PathExplorer<SocketCandidate>>,
     in_flight_dials: &HashSet<SocketAddr>,
 ) {
     groups.retain(|addr, group| {
@@ -212,7 +212,7 @@ mod tests {
     use tokio::task::JoinSet;
 
     #[tokio::test]
-    async fn a_recycle_onto_a_dead_session_leaves_streams_where_they_are() {
+    async fn a_redial_onto_a_dead_session_leaves_streams_where_they_are() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();

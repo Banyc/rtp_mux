@@ -26,7 +26,7 @@ async fn wait_until(mut cond: impl AsyncFnMut() -> bool, deadline: Duration, wha
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn recycle_dial_lands_on_the_surrendered_candidate_port() {
+async fn redial_dial_lands_on_the_surrendered_candidate_port() {
     let test = async {
         let addr = spawn_echo_server().await;
         let bind: rtp_mux::BindSelector =
@@ -37,7 +37,6 @@ async fn recycle_dial_lands_on_the_surrendered_candidate_port() {
                 candidates: 4,
                 probe_mean_interval: Duration::from_millis(200),
                 rotation_period: Duration::from_secs(3600),
-                ..ExplorerConfig::default()
             },
             ..RtpMuxConnectorConfig::standard(bind, false)
         });
@@ -63,7 +62,7 @@ async fn recycle_dial_lands_on_the_surrendered_candidate_port() {
             .iter()
             .map(|c| c.local_addr.port())
             .collect();
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         wait_until(
             async || {
                 connector
@@ -71,7 +70,7 @@ async fn recycle_dial_lands_on_the_surrendered_candidate_port() {
                     .is_some_and(|p| p.id() != old_id)
             },
             Duration::from_secs(15),
-            "replacement session after recycle",
+            "replacement session after redial",
         )
         .await;
         let fresh = connector.connect_stream(addr).await.unwrap();

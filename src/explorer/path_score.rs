@@ -14,27 +14,27 @@ impl PathScore {
     pub(crate) fn cost(&self) -> f64 {
         self.rtt.as_secs_f64() / (1.0 - self.loss).max(0.05)
     }
-    pub(crate) fn beats_by_margin(&self, active: &PathScore) -> Option<ReoptRule> {
+    pub(crate) fn beats_by_margin(&self, active: &PathScore) -> Option<MigrationRule> {
         let rtt_wins = self.rtt.as_secs_f64()
             <= active.rtt.as_secs_f64() * (1.0 - REOPT_RTT_MARGIN)
             && self.loss <= active.loss + REOPT_LOSS_TOLERANCE;
         let loss_wins = self.loss + REOPT_LOSS_MARGIN <= active.loss
             && self.rtt.as_secs_f64() <= active.rtt.as_secs_f64() * (1.0 + REOPT_RTT_MARGIN);
         match (rtt_wins, loss_wins) {
-            (true, _) => Some(ReoptRule::Rtt),
-            (false, true) => Some(ReoptRule::Loss),
+            (true, _) => Some(MigrationRule::Rtt),
+            (false, true) => Some(MigrationRule::Loss),
             (false, false) => None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReoptRule {
+pub enum MigrationRule {
     Rtt,
     Loss,
 }
 
-impl ReoptRule {
+impl MigrationRule {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Rtt => "rtt_margin",
@@ -44,9 +44,9 @@ impl ReoptRule {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ReoptVerdict {
+pub enum MigrationVerdict {
     Migrate {
-        rule: ReoptRule,
+        rule: MigrationRule,
         active: PathScore,
         best: PathScore,
     },
@@ -60,7 +60,7 @@ pub enum ReoptVerdict {
     },
 }
 
-impl ReoptVerdict {
+impl MigrationVerdict {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Migrate { .. } => "margin_win",
@@ -86,7 +86,7 @@ impl ReoptVerdict {
             Self::ActiveUnmeasured | Self::NoLiveCandidate { .. } => None,
         }
     }
-    pub fn rule(&self) -> Option<ReoptRule> {
+    pub fn rule(&self) -> Option<MigrationRule> {
         match self {
             Self::Migrate { rule, .. } => Some(*rule),
             _ => None,

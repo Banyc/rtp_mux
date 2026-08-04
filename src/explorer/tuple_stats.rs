@@ -65,7 +65,7 @@ impl TupleStats {
             None => self.consecutive_losses = self.consecutive_losses.saturating_add(1),
         }
     }
-    pub(crate) fn drive(
+    pub(crate) fn tick(
         &mut self,
         io: &mut dyn ProbeIo,
         now: Instant,
@@ -88,7 +88,7 @@ impl TupleStats {
         }
         if self.outstanding.is_none() && now >= self.next_probe_at {
             let nonce = rand::random();
-            let echo = rtp::probe::ProbeEcho {
+            let echo = rtp::path_probe::ProbeEcho {
                 nonce,
                 timestamp_micros: now.duration_since(epoch).as_micros() as u64,
             };

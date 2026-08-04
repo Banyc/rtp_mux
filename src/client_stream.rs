@@ -66,7 +66,7 @@ impl ClientStream {
             let Ok(gen0_reader) = reader.await else {
                 return;
             };
-            let rx = router.expect_response(logical_id, gen0_reader);
+            let rx = router.inject_response_gene(logical_id, gen0_reader);
             if let Ok(spliced) = rx.await {
                 let _ = spliced_tx.send(spliced);
             }

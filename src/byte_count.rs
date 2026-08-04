@@ -10,16 +10,16 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[derive(Debug, Default)]
-pub(crate) struct SessionTraffic {
+pub(crate) struct SessionByteCounters {
     tx_bytes: AtomicU64,
     rx_bytes: AtomicU64,
 }
 
-impl SessionTraffic {
+impl SessionByteCounters {
     pub(crate) fn count_read<R>(self: &Arc<Self>, inner: R) -> Counted<R> {
         Counted {
             inner,
-            counter: CountInto {
+            counter: CounterTarget {
                 traffic: Arc::clone(self),
                 rx: true,
             },
@@ -29,7 +29,7 @@ impl SessionTraffic {
     pub(crate) fn count_write<W>(self: &Arc<Self>, inner: W) -> Counted<W> {
         Counted {
             inner,
-            counter: CountInto {
+            counter: CounterTarget {
                 traffic: Arc::clone(self),
                 rx: false,
             },
@@ -46,12 +46,12 @@ impl SessionTraffic {
 }
 
 #[derive(Debug)]
-struct CountInto {
-    traffic: Arc<SessionTraffic>,
+struct CounterTarget {
+    traffic: Arc<SessionByteCounters>,
     rx: bool,
 }
 
-impl CountInto {
+impl CounterTarget {
     fn add(&self, bytes: usize) {
         let counter = match self.rx {
             true => &self.traffic.rx_bytes,
@@ -64,7 +64,7 @@ impl CountInto {
 #[derive(Debug)]
 pub(crate) struct Counted<T> {
     inner: T,
-    counter: CountInto,
+    counter: CounterTarget,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for Counted<R> {
@@ -185,7 +185,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_counted_half_tallies_only_the_bytes_it_moved() {
-        let traffic = Arc::new(SessionTraffic::default());
+        let traffic = Arc::new(SessionByteCounters::default());
         let (client, mut server) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(client);
         let mut reader = traffic.count_read(reader);
@@ -239,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn counting_a_vectored_writer_keeps_it_vectored() {
-        let traffic = Arc::new(SessionTraffic::default());
+        let traffic = Arc::new(SessionByteCounters::default());
         let mut writer = traffic.count_write(VectoredOnly::default());
         assert!(writer.is_write_vectored(), "the wrapper hid the capability");
         let bufs = [

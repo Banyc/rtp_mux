@@ -6,23 +6,23 @@ edition = "2024"
 [dependencies]
 futures = "0.3"
 metrics = "0.24"
-mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.24" }
+mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.25" }
 rand = "0.10"
-rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.81" }
+rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.82" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
-tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.2" }
+tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.3" }
 
-[patch."https://github.com/Banyc/mux.git"]
-mux = { path = "../mux" }
-[patch."https://github.com/Banyc/rtp.git"]
-rtp = { path = "../rtp" }
-[patch."https://github.com/Banyc/tokio_udp.git"]
-tokio_udp = { path = "../tokio_udp" }
-[patch."https://github.com/Banyc/udp_listener.git"]
-udp_listener = { path = "../udp_listener" }
+# [patch."https://github.com/Banyc/mux.git"]
+# mux = { path = "../mux" }
+# [patch."https://github.com/Banyc/rtp.git"]
+# rtp = { path = "../rtp" }
+# [patch."https://github.com/Banyc/tokio_udp.git"]
+# tokio_udp = { path = "../tokio_udp" }
+# [patch."https://github.com/Banyc/udp_listener.git"]
+# udp_listener = { path = "../udp_listener" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

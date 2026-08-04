@@ -422,12 +422,13 @@ dependencies = [
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.56)",
  "rand 0.8.7",
  "tokio",
- "udp_listener",
+ "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13)",
 ]
 
 [[package]]
 name = "mux"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/mux.git?tag=v0.0.25#c10313c7d0424ed6b1a41d89a234b804131ce0f3"
 dependencies = [
  "getrandom 0.4.3",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
@@ -528,6 +529,16 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "primitive"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.55#57489ef98acfcfb819e048964805ef16a386787f"
+dependencies = [
+ "anyhow",
+ "num-traits",
+ "thiserror",
 ]
 
 [[package]]
@@ -672,6 +683,7 @@ checksum = "1e0e61cd21fbddd85fbd9367b775660a01d388c08a61c6d2824af480b0309bb9"
 [[package]]
 name = "rtp"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/rtp.git?tag=v0.0.82#a04588da8f5ca323206774a826ce6a6ee5e24c4b"
 dependencies = [
  "async-trait",
  "async_async_io",
@@ -689,7 +701,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tokio_udp",
- "udp_listener",
+ "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.15)",
 ]
 
 [[package]]
@@ -902,6 +914,7 @@ dependencies = [
 [[package]]
 name = "tokio_udp"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/tokio_udp.git?tag=v0.0.3#b8f36184f041930551f6ea87bcb2156da91b2b68"
 dependencies = [
  "bytes",
  "socket2",
@@ -942,6 +955,17 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13#076920b9a83f9472e7d6209502f1fecb58f7d665"
+dependencies = [
+ "bytes",
+ "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.55)",
+ "tokio",
+]
+
+[[package]]
+name = "udp_listener"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.15#d0e16f49886772cd98bb0edd6631a02465605223"
 dependencies = [
  "bytes",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",

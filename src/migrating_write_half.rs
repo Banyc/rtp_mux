@@ -84,11 +84,6 @@ impl BackgroundWriteError {
         io::Error::new(io::ErrorKind::BrokenPipe, self.message.clone())
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ControlKind {
-    Flush,
-    Shutdown,
-}
 struct PendingControl {
     kind: ControlKind,
     reply: tokio::sync::oneshot::Receiver<Result<(), BackgroundWriteError>>,
@@ -100,7 +95,10 @@ pub struct MigratingWriteHalf {
     shutdown_started: bool,
     shutdown_complete: bool,
     name: mux::StreamName,
-    _rebind: RebindSlot,
+    /// Keeps the rebind wake channel's sender alive for the lifetime of the
+    /// write half; never read directly.
+    #[allow(dead_code)]
+    rebind_guard: RebindSlot,
     background_writer: tokio::task::JoinHandle<()>,
 }
 impl fmt::Debug for MigratingWriteHalf {
@@ -115,7 +113,7 @@ impl Drop for MigratingWriteHalf {
 }
 impl MigratingWriteHalf {
     pub(crate) fn new_with_rebind(mut writer: MigratingStreamWriter) -> (Self, RebindHandle) {
-        let name = writer.name_handle();
+        let name = writer.name();
         let (write_tx, mut write_rx) =
             tokio::sync::mpsc::channel::<WriteCommand>(WRITE_QUEUE_CAPACITY);
         let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -136,13 +134,12 @@ impl MigratingWriteHalf {
                         match wake {
                             Some(()) => {
                                 let opener = latest.lock().unwrap().take();
-                                if let Some(opener) = opener {
-                                    if let Err(error) = writer.rebind(opener).await {
+                                if let Some(opener) = opener
+                                    && let Err(error) = writer.rebind(opener).await {
                                         *background_error_clone.lock().unwrap() =
                                             Some(BackgroundWriteError::from_debug(error));
                                         break;
                                     }
-                                }
                             }
                             None => rebind_open = false,
                         }
@@ -200,7 +197,7 @@ impl MigratingWriteHalf {
             shutdown_started: false,
             shutdown_complete: false,
             name,
-            _rebind: rebind,
+            rebind_guard: rebind,
             background_writer,
         };
         (half, handle)
@@ -211,7 +208,7 @@ impl MigratingWriteHalf {
     fn poll_pending_control(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<io::Result<Option<ControlKindPublic>>> {
+    ) -> Poll<io::Result<Option<ControlKind>>> {
         let Some(pending) = &mut self.pending_control else {
             return Poll::Ready(Ok(None));
         };
@@ -225,10 +222,6 @@ impl MigratingWriteHalf {
             self.shutdown_complete = true;
             self.write_tx.close();
         }
-        let kind = match kind {
-            ControlKind::Flush => ControlKindPublic::Flush,
-            ControlKind::Shutdown => ControlKindPublic::Shutdown,
-        };
         match result {
             Ok(Ok(())) => Poll::Ready(Ok(Some(kind))),
             Ok(Err(error)) => Poll::Ready(Err(error.to_io())),
@@ -250,7 +243,7 @@ impl MigratingWriteHalf {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         match self.poll_pending_control(cx) {
-            Poll::Ready(Ok(Some(ControlKindPublic::Shutdown))) => {
+            Poll::Ready(Ok(Some(ControlKind::Shutdown))) => {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "stream shut down",
@@ -299,13 +292,13 @@ impl MigratingWriteHalf {
     }
     pub(crate) fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.poll_pending_control(cx) {
-            Poll::Ready(Ok(Some(ControlKindPublic::Shutdown))) => {
+            Poll::Ready(Ok(Some(ControlKind::Shutdown))) => {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "stream shut down",
                 )));
             }
-            Poll::Ready(Ok(Some(ControlKindPublic::Flush))) => return Poll::Ready(Ok(())),
+            Poll::Ready(Ok(Some(ControlKind::Flush))) => return Poll::Ready(Ok(())),
             Poll::Ready(Ok(None)) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
@@ -342,7 +335,7 @@ impl MigratingWriteHalf {
     }
     pub(crate) fn poll_shutdown_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.poll_pending_control(cx) {
-            Poll::Ready(Ok(Some(ControlKindPublic::Shutdown))) => return Poll::Ready(Ok(())),
+            Poll::Ready(Ok(Some(ControlKind::Shutdown))) => return Poll::Ready(Ok(())),
             Poll::Ready(Ok(_)) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
@@ -378,7 +371,7 @@ impl MigratingWriteHalf {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ControlKindPublic {
+pub enum ControlKind {
     Flush,
     Shutdown,
 }

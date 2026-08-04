@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use path_score::{PathScore, ReoptRule, ReoptVerdict};
+pub use path_score::{MigrationRule, MigrationVerdict, PathScore};
 pub use tuple_stats::TupleReport;
 use tuple_stats::TupleStats;
 
@@ -31,15 +31,15 @@ impl Default for ExplorerConfig {
 }
 
 pub(crate) trait ProbeIo: Send {
-    fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()>;
-    fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho>;
+    fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()>;
+    fn try_recv_echo(&mut self) -> Option<rtp::path_probe::ProbeEcho>;
 }
-impl ProbeIo for rtp::probe::ProbeTap {
-    fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
-        rtp::probe::ProbeTap::send_probe(self, echo)
+impl ProbeIo for rtp::path_probe::EchoDemux {
+    fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()> {
+        rtp::path_probe::EchoDemux::send_probe(self, echo)
     }
-    fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
-        rtp::probe::ProbeTap::try_recv_echo(self)
+    fn try_recv_echo(&mut self) -> Option<rtp::path_probe::ProbeEcho> {
+        rtp::path_probe::EchoDemux::try_recv_echo(self)
     }
 }
 
@@ -49,7 +49,7 @@ pub(crate) struct SocketCandidate {
 }
 
 impl SocketCandidate {
-    pub(crate) async fn mint(
+    pub(crate) async fn bind_new(
         bind_ip: std::net::IpAddr,
         remote: SocketAddr,
     ) -> io::Result<(Self, SocketAddr)> {
@@ -64,16 +64,16 @@ impl SocketCandidate {
 }
 
 impl ProbeIo for SocketCandidate {
-    fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
+    fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()> {
         self.socket
-            .try_send(&rtp::probe::encode_probe(echo))
+            .try_send(&rtp::path_probe::encode_probe(echo))
             .map(drop)
     }
-    fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
+    fn try_recv_echo(&mut self) -> Option<rtp::path_probe::ProbeEcho> {
         let mut buf = [0u8; 64];
         loop {
             let n = self.socket.try_recv(&mut buf).ok()?;
-            if let Some(echo) = rtp::probe::decode_echo(&buf[..n]) {
+            if let Some(echo) = rtp::path_probe::decode_echo(&buf[..n]) {
                 return Some(echo);
             }
         }
@@ -91,7 +91,7 @@ struct Candidate<C> {
     local_addr: SocketAddr,
     stats: TupleStats,
 }
-pub(crate) struct Explorer<C> {
+pub(crate) struct PathExplorer<C> {
     config: ExplorerConfig,
     candidates: Vec<Candidate<C>>,
     active: Option<Candidate<Box<dyn ProbeIo>>>,
@@ -100,7 +100,7 @@ pub(crate) struct Explorer<C> {
     epoch: Instant,
 }
 
-impl<C: ProbeIo> Explorer<C> {
+impl<C: ProbeIo> PathExplorer<C> {
     pub(crate) fn new(config: ExplorerConfig, now: Instant) -> Self {
         let next_rotation_at = now + config.rotation_period;
         Self {
@@ -144,19 +144,17 @@ impl<C: ProbeIo> Explorer<C> {
         for candidate in &mut self.candidates {
             candidate
                 .stats
-                .drive(&mut candidate.io, now, mean, self.epoch);
+                .tick(&mut candidate.io, now, mean, self.epoch);
         }
         if let Some(active) = &mut self.active {
-            active
-                .stats
-                .drive(active.io.as_mut(), now, mean, self.epoch);
+            active.stats.tick(active.io.as_mut(), now, mean, self.epoch);
         }
         if now >= self.next_rotation_at {
             self.next_rotation_at = now + self.config.rotation_period;
-            self.rotate_worst();
+            self.evict_worst();
         }
     }
-    fn rotate_worst(&mut self) {
+    fn evict_worst(&mut self) {
         if self.deficit() > 0 {
             return;
         }
@@ -190,7 +188,7 @@ impl<C: ProbeIo> Explorer<C> {
         self.best_index()
             .and_then(|index| self.candidates[index].stats.score())
     }
-    pub(crate) fn take_best(&mut self) -> Option<(C, SocketAddr, PathScore)> {
+    pub(crate) fn pop_best(&mut self) -> Option<(C, SocketAddr, PathScore)> {
         let index = self.best_index()?;
         let candidate = self.candidates.swap_remove(index);
         let score = candidate
@@ -199,16 +197,16 @@ impl<C: ProbeIo> Explorer<C> {
             .expect("best_index only returns scored candidates");
         Some((candidate.io, candidate.local_addr, score))
     }
-    pub(crate) fn reoptimize_verdict(&self) -> ReoptVerdict {
+    pub(crate) fn reoptimize_verdict(&self) -> MigrationVerdict {
         let Some(active) = self.active.as_ref().and_then(|active| active.stats.score()) else {
-            return ReoptVerdict::ActiveUnmeasured;
+            return MigrationVerdict::ActiveUnmeasured;
         };
         let Some(best) = self.best_score() else {
-            return ReoptVerdict::NoLiveCandidate { active };
+            return MigrationVerdict::NoLiveCandidate { active };
         };
         match best.beats_by_margin(&active) {
-            Some(rule) => ReoptVerdict::Migrate { rule, active, best },
-            None => ReoptVerdict::WithinMargin { active, best },
+            Some(rule) => MigrationVerdict::Migrate { rule, active, best },
+            None => MigrationVerdict::WithinMargin { active, best },
         }
     }
     pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Instant> {
@@ -276,7 +274,7 @@ mod tests {
     }
 
     impl ProbeIo for FakeIo {
-        fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
+        fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()> {
             if self.send_fails {
                 return Err(io::Error::from(io::ErrorKind::NetworkUnreachable));
             }
@@ -284,12 +282,12 @@ mod tests {
             Ok(())
         }
 
-        fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
+        fn try_recv_echo(&mut self) -> Option<rtp::path_probe::ProbeEcho> {
             self.echoes
                 .lock()
                 .unwrap()
                 .pop_front()
-                .map(|nonce| rtp::probe::ProbeEcho {
+                .map(|nonce| rtp::path_probe::ProbeEcho {
                     nonce,
                     timestamp_micros: 0,
                 })
@@ -310,7 +308,7 @@ mod tests {
     }
 
     fn probe_cycle(
-        explorer: &mut Explorer<FakeIo>,
+        explorer: &mut PathExplorer<FakeIo>,
         now: &mut Instant,
         responders: &[(&FakeIo, Duration)],
     ) {
@@ -327,8 +325,8 @@ mod tests {
         explorer.tick(*now);
     }
 
-    fn warmed_pair(now: &mut Instant) -> (Explorer<FakeIo>, FakeIo, FakeIo) {
-        let mut explorer = Explorer::new(config(), *now);
+    fn warmed_pair(now: &mut Instant) -> (PathExplorer<FakeIo>, FakeIo, FakeIo) {
+        let mut explorer = PathExplorer::new(config(), *now);
         let fast = FakeIo::default();
         let slow = FakeIo::default();
         explorer.add_candidate(fast.clone(), local(1000), *now);
@@ -347,51 +345,51 @@ mod tests {
     }
 
     #[test]
-    fn take_best_prefers_the_lower_rtt_candidate_and_leaves_a_deficit() {
+    fn pop_best_prefers_the_lower_rtt_candidate_and_leaves_a_deficit() {
         let mut now = Instant::now();
         let (mut explorer, _fast, _slow) = warmed_pair(&mut now);
-        let (_io, local_addr, score) = explorer.take_best().expect("warm explorer");
+        let (_io, local_addr, score) = explorer.pop_best().expect("warm explorer");
         assert_eq!(local_addr, local(1000));
         assert!(score.rtt < Duration::from_millis(50), "{score:?}");
         assert_eq!(explorer.deficit(), 1);
         explorer.add_candidate(FakeIo::default(), local(3000), now);
         assert_eq!(explorer.deficit(), 0);
-        let (_io, local_addr, _score) = explorer.take_best().expect("slow is still alive");
+        let (_io, local_addr, _score) = explorer.pop_best().expect("slow is still alive");
         assert_eq!(local_addr, local(2000));
         assert!(
-            explorer.take_best().is_none(),
+            explorer.pop_best().is_none(),
             "fresh mint is not scored yet"
         );
     }
     #[test]
     fn cold_explorer_surrenders_nothing() {
-        let mut explorer = Explorer::new(config(), Instant::now());
+        let mut explorer = PathExplorer::new(config(), Instant::now());
         explorer.add_candidate(FakeIo::default(), local(1000), Instant::now());
-        assert!(explorer.take_best().is_none());
+        assert!(explorer.pop_best().is_none());
         assert_eq!(
             explorer.reoptimize_verdict(),
-            ReoptVerdict::ActiveUnmeasured,
+            MigrationVerdict::ActiveUnmeasured,
             "no active session means nothing to beat"
         );
     }
     #[test]
     fn loss_marks_a_candidate_dead_and_ineligible() {
         let mut now = Instant::now();
-        let mut explorer = Explorer::new(config(), now);
+        let mut explorer = PathExplorer::new(config(), now);
         let mute = FakeIo::default();
         explorer.add_candidate(mute.clone(), local(1000), now);
         for _ in 0..DEAD_CONSECUTIVE_LOSSES + 1 {
             probe_cycle(&mut explorer, &mut now, &[]);
         }
         assert!(
-            explorer.take_best().is_none(),
+            explorer.pop_best().is_none(),
             "dead tuple must not be handed off"
         );
     }
     #[test]
     fn lossy_candidate_scores_worse_than_a_clean_one_at_equal_rtt() {
         let mut now = Instant::now();
-        let mut explorer = Explorer::new(config(), now);
+        let mut explorer = PathExplorer::new(config(), now);
         let clean = FakeIo::default();
         let lossy = FakeIo::default();
         explorer.add_candidate(clean.clone(), local(1000), now);
@@ -404,7 +402,7 @@ mod tests {
             }
             probe_cycle(&mut explorer, &mut now, &responders);
         }
-        let (_io, local_addr, score) = explorer.take_best().expect("clean candidate");
+        let (_io, local_addr, score) = explorer.pop_best().expect("clean candidate");
         assert_eq!(local_addr, local(1000));
         assert!(score.loss < 0.05, "{score:?}");
     }
@@ -422,12 +420,12 @@ mod tests {
     #[test]
     fn a_declined_reoptimize_distinguishes_its_two_no_op_cases() {
         let mut now = Instant::now();
-        let mut explorer: Explorer<FakeIo> = Explorer::new(config(), now);
+        let mut explorer: PathExplorer<FakeIo> = PathExplorer::new(config(), now);
         let active = FakeIo::default();
         explorer.set_active(Some((Box::new(active.clone()), local(9000))), now);
         assert_eq!(
             explorer.reoptimize_verdict(),
-            ReoptVerdict::ActiveUnmeasured,
+            MigrationVerdict::ActiveUnmeasured,
             "the active tuple has not reached MIN_SAMPLES yet"
         );
         for _ in 0..MIN_SAMPLES {
@@ -439,7 +437,7 @@ mod tests {
         }
         let verdict = explorer.reoptimize_verdict();
         assert!(
-            matches!(verdict, ReoptVerdict::NoLiveCandidate { .. }),
+            matches!(verdict, MigrationVerdict::NoLiveCandidate { .. }),
             "a measured active with no candidates: {verdict:?}"
         );
         assert!(verdict.active().is_some(), "the active score is reportable");
@@ -448,7 +446,7 @@ mod tests {
     #[test]
     fn a_report_names_the_active_tuple() {
         let now = Instant::now();
-        let mut explorer: Explorer<FakeIo> = Explorer::new(config(), now);
+        let mut explorer: PathExplorer<FakeIo> = PathExplorer::new(config(), now);
         explorer.set_active(Some((Box::new(FakeIo::default()), local(3000))), now);
         let report = explorer.report();
         assert_eq!(
@@ -459,7 +457,7 @@ mod tests {
     #[test]
     fn rotation_never_retires_unmeasured_candidates() {
         let now = Instant::now();
-        let mut explorer = Explorer::new(config(), now);
+        let mut explorer = PathExplorer::new(config(), now);
         explorer.add_candidate(FakeIo::default(), local(1000), now);
         explorer.add_candidate(FakeIo::default(), local(2000), now);
         explorer.next_rotation_at = now;
@@ -469,7 +467,7 @@ mod tests {
     #[test]
     fn rotation_retires_a_dead_tuple_before_a_warming_one() {
         let mut now = Instant::now();
-        let mut explorer = Explorer::new(config(), now);
+        let mut explorer = PathExplorer::new(config(), now);
         let dead = FakeIo::default();
         explorer.add_candidate(dead.clone(), local(1000), now);
         for _ in 0..DEAD_CONSECUTIVE_LOSSES {
@@ -495,7 +493,7 @@ mod tests {
     #[test]
     fn a_candidate_that_cannot_send_is_retired_like_a_lost_one() {
         let mut now = Instant::now();
-        let mut explorer = Explorer::new(config(), now);
+        let mut explorer = PathExplorer::new(config(), now);
         let good = FakeIo::default();
         explorer.add_candidate(FakeIo::broken(), local(1000), now);
         explorer.add_candidate(good.clone(), local(2000), now);
@@ -534,7 +532,7 @@ mod tests {
         assert!(
             matches!(
                 explorer.reoptimize_verdict(),
-                ReoptVerdict::WithinMargin { .. }
+                MigrationVerdict::WithinMargin { .. }
             ),
             "11ms - 10ms is within margin: {:?}",
             explorer.reoptimize_verdict()
@@ -551,8 +549,8 @@ mod tests {
         assert!(
             matches!(
                 verdict,
-                ReoptVerdict::Migrate {
-                    rule: ReoptRule::Rtt,
+                MigrationVerdict::Migrate {
+                    rule: MigrationRule::Rtt,
                     ..
                 }
             ),
@@ -569,7 +567,7 @@ mod tests {
         let score = |rtt, loss| PathScore { rtt, loss };
         assert_eq!(
             score(ms(75), 0.0).beats_by_margin(&score(ms(100), 0.0)),
-            Some(ReoptRule::Rtt)
+            Some(MigrationRule::Rtt)
         );
         assert_eq!(
             score(ms(80), 0.0).beats_by_margin(&score(ms(100), 0.0)),
@@ -581,7 +579,7 @@ mod tests {
         );
         assert_eq!(
             score(ms(100), 0.0).beats_by_margin(&score(ms(100), 0.15)),
-            Some(ReoptRule::Loss)
+            Some(MigrationRule::Loss)
         );
         assert_eq!(
             score(ms(200), 0.0).beats_by_margin(&score(ms(100), 0.15)),
@@ -591,7 +589,7 @@ mod tests {
     #[test]
     fn wakeups_poll_finely_only_while_a_probe_is_outstanding() {
         let now = Instant::now();
-        let mut explorer = Explorer::new(config(), now);
+        let mut explorer = PathExplorer::new(config(), now);
         explorer.add_candidate(FakeIo::default(), local(1000), now);
         explorer.add_candidate(FakeIo::default(), local(2000), now);
         let idle = explorer.next_wakeup(now).unwrap();

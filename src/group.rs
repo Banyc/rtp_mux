@@ -4,14 +4,14 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-pub(crate) struct SessionGroupRegistry {
-    groups: Mutex<HashMap<GroupToken, Weak<SessionGroup>>>,
+pub(crate) struct SessionPairRegistry {
+    groups: Mutex<HashMap<GroupToken, Weak<SessionPair>>>,
 }
-pub(crate) struct SessionGroup {
-    feed: mux::SpliceFeed,
-    state: Mutex<GroupState>,
+pub(crate) struct SessionPair {
+    feed: mux::SpliceRouter,
+    state: Mutex<PairState>,
 }
-struct GroupState {
+struct PairState {
     members: usize,
     next_seq: u64,
     newest_seq: u64,
@@ -19,17 +19,17 @@ struct GroupState {
     writers: Vec<crate::migrating_write_half::RebindHandle>,
     next_purge: usize,
 }
-pub(crate) struct GroupMember {
-    group: Arc<SessionGroup>,
+pub(crate) struct PairMember {
+    group: Arc<SessionPair>,
     seq: u64,
 }
-impl Drop for GroupMember {
+impl Drop for PairMember {
     fn drop(&mut self) {
         self.group.state.lock().unwrap().members -= 1;
     }
 }
 
-impl SessionGroupRegistry {
+impl SessionPairRegistry {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             groups: Mutex::new(HashMap::new()),
@@ -46,16 +46,16 @@ impl SessionGroupRegistry {
         &self,
         token: GroupToken,
         opener: DualStreamOpener,
-    ) -> Result<GroupMember, &'static str> {
+    ) -> Result<PairMember, &'static str> {
         let group = {
             let mut groups = self.groups.lock().unwrap();
             groups.retain(|_, weak| weak.strong_count() > 0);
             match groups.get(&token).and_then(Weak::upgrade) {
                 Some(group) => group,
                 None => {
-                    let group = Arc::new(SessionGroup {
-                        feed: mux::spawn_splice_feed(),
-                        state: Mutex::new(GroupState {
+                    let group = Arc::new(SessionPair {
+                        feed: mux::spawn_splice_router(),
+                        state: Mutex::new(PairState {
                             members: 0,
                             next_seq: 0,
                             newest_seq: 0,
@@ -97,12 +97,12 @@ impl SessionGroupRegistry {
                 "RTP mux group rebind; a newer session joined the group",
             );
         }
-        Ok(GroupMember { group, seq })
+        Ok(PairMember { group, seq })
     }
 }
 
-impl GroupMember {
-    pub(crate) fn feed(&self) -> mux::SpliceFeedHandle {
+impl PairMember {
+    pub(crate) fn feed(&self) -> mux::SpliceRouterHandle {
         self.group.feed.handle()
     }
     pub(crate) fn register_writer(&self, writer: crate::migrating_write_half::RebindHandle) {
@@ -162,7 +162,7 @@ mod tests {
     #[tokio::test]
     async fn third_concurrent_member_is_rejected() {
         let mut tasks = JoinSet::new();
-        let registry = SessionGroupRegistry::new();
+        let registry = SessionPairRegistry::new();
         let token = GroupToken::generate();
         let first = registry.join(token, test_opener(&mut tasks)).unwrap();
         let second = registry.join(token, test_opener(&mut tasks)).unwrap();
@@ -176,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn group_is_dropped_with_its_last_member() {
         let mut tasks = JoinSet::new();
-        let registry = SessionGroupRegistry::new();
+        let registry = SessionPairRegistry::new();
         let token = GroupToken::generate();
         let member = registry.join(token, test_opener(&mut tasks)).unwrap();
         let weak = Arc::downgrade(&member.group);
@@ -210,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn a_dead_newest_member_never_takes_over_live_streams() {
         let mut tasks = JoinSet::new();
-        let registry = SessionGroupRegistry::new();
+        let registry = SessionPairRegistry::new();
         let token = GroupToken::generate();
         let old = registry.join(token, test_opener(&mut tasks)).unwrap();
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
@@ -233,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn late_registered_writer_is_rebound_to_newest_member() {
         let mut tasks = JoinSet::new();
-        let registry = SessionGroupRegistry::new();
+        let registry = SessionPairRegistry::new();
         let token = GroupToken::generate();
         let old = registry.join(token, test_opener(&mut tasks)).unwrap();
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
@@ -244,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn join_rebinds_existing_writers() {
         let mut tasks = JoinSet::new();
-        let registry = SessionGroupRegistry::new();
+        let registry = SessionPairRegistry::new();
         let token = GroupToken::generate();
         let old = registry.join(token, test_opener(&mut tasks)).unwrap();
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();

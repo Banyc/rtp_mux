@@ -1,5 +1,5 @@
+mod cross_session;
 mod dial;
-mod session;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -18,22 +18,23 @@ use tokio::{sync::oneshot, task::JoinSet};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
+    byte_count::SessionStats,
     client_stream::ClientStream,
     explorer::{
-        Explorer, ExplorerConfig, ExplorerReport, ProbeIo, ReoptRule, ReoptVerdict, SocketCandidate,
+        ExplorerConfig, ExplorerReport, MigrationRule, MigrationVerdict, PathExplorer, ProbeIo,
+        SocketCandidate,
     },
     shared::{MAX_CONCURRENT_DUAL_DIALS, MAX_DIAL_WAITERS_PER_ADDR},
     stream::SocketAddrPair,
-    traffic::SessionStats,
 };
 
+use cross_session::{
+    Session, SharedDraining, SharedSessions, live_session, prune_dead_addresses, rebind_streams,
+};
+pub(crate) use cross_session::{SessionGuard, StreamRebind};
 use dial::{
     ConnectedDualLaneBirth, DualLaneDial, DualLaneDialer, connect_dual_lane, dual_supervisor_result,
 };
-use session::{
-    Session, SharedDraining, SharedSessions, live_session, prune_dead_addresses, rebind_streams,
-};
-pub(crate) use session::{SessionGuard, StreamRebind};
 
 const SESSION_LINGER: Duration = Duration::from_secs(3);
 
@@ -95,12 +96,12 @@ struct ExplorerContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecycleTrigger {
+pub(crate) enum RedialTrigger {
     Forced,
     BetterPath,
 }
 
-impl RecycleTrigger {
+impl RedialTrigger {
     fn as_str(self) -> &'static str {
         match self {
             Self::Forced => "forced",
@@ -109,10 +110,10 @@ impl RecycleTrigger {
     }
 }
 
-struct Recycling {
+struct RedialInFlight {
     old: Arc<Session>,
-    trigger: RecycleTrigger,
-    verdict: Option<ReoptVerdict>,
+    trigger: RedialTrigger,
+    verdict: Option<MigrationVerdict>,
 }
 
 enum ConnectorCommand {
@@ -121,9 +122,9 @@ enum ConnectorCommand {
         lane: LaneClass,
         response: oneshot::Sender<io::Result<OpenedStream>>,
     },
-    Recycle {
+    Redial {
         addr: SocketAddr,
-        trigger: RecycleTrigger,
+        trigger: RedialTrigger,
     },
     ExplorerReport {
         addr: SocketAddr,
@@ -148,12 +149,12 @@ impl std::fmt::Debug for RtpMuxConnector {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionProbe {
+pub struct SessionView {
     id: u64,
     inner: std::sync::Weak<Session>,
 }
 
-impl SessionProbe {
+impl SessionView {
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -264,11 +265,11 @@ impl RtpMuxConnector {
             .map(OpenedStream::into_stream)
     }
 
-    pub fn reset_addr(&self, addr: SocketAddr) {
-        self.request_recycle(addr, RecycleTrigger::Forced);
+    pub fn force_redial(&self, addr: SocketAddr) {
+        self.request_redial(addr, RedialTrigger::Forced);
     }
 
-    fn request_recycle(&self, addr: SocketAddr, trigger: RecycleTrigger) {
+    fn request_redial(&self, addr: SocketAddr, trigger: RedialTrigger) {
         if let Some(prev) = self
             .draining
             .lock()
@@ -276,12 +277,12 @@ impl RtpMuxConnector {
             .get(&addr)
             .and_then(std::sync::Weak::upgrade)
         {
-            info!(up = ?prev.addr.peer_addr, trigger = trigger.as_str(), draining = %prev.stats(), "RTP mux session recycle skipped; previous generation still draining");
+            info!(up = ?prev.addr.peer_addr, trigger = trigger.as_str(), draining = %prev.stats(), "RTP mux session redial skipped; previous generation still draining");
             return;
         }
         let _ = self
             .commands
-            .try_send(ConnectorCommand::Recycle { addr, trigger });
+            .try_send(ConnectorCommand::Redial { addr, trigger });
     }
 
     pub async fn explorer_report(&self, addr: SocketAddr) -> io::Result<ExplorerReport> {
@@ -298,9 +299,9 @@ impl RtpMuxConnector {
         })
     }
 
-    pub fn probe_session(&self, addr: SocketAddr) -> Option<SessionProbe> {
+    pub fn probe_session(&self, addr: SocketAddr) -> Option<SessionView> {
         let sessions = self.sessions.lock().unwrap();
-        sessions.get(&addr).map(|session| SessionProbe {
+        sessions.get(&addr).map(|session| SessionView {
             id: session.id,
             inner: Arc::downgrade(session),
         })
@@ -321,7 +322,7 @@ impl RtpMuxConnector {
     }
 
     pub fn reoptimize(&self, addr: SocketAddr) {
-        self.request_recycle(addr, RecycleTrigger::BetterPath);
+        self.request_redial(addr, RedialTrigger::BetterPath);
     }
 }
 
@@ -340,7 +341,7 @@ fn spawn_session_watcher(
                     tokio::time::sleep(SESSION_LINGER).await;
                 }
                 MuxError::TaskStopped {
-                    task: "dual_lane_recycled",
+                    task: "dual_lane_redialed",
                 }
             }
         };
@@ -406,13 +407,13 @@ fn install_session(
 }
 
 async fn refill_candidates(
-    explorer: &mut Explorer<SocketCandidate>,
+    explorer: &mut PathExplorer<SocketCandidate>,
     ctx: &ExplorerContext,
     addr: SocketAddr,
 ) {
     while explorer.deficit() > 0 {
         let bind_ip = (ctx.bind)(addr).ip();
-        match SocketCandidate::mint(bind_ip, addr).await {
+        match SocketCandidate::bind_new(bind_ip, addr).await {
             Ok((candidate, local_addr)) => {
                 explorer.add_candidate(candidate, local_addr, Instant::now());
             }
@@ -437,14 +438,14 @@ async fn run_connector(
     let mut in_flight_dials: HashSet<SocketAddr> = HashSet::new();
     let mut dial_waiters: HashMap<SocketAddr, Vec<StreamRequest>> = HashMap::new();
     let mut groups: HashMap<SocketAddr, AddrGroup> = HashMap::new();
-    let mut recycling: HashMap<SocketAddr, Recycling> = HashMap::new();
-    let mut explorers: HashMap<SocketAddr, Explorer<SocketCandidate>> = HashMap::new();
+    let mut redials: HashMap<SocketAddr, RedialInFlight> = HashMap::new();
+    let mut explorers: HashMap<SocketAddr, PathExplorer<SocketCandidate>> = HashMap::new();
     let start_dial =
         |addr: SocketAddr,
          groups: &mut HashMap<SocketAddr, AddrGroup>,
          pending_dials: &mut FuturesUnordered<DualLaneDial>,
          in_flight_dials: &mut HashSet<SocketAddr>,
-         explorers: &mut HashMap<SocketAddr, Explorer<SocketCandidate>>| {
+         explorers: &mut HashMap<SocketAddr, PathExplorer<SocketCandidate>>| {
             let token = groups
                 .entry(addr)
                 .or_insert_with(|| AddrGroup {
@@ -456,9 +457,9 @@ async fn run_connector(
             if let Some(ctx) = &explorer_ctx {
                 explorers
                     .entry(addr)
-                    .or_insert_with(|| Explorer::new(ctx.config.clone(), Instant::now()));
+                    .or_insert_with(|| PathExplorer::new(ctx.config.clone(), Instant::now()));
             }
-            let socket = explorers.get_mut(&addr).and_then(|explorer| explorer.take_best().map(|(candidate, local_addr, score)| {
+            let socket = explorers.get_mut(&addr).and_then(|explorer| explorer.pop_best().map(|(candidate, local_addr, score)| {
             info!(up = ?addr, up_local = ?local_addr, probe_rtt = ?score.rtt, probe_loss = score.loss, "RTP mux dial inherits explorer candidate tuple");
             candidate.into_socket()
         }));
@@ -497,7 +498,7 @@ async fn run_connector(
                                 warn!(event = "rtp_mux_session_terminated", ?error, nonce = ?session.nonce, up = ?session.addr.peer_addr, up_local = ?session.addr.local_addr, mux = %session.stats(), "RTP mux dual-lane session terminated");
                                 if let Some(explorer) = explorers.get_mut(&addr) { explorer.set_active(None, Instant::now()); }
                             }
-                            None => debug!(?error, up = ?addr, "RTP mux dual-lane session ended after recycle or reset"),
+                            None => debug!(?error, up = ?addr, "RTP mux dual-lane session ended after redial or reset"),
                         }
                     }
                     Err(error) if error.is_cancelled() => trace!(?error, "Dual-Lane MUX task cancelled"),
@@ -507,7 +508,7 @@ async fn run_connector(
             }
             Some((addr, result)) = pending_dials.next() => {
                 in_flight_dials.remove(&addr);
-                let recycled_old = recycling.remove(&addr);
+                let redialed_old = redials.remove(&addr);
                 match result {
                     Ok(mut birth) => {
                         let probe_tap = birth.probe_tap.take();
@@ -515,9 +516,9 @@ async fn run_connector(
                             explorer.set_active(probe_tap.map(|tap| (Box::new(tap) as Box<dyn ProbeIo>, birth.local_addr)), Instant::now());
                         }
                         let session = install_session(addr, birth, &mut groups, &mut supervisors);
-                        if let Some(Recycling { old, trigger, verdict }) = &recycled_old {
+                        if let Some(RedialInFlight { old, trigger, verdict }) = &redialed_old {
                             let moved = rebind_streams(old, &session);
-                            info!(up = ?old.addr.peer_addr, up_local = ?old.addr.local_addr, new_local = ?session.addr.local_addr, trigger = trigger.as_str(), rule = verdict.and_then(|v| v.rule()).map(ReoptRule::as_str), self_rtt = ?verdict.and_then(|v| v.active()).map(|s| s.rtt), self_loss = verdict.and_then(|v| v.active()).map(|s| s.loss), best_rtt = ?verdict.and_then(|v| v.best()).map(|s| s.rtt), best_loss = verdict.and_then(|v| v.best()).map(|s| s.loss), old_mux = %old.stats(), migrated_streams = moved, "RTP mux session recycled");
+                            info!(up = ?old.addr.peer_addr, up_local = ?old.addr.local_addr, new_local = ?session.addr.local_addr, trigger = trigger.as_str(), rule = verdict.and_then(|v| v.rule()).map(MigrationRule::as_str), self_rtt = ?verdict.and_then(|v| v.active()).map(|s| s.rtt), self_loss = verdict.and_then(|v| v.active()).map(|s| s.loss), best_rtt = ?verdict.and_then(|v| v.best()).map(|s| s.rtt), best_loss = verdict.and_then(|v| v.best()).map(|s| s.loss), old_mux = %old.stats(), migrated_streams = moved, "RTP mux session redialed");
                             draining.lock().unwrap().insert(addr, Arc::downgrade(old));
                         }
                         if let Some(waiters) = dial_waiters.remove(&addr) {
@@ -529,7 +530,7 @@ async fn run_connector(
                         sessions.lock().unwrap().insert(addr, session);
                     }
                     Err(error) => {
-                        if recycled_old.is_some() { warn!(?error, up = ?addr, "RTP mux recycle dial failed; streams stay on the old session"); }
+                        if redialed_old.is_some() { warn!(?error, up = ?addr, "RTP mux redial dial failed; streams stay on the old session"); }
                         let kind = error.kind();
                         let message = error.to_string();
                         if let Some(waiters) = dial_waiters.remove(&addr) {
@@ -566,22 +567,22 @@ async fn run_connector(
                         for (_, waiters) in dial_waiters.drain() { for waiter in waiters { let _ = waiter.response.send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connector reset"))); } }
                         in_flight_dials.clear();
                         pending_dials = FuturesUnordered::new();
-                        recycling.clear();
+                        redials.clear();
                         groups.clear();
                         explorers.clear();
                         let _ = completed.send(());
                     }
-                    ConnectorCommand::Recycle { addr, trigger } => {
+                    ConnectorCommand::Redial { addr, trigger } => {
                         let drainer_alive = draining.lock().unwrap().get(&addr).and_then(std::sync::Weak::upgrade).is_some();
                         if drainer_alive || in_flight_dials.contains(&addr) { continue; }
                         if pending_dials.len() >= MAX_CONCURRENT_DUAL_DIALS {
-                            debug!(up = ?addr, trigger = trigger.as_str(), pending = pending_dials.len(), "RTP mux recycle skipped; dial capacity is saturated");
+                            debug!(up = ?addr, trigger = trigger.as_str(), pending = pending_dials.len(), "RTP mux redial skipped; dial capacity is saturated");
                             continue;
                         }
                         let verdict = match trigger {
-                            RecycleTrigger::Forced => None,
-                            RecycleTrigger::BetterPath => {
-                                let verdict = explorers.get(&addr).map(Explorer::reoptimize_verdict).unwrap_or(ReoptVerdict::ActiveUnmeasured);
+                            RedialTrigger::Forced => None,
+                            RedialTrigger::BetterPath => {
+                                let verdict = explorers.get(&addr).map(PathExplorer::reoptimize_verdict).unwrap_or(MigrationVerdict::ActiveUnmeasured);
                                 if !verdict.wants_migration() {
                                     debug!(up = ?addr, outcome = verdict.as_str(), self_rtt = ?verdict.active().map(|s| s.rtt), self_loss = verdict.active().map(|s| s.loss), best_rtt = ?verdict.best().map(|s| s.rtt), best_loss = verdict.best().map(|s| s.loss), mux = live_session(&sessions, addr).map(|s| s.stats().to_string()), "RTP mux reoptimize declined");
                                     continue;
@@ -590,11 +591,11 @@ async fn run_connector(
                             }
                         };
                         let Some(old) = sessions.lock().unwrap().get(&addr).cloned() else { continue; };
-                        recycling.insert(addr, Recycling { old, trigger, verdict });
+                        redials.insert(addr, RedialInFlight { old, trigger, verdict });
                         start_dial(addr, &mut groups, &mut pending_dials, &mut in_flight_dials, &mut explorers);
                     }
                     ConnectorCommand::ExplorerReport { addr, response } => {
-                        let report = explorers.get(&addr).map(Explorer::report).unwrap_or_default();
+                        let report = explorers.get(&addr).map(PathExplorer::report).unwrap_or_default();
                         let _ = response.send(report);
                     }
                     ConnectorCommand::Connect { addr, lane, response } => {
@@ -647,8 +648,8 @@ mod tests {
 
     use super::dial::retry_dual_connect;
     use super::*;
+    use crate::byte_count::SessionByteCounters;
     use crate::shared::{client_mux_config, server_mux_config};
-    use crate::traffic::SessionTraffic;
     use mux::{PairingNonce, spawn_mux_no_reconnection};
 
     fn spawn_test_connector(
@@ -858,7 +859,7 @@ mod tests {
             nonce: PairingNonce::generate(),
             supervisor,
             probe_tap: None,
-            traffic: Arc::new(SessionTraffic::default()),
+            traffic: Arc::new(SessionByteCounters::default()),
         }
     }
 
@@ -898,7 +899,7 @@ mod tests {
             nonce: PairingNonce::generate(),
             supervisor,
             probe_tap: None,
-            traffic: Arc::new(SessionTraffic::default()),
+            traffic: Arc::new(SessionByteCounters::default()),
         }
     }
 
@@ -1265,7 +1266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recycle_respects_concurrent_dial_capacity() {
+    async fn redial_respects_concurrent_dial_capacity() {
         let live_addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let dial_count = Arc::new(AtomicUsize::new(0));
         let dialer: DualLaneDialer = Arc::new({
@@ -1292,9 +1293,9 @@ mod tests {
         .await;
         let old_id = sessions.lock().unwrap().get(&live_addr).unwrap().id;
         commands
-            .send(ConnectorCommand::Recycle {
+            .send(ConnectorCommand::Redial {
                 addr: live_addr,
-                trigger: RecycleTrigger::Forced,
+                trigger: RedialTrigger::Forced,
             })
             .await
             .unwrap();
@@ -1304,7 +1305,7 @@ mod tests {
         assert_eq!(
             dial_count.load(Ordering::SeqCst),
             MAX_CONCURRENT_DUAL_DIALS + 1,
-            "recycle dialed past the concurrent dial capacity",
+            "redial dialed past the concurrent dial capacity",
         );
         assert_eq!(
             sessions.lock().unwrap().get(&live_addr).unwrap().id,
@@ -1444,7 +1445,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn live_stream_gauge_and_graceful_recycle() {
+    async fn live_stream_gauge_and_graceful_redial() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
@@ -1457,17 +1458,17 @@ mod tests {
             assert_eq!(session.live_streams.load(Ordering::Relaxed), 2);
             assert_eq!(session.opened_streams.load(Ordering::Relaxed), 2);
         }
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         wait_for(
             || {
                 connector
                     .probe_session(addr)
                     .is_some_and(|p| p.id() != old_id)
             },
-            "replacement session after recycle",
+            "replacement session after redial",
         )
         .await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2, "recycle dials first");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "redial dials first");
         drop(first);
         assert_eq!(
             session
@@ -1485,25 +1486,25 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recycle_is_skipped_while_the_previous_generation_drains() {
+    async fn redial_is_skipped_while_the_previous_generation_drains() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
         let old_stream = connector.connect(addr).await.unwrap();
         let old_id = connector.probe_session(addr).unwrap().id();
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         wait_for(
             || {
                 connector
                     .probe_session(addr)
                     .is_some_and(|p| p.id() != old_id)
             },
-            "replacement session after recycle",
+            "replacement session after redial",
         )
         .await;
         let fresh_id = connector.probe_session(addr).unwrap().id();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
@@ -1515,7 +1516,7 @@ mod tests {
             "no new dial while skipped"
         );
         drop(old_stream);
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         wait_for(
             || {
                 connector
@@ -1529,27 +1530,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stream_opened_before_a_recycle_lands_on_the_new_session() {
+    async fn a_stream_opened_before_a_redial_lands_on_the_new_session() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
         let opened = connector.connect(addr).await.unwrap();
         let old = connector.probe_session(addr).unwrap();
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         wait_for(
             || {
                 connector
                     .probe_session(addr)
                     .is_some_and(|probe| probe.id() != old.id())
             },
-            "replacement session after recycle",
+            "replacement session after redial",
         )
         .await;
         let new = connector.probe_session(addr).unwrap();
         assert_eq!(
             new.live_streams(),
             Some(0),
-            "the recycle could not have migrated an untracked stream",
+            "the redial could not have migrated an untracked stream",
         );
         let stream = opened.into_stream();
         assert_eq!(
@@ -1566,7 +1567,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn failed_recycle_dial_keeps_streams_on_the_old_session() {
+    async fn failed_redial_dial_keeps_streams_on_the_old_session() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let dialer: DualLaneDialer = Arc::new({
@@ -1578,7 +1579,7 @@ mod tests {
                     Box::pin(async {
                         Err(io::Error::new(
                             io::ErrorKind::ConnectionRefused,
-                            "synthetic recycle dial failure",
+                            "synthetic redial dial failure",
                         ))
                     })
                 }
@@ -1587,10 +1588,10 @@ mod tests {
         let connector = RtpMuxConnector::with_dialer(dialer);
         let stream = connector.connect(addr).await.unwrap();
         let old_id = connector.probe_session(addr).unwrap().id();
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         wait_for(
             || attempts.load(Ordering::SeqCst) == 2,
-            "recycle dial attempt",
+            "redial dial attempt",
         )
         .await;
         for _ in 0..50 {
@@ -1603,7 +1604,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recycle_presents_the_same_group_token() {
+    async fn redial_presents_the_same_group_token() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let tokens: Arc<Mutex<Vec<GroupToken>>> = Arc::new(Mutex::new(Vec::new()));
         let dialer: DualLaneDialer = Arc::new({
@@ -1616,19 +1617,19 @@ mod tests {
         let connector = RtpMuxConnector::with_dialer(dialer);
         drop(connector.connect(addr).await.unwrap());
         let old_id = connector.probe_session(addr).unwrap().id();
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         wait_for(
             || {
                 connector
                     .probe_session(addr)
                     .is_some_and(|p| p.id() != old_id)
             },
-            "replacement session after recycle",
+            "replacement session after redial",
         )
         .await;
         let tokens = tokens.lock().unwrap();
         assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0], tokens[1], "recycle must reuse the group token");
+        assert_eq!(tokens[0], tokens[1], "redial must reuse the group token");
     }
 
     #[tokio::test]
@@ -1638,19 +1639,19 @@ mod tests {
         let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
         drop(connector.connect(addr).await.unwrap());
         let old_id = connector.probe_session(addr).unwrap().id();
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         wait_for(
             || {
                 connector
                     .probe_session(addr)
                     .is_some_and(|p| p.id() != old_id)
             },
-            "replacement session after recycle",
+            "replacement session after redial",
         )
         .await;
         assert!(
             !connector.draining.lock().unwrap().is_empty(),
-            "the recycle did not record a draining generation",
+            "the redial did not record a draining generation",
         );
         connector.reset().await.unwrap();
         assert!(

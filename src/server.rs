@@ -10,9 +10,9 @@ use std::{
 use metrics::counter;
 use mux::{
     AcceptedStream, LaneClass, MuxError, PairingNonce, complete_pairing, read_lane_hello,
-    spawn_mux_no_reconnection, write_birth_heartbeat,
+    spawn_mux_no_reconnection, write_liveness_heartbeat,
 };
-use rtp::socket::{FrameReader, FrameWriter};
+use rtp::socket::{FrameByteReader, FrameByteWriter};
 use thiserror::Error;
 use tokio::{net::ToSocketAddrs, task::JoinSet};
 use tracing::{error, info, instrument, trace, warn};
@@ -23,7 +23,7 @@ use crate::{
         AdmittedLane, ExpiredPendingLane, PendingLane, PendingLaneAdmission, PendingLaneRegistry,
         PendingLaneWait, PreparedLane,
     },
-    group::{GroupMember, SessionGroupRegistry},
+    group::{PairMember, SessionPairRegistry},
     lane_rejection::{LaneRejectionClass, LaneRejectionLog, RejectedLaneContext},
     shared::{ADMISSION_REJECTION_LOG_INTERVAL, HELLO_DEADLINE, bulk_lane_addr, server_mux_config},
     stream::{ServerStream, SocketAddrPair},
@@ -105,9 +105,9 @@ impl RtpMuxServer {
             ?bulk_addr,
             "Listening (interactive + bulk dual-lane)"
         );
-        let env: StreamHandler = Arc::new(handler);
+        let handler: StreamHandler = Arc::new(handler);
         let registry = PendingLaneRegistry::new();
-        let groups = SessionGroupRegistry::new();
+        let groups = SessionPairRegistry::new();
         let rejections = LaneRejectionLog::default();
         let mut interactive_backoff = AcceptErrorBackoff::default();
         let mut bulk_backoff = AcceptErrorBackoff::default();
@@ -135,14 +135,10 @@ impl RtpMuxServer {
                 }
                 _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
-                    if let Err(source) = handle_lane_accept(result, &mut interactive_backoff, "rtp_mux_interactive", addr, LaneClass::Interactive, &env, &registry, &groups, &rejections, &mut self.mux).await {
-                        return Err(source);
-                    }
+                    handle_lane_accept(result, &mut interactive_backoff, "rtp_mux_interactive", addr, LaneClass::Interactive, &handler, &registry, &groups, &rejections, &mut self.mux).await?;
                 }
                 result = self.bulk_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
-                    if let Err(source) = handle_lane_accept(result, &mut bulk_backoff, "rtp_mux_bulk", bulk_addr, LaneClass::Bulk, &env, &registry, &groups, &rejections, &mut self.mux).await {
-                        return Err(source);
-                    }
+                    handle_lane_accept(result, &mut bulk_backoff, "rtp_mux_bulk", bulk_addr, LaneClass::Bulk, &handler, &registry, &groups, &rejections, &mut self.mux).await?;
                 }
             }
         }
@@ -161,15 +157,16 @@ async fn finish_frame_delivery_accept(
     accept?.await.map_err(io::Error::other)?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_lane_accept(
     accept: io::Result<rtp::udp::FrameDeliveryAccept>,
     backoff: &mut AcceptErrorBackoff,
     backoff_name: &'static str,
     addr: SocketAddr,
     lane: LaneClass,
-    env: &StreamHandler,
+    handler: &StreamHandler,
     registry: &Arc<PendingLaneRegistry>,
-    groups: &Arc<SessionGroupRegistry>,
+    groups: &Arc<SessionPairRegistry>,
     rejections: &LaneRejectionLog,
     mux: &mut JoinSet<MuxError>,
 ) -> Result<(), ServeError> {
@@ -190,7 +187,7 @@ async fn handle_lane_accept(
     let peer = stream.peer_addr;
     let read = stream.read;
     let write = stream.write;
-    let permit = match registry.try_acquire(peer.ip()) {
+    let permit = match registry.try_admit(peer.ip()) {
         Ok(permit) => permit,
         Err(reason) => {
             rejections.record(RejectedLaneContext {
@@ -213,7 +210,7 @@ async fn handle_lane_accept(
             local_addr: addr,
             permit,
         },
-        env.clone(),
+        handler.clone(),
         Arc::clone(registry),
         Arc::clone(groups),
         rejections.clone(),
@@ -224,9 +221,9 @@ async fn handle_lane_accept(
 
 fn spawn_lane_accept(
     admitted: AdmittedLane,
-    env: StreamHandler,
+    handler: StreamHandler,
     registry: Arc<PendingLaneRegistry>,
-    groups: Arc<SessionGroupRegistry>,
+    groups: Arc<SessionPairRegistry>,
     rejections: LaneRejectionLog,
     mux: &mut JoinSet<MuxError>,
 ) {
@@ -325,7 +322,7 @@ fn spawn_lane_accept(
             };
         }
         let mut permit = Some(permit);
-        match registry.admit(nonce, class, peer, local_addr, group, &mut permit) {
+        match registry.register_admitted(nonce, class, peer, local_addr, group, &mut permit) {
             PendingLaneAdmission::Reserved => {
                 if let Err(failure) = write_birth_heartbeat_result(&mut write).await {
                     registry.cancel_reservation(nonce, peer, class);
@@ -350,13 +347,11 @@ fn spawn_lane_accept(
                 let mut tasks = JoinSet::new();
                 let (opener, accepter) = spawn_mux_no_reconnection(read, write, config, &mut tasks);
                 let lane = PreparedLane {
-                    pending: mux::PendingAcceptor::new(
-                        class, nonce, group, opener, accepter, tasks,
-                    ),
+                    pending: mux::UnpairedLane::new(class, nonce, group, opener, accepter, tasks),
                     peer,
                     local_addr,
                 };
-                finish_reservation_or_reject(
+                confirm_reservation_or_reject(
                     &registry,
                     &rejections,
                     nonce,
@@ -397,7 +392,7 @@ fn spawn_lane_accept(
                         let (opener, accepter) =
                             spawn_mux_no_reconnection(read, write, config, &mut tasks);
                         let lane = PendingLane {
-                            pending: mux::PendingAcceptor::new(
+                            pending: mux::UnpairedLane::new(
                                 class, nonce, group, opener, accepter, tasks,
                             ),
                             peer,
@@ -405,7 +400,7 @@ fn spawn_lane_accept(
                             group,
                             _permit: permit.take().unwrap(),
                         };
-                        pair_lanes_inner(lane, other, env.clone(), nonce, &groups);
+                        pair_lanes_inner(lane, other, handler.clone(), nonce, &groups);
                     }
                     PendingLaneWait::Timeout => {
                         drop(permit.take());
@@ -446,7 +441,7 @@ fn spawn_lane_accept(
                 expires_at,
             } => {
                 if let Err(failure) = write_birth_heartbeat_result(&mut write).await {
-                    restore_ready_or_reject(
+                    reinsert_ready_lane_or_reject(
                         &registry,
                         &rejections,
                         nonce,
@@ -475,15 +470,13 @@ fn spawn_lane_accept(
                 let mut tasks = JoinSet::new();
                 let (opener, accepter) = spawn_mux_no_reconnection(read, write, config, &mut tasks);
                 let lane = PendingLane {
-                    pending: mux::PendingAcceptor::new(
-                        class, nonce, group, opener, accepter, tasks,
-                    ),
+                    pending: mux::UnpairedLane::new(class, nonce, group, opener, accepter, tasks),
                     peer,
                     local_addr,
                     group,
                     _permit: permit.take().unwrap(),
                 };
-                pair_lanes_inner(lane, other, env.clone(), nonce, &groups);
+                pair_lanes_inner(lane, other, handler.clone(), nonce, &groups);
             }
             PendingLaneAdmission::Reject(reason) => {
                 drop(permit);
@@ -509,9 +502,9 @@ fn spawn_lane_accept(
 }
 
 async fn write_birth_heartbeat_result(
-    writer: &mut FrameWriter,
+    writer: &mut FrameByteWriter,
 ) -> Result<(), BirthHeartbeatFailure> {
-    await_birth_heartbeat(write_birth_heartbeat(writer), HELLO_DEADLINE).await
+    await_birth_heartbeat(write_liveness_heartbeat(writer), HELLO_DEADLINE).await
 }
 
 async fn await_birth_heartbeat<F>(
@@ -533,8 +526,8 @@ where
 }
 
 async fn reject_birth_heartbeat(
-    read: FrameReader,
-    mut writer: FrameWriter,
+    read: FrameByteReader,
+    mut writer: FrameByteWriter,
     rejections: &LaneRejectionLog,
     mut context: RejectedLaneContext,
     failure: BirthHeartbeatFailure,
@@ -564,7 +557,7 @@ fn reject_timed_out_birth_heartbeat<R, W>(
     record_rejected_lane(rejections, context, elapsed);
 }
 
-fn restore_ready_or_reject(
+fn reinsert_ready_lane_or_reject(
     registry: &PendingLaneRegistry,
     rejections: &LaneRejectionLog,
     nonce: PairingNonce,
@@ -573,7 +566,7 @@ fn restore_ready_or_reject(
     elapsed: Duration,
 ) {
     let (peer, local_addr, class) = (lane.peer, lane.local_addr, lane.pending.class);
-    let Err(lane) = registry.restore_ready(nonce, lane, expires_at) else {
+    let Err(lane) = registry.reinsert_ready_lane(nonce, lane, expires_at) else {
         return;
     };
     drop(lane);
@@ -590,7 +583,7 @@ fn restore_ready_or_reject(
     );
 }
 
-fn finish_reservation_or_reject(
+fn confirm_reservation_or_reject(
     registry: &PendingLaneRegistry,
     rejections: &LaneRejectionLog,
     nonce: PairingNonce,
@@ -599,7 +592,7 @@ fn finish_reservation_or_reject(
     elapsed: Duration,
 ) {
     let (peer, local_addr) = (lane.peer, lane.local_addr);
-    let Err(lane) = registry.finish_reservation(nonce, lane) else {
+    let Err(lane) = registry.confirm_reservation(nonce, lane) else {
         return;
     };
     drop(lane);
@@ -617,7 +610,7 @@ fn finish_reservation_or_reject(
 }
 
 async fn signal_rejected_lane(
-    writer: &mut FrameWriter,
+    writer: &mut FrameByteWriter,
     rejections: &LaneRejectionLog,
     context: RejectedLaneContext,
     elapsed: Duration,
@@ -638,9 +631,9 @@ fn record_rejected_lane(
 fn pair_lanes_inner(
     lane_a: PendingLane,
     lane_b: PendingLane,
-    env: StreamHandler,
+    handler: StreamHandler,
     nonce: PairingNonce,
-    groups: &Arc<SessionGroupRegistry>,
+    groups: &Arc<SessionPairRegistry>,
 ) {
     counter!("stream.rtp_mux.paired").increment(1);
     let addrs = classify_lane_addrs(
@@ -650,7 +643,7 @@ fn pair_lanes_inner(
         lane_b.peer,
         lane_b.local_addr,
     );
-    pair_lanes(lane_a, lane_b, env, addrs, nonce, groups);
+    pair_lanes(lane_a, lane_b, handler, addrs, nonce, groups);
 }
 
 async fn run_pending_lane_expiry(registry: Arc<PendingLaneRegistry>, rejections: LaneRejectionLog) {
@@ -712,10 +705,10 @@ fn classify_lane_addrs(
 fn pair_lanes(
     lane_a: PendingLane,
     lane_b: PendingLane,
-    env: StreamHandler,
+    handler: StreamHandler,
     addrs: DualLaneSocketAddrs,
     nonce: PairingNonce,
-    groups: &Arc<SessionGroupRegistry>,
+    groups: &Arc<SessionPairRegistry>,
 ) {
     let group_token = lane_a.group;
     let mut tasks = JoinSet::new();
@@ -736,7 +729,7 @@ fn pair_lanes(
             tokio::spawn(async move {
                 let paired_at = Instant::now();
                 let accepted_streams =
-                    run_dual_mux_accepter(accepter, opener, addr, env, member).await;
+                    run_dual_mux_accepter(accepter, opener, addr, handler, member).await;
                 let error = match tasks.join_next().await {
                     Some(Ok(error)) => error,
                     Some(Err(source)) => MuxError::TaskJoin {
@@ -760,9 +753,9 @@ async fn run_dual_mux_accepter(
     opener: mux::DualStreamOpener,
     addr: SocketAddrPair,
     handler: StreamHandler,
-    member: GroupMember,
+    member: PairMember,
 ) -> u64 {
-    let mut accepter = accepter.into_migrating_duplex_shared(opener, member.feed());
+    let mut accepter = accepter.into_migrating_duplex_with_feed(opener, member.feed());
     let mut accepted_streams = 0;
     loop {
         let accepted = match accepter.accept().await {
@@ -953,7 +946,7 @@ mod tests {
 
         let failure = await_birth_heartbeat(
             CancellationProbe::new(
-                write_birth_heartbeat(&mut writer),
+                write_liveness_heartbeat(&mut writer),
                 Arc::clone(&heartbeat_cancelled),
             ),
             Duration::from_millis(1),
@@ -1019,7 +1012,7 @@ mod tests {
             &mut tasks,
         );
         PreparedLane {
-            pending: mux::PendingAcceptor::new(
+            pending: mux::UnpairedLane::new(
                 LaneClass::Interactive,
                 nonce,
                 group,
@@ -1048,7 +1041,7 @@ mod tests {
             peer,
             local_addr,
             group: mux::GroupToken::generate(),
-            _permit: registry.try_acquire(peer.ip()).unwrap(),
+            _permit: registry.try_admit(peer.ip()).unwrap(),
         }
     }
 
@@ -1059,8 +1052,8 @@ mod tests {
         let peer: SocketAddr = "10.0.0.1:1000".parse().unwrap();
         let local_addr: SocketAddr = "10.0.0.2:2000".parse().unwrap();
         let nonce = PairingNonce::generate();
-        let mut permit = Some(registry.try_acquire(peer.ip()).unwrap());
-        registry.admit(
+        let mut permit = Some(registry.try_admit(peer.ip()).unwrap());
+        registry.register_admitted(
             nonce,
             LaneClass::Bulk,
             peer,
@@ -1068,7 +1061,7 @@ mod tests {
             mux::GroupToken::generate(),
             &mut permit,
         );
-        restore_ready_or_reject(
+        reinsert_ready_lane_or_reject(
             &registry,
             &rejections,
             nonce,
@@ -1090,7 +1083,7 @@ mod tests {
         let peer: SocketAddr = "10.0.0.1:1000".parse().unwrap();
         let local_addr: SocketAddr = "10.0.0.2:2000".parse().unwrap();
         let nonce = PairingNonce::generate();
-        finish_reservation_or_reject(
+        confirm_reservation_or_reject(
             &registry,
             &rejections,
             nonce,

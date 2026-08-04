@@ -1,5 +1,6 @@
 mod accept_error;
 mod admission;
+mod byte_count;
 mod client_stream;
 mod connector;
 mod explorer;
@@ -9,16 +10,15 @@ mod migrating_write_half;
 mod server;
 mod shared;
 mod stream;
-mod traffic;
 
+pub use byte_count::SessionStats;
 pub use client_stream::ClientStream;
 pub use connector::{
     BindSelector, BulkAddrSelector, OpenedStream, RtpMuxConnector, RtpMuxConnectorConfig,
-    SessionProbe,
+    SessionView,
 };
 pub use explorer::{ExplorerConfig, ExplorerReport, PathScore, TupleReport};
 pub use migrating_write_half::MigratingWriteHalf;
 pub use mux::LaneClass;
 pub use server::{RtpMuxServer, ServeError};
 pub use stream::{ServerStream, SocketAddrPair};
-pub use traffic::SessionStats;

@@ -148,7 +148,7 @@ async fn xsession_migration_end_to_end() {
             "transfers to reach the gate",
         )
         .await;
-        connector.reset_addr(addr);
+        connector.force_redial(addr);
         wait_until(
             || {
                 connector
