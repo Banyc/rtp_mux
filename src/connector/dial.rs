@@ -16,8 +16,7 @@ use tracing::{debug, info};
 
 use crate::{
     shared::{
-        BIRTH_LIVENESS_DEADLINE, BIRTH_LIVENESS_GRACE, MAX_DUAL_CONNECT_ATTEMPTS,
-        client_mux_config,
+        BIRTH_LIVENESS_DEADLINE, BIRTH_LIVENESS_GRACE, MAX_DUAL_CONNECT_ATTEMPTS, client_mux_config,
     },
     traffic::SessionTraffic,
 };

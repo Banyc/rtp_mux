@@ -28,7 +28,7 @@ use crate::{
 };
 
 use dial::{
-    connect_dual_lane, dual_supervisor_result, ConnectedDualLaneBirth, DualLaneDial, DualLaneDialer,
+    ConnectedDualLaneBirth, DualLaneDial, DualLaneDialer, connect_dual_lane, dual_supervisor_result,
 };
 use session::{
     Session, SharedDraining, SharedSessions, live_session, prune_dead_addresses, rebind_streams,
@@ -645,11 +645,11 @@ fn live_dial_waiters(
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
+    use super::dial::retry_dual_connect;
     use super::*;
     use crate::shared::{client_mux_config, server_mux_config};
     use crate::traffic::SessionTraffic;
     use mux::{PairingNonce, spawn_mux_no_reconnection};
-    use super::dial::retry_dual_connect;
 
     fn spawn_test_connector(
         dialer: DualLaneDialer,

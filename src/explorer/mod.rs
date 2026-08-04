@@ -7,9 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tuple_stats::TupleStats;
 pub use path_score::{PathScore, ReoptRule, ReoptVerdict};
 pub use tuple_stats::TupleReport;
+use tuple_stats::TupleStats;
 
 #[derive(Debug, Clone)]
 pub struct ExplorerConfig {
@@ -65,7 +65,9 @@ impl SocketCandidate {
 
 impl ProbeIo for SocketCandidate {
     fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
-        self.socket.try_send(&rtp::probe::encode_probe(echo)).map(drop)
+        self.socket
+            .try_send(&rtp::probe::encode_probe(echo))
+            .map(drop)
     }
     fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
         let mut buf = [0u8; 64];
@@ -242,8 +244,10 @@ impl<C: ProbeIo> Explorer<C> {
 
 #[cfg(test)]
 mod tests {
+    use super::tuple_stats::{
+        DEAD_CONSECUTIVE_LOSSES, MIN_SAMPLES, PROBE_POLL_TICK, PROBE_TIMEOUT,
+    };
     use super::*;
-    use super::tuple_stats::{DEAD_CONSECUTIVE_LOSSES, MIN_SAMPLES, PROBE_POLL_TICK, PROBE_TIMEOUT};
 
     use std::{
         collections::VecDeque,

@@ -65,7 +65,13 @@ impl TupleStats {
             None => self.consecutive_losses = self.consecutive_losses.saturating_add(1),
         }
     }
-    pub(crate) fn drive(&mut self, io: &mut dyn ProbeIo, now: Instant, mean: Duration, epoch: Instant) {
+    pub(crate) fn drive(
+        &mut self,
+        io: &mut dyn ProbeIo,
+        now: Instant,
+        mean: Duration,
+        epoch: Instant,
+    ) {
         while let Some(echo) = io.try_recv_echo() {
             if let Some((expected, sent_at)) = self.outstanding
                 && echo.nonce == expected

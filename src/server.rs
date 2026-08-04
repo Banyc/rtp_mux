@@ -12,9 +12,7 @@ use mux::{
     AcceptedStream, LaneClass, MuxError, PairingNonce, complete_pairing, read_lane_hello,
     spawn_mux_no_reconnection, write_birth_heartbeat,
 };
-use rtp::{
-    socket::{FrameReader, FrameWriter},
-};
+use rtp::socket::{FrameReader, FrameWriter};
 use thiserror::Error;
 use tokio::{net::ToSocketAddrs, task::JoinSet};
 use tracing::{error, info, instrument, trace, warn};
@@ -180,15 +178,13 @@ async fn handle_lane_accept(
             backoff.accepted(backoff_name, addr);
             stream
         }
-        Err(error) => {
-            match backoff.failed_dispatching(backoff_name, addr, error) {
-                Ok(()) => {
-                    backoff.pause().await;
-                    return Ok(());
-                }
-                Err(source) => return Err(ServeError::Accept { source, addr }),
+        Err(error) => match backoff.failed_dispatching(backoff_name, addr, error) {
+            Ok(()) => {
+                backoff.pause().await;
+                return Ok(());
             }
-        }
+            Err(source) => return Err(ServeError::Accept { source, addr }),
+        },
     };
     counter!("stream.rtp_mux.rtp.accepts").increment(1);
     let peer = stream.peer_addr;
@@ -264,7 +260,9 @@ fn spawn_lane_accept(
                         elapsed,
                     );
                     drop(permit);
-                    return MuxError::TaskStopped { task: "lane_accept" };
+                    return MuxError::TaskStopped {
+                        task: "lane_accept",
+                    };
                 }
                 Ok(Err(error)) => {
                     let elapsed = started.elapsed();
@@ -282,7 +280,9 @@ fn spawn_lane_accept(
                         elapsed,
                     )
                     .await;
-                    return MuxError::TaskStopped { task: "lane_accept" };
+                    return MuxError::TaskStopped {
+                        task: "lane_accept",
+                    };
                 }
             };
         let elapsed = started.elapsed();
@@ -301,7 +301,9 @@ fn spawn_lane_accept(
                 elapsed,
             )
             .await;
-            return MuxError::TaskStopped { task: "lane_accept" };
+            return MuxError::TaskStopped {
+                task: "lane_accept",
+            };
         }
         if groups.is_full(&group) {
             drop(permit);
@@ -318,7 +320,9 @@ fn spawn_lane_accept(
                 elapsed,
             )
             .await;
-            return MuxError::TaskStopped { task: "lane_accept" };
+            return MuxError::TaskStopped {
+                task: "lane_accept",
+            };
         }
         let mut permit = Some(permit);
         match registry.admit(nonce, class, peer, local_addr, group, &mut permit) {
@@ -339,7 +343,9 @@ fn spawn_lane_accept(
                         failure,
                     )
                     .await;
-                    return MuxError::TaskStopped { task: "lane_accept" };
+                    return MuxError::TaskStopped {
+                        task: "lane_accept",
+                    };
                 }
                 let mut tasks = JoinSet::new();
                 let (opener, accepter) = spawn_mux_no_reconnection(read, write, config, &mut tasks);
@@ -378,7 +384,9 @@ fn spawn_lane_accept(
                         failure,
                     )
                     .await;
-                    return MuxError::TaskStopped { task: "lane_accept" };
+                    return MuxError::TaskStopped {
+                        task: "lane_accept",
+                    };
                 }
                 match registry
                     .wait_for_pair(nonce, class, peer, expires_at, changed)
@@ -460,7 +468,9 @@ fn spawn_lane_accept(
                         failure,
                     )
                     .await;
-                    return MuxError::TaskStopped { task: "lane_accept" };
+                    return MuxError::TaskStopped {
+                        task: "lane_accept",
+                    };
                 }
                 let mut tasks = JoinSet::new();
                 let (opener, accepter) = spawn_mux_no_reconnection(read, write, config, &mut tasks);
