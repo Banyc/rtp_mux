@@ -504,32 +504,43 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_write_half_aborts_its_background_writer() {
         use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
         let (opener, accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
         let (writer, _gen0) = opener.open_migrating_with_reader(50, mux::LaneClass::Interactive);
-        let (half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        let (mut half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
         assert_eq!(
             half.background_writer.len(),
             1,
             "the writer task must be owned by the object while it lives",
         );
+        // The migrating stream is opened lazily by the first write; without
+        // it the peer never sees an announced stream to accept.
+        tokio::time::timeout(Duration::from_secs(2), half.write_all(b"x"))
+            .await
+            .expect("the first write must open the migrating stream")
+            .unwrap();
         let mut accepter = accepter.into_migrating_only();
         let accepted = tokio::time::timeout(Duration::from_secs(2), accepter.accept())
             .await
             .expect("the stream must be accepted while the writer is alive")
             .unwrap();
         let mut reader = match accepted {
-            mux::AcceptedStream::Migrating { reader, writer, .. } => {
-                drop(writer);
-                reader
-            }
+            mux::AcceptedStream::Migrating { reader, .. } => reader,
             _ => panic!("expected a migrating stream"),
         };
-        drop(half);
-        let mut buf = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut buf))
+        let mut buf = [0u8; 4];
+        let n = tokio::time::timeout(Duration::from_secs(2), reader.read(&mut buf))
             .await
-            .expect("dropping the write half must abort its writer so the peer sees the stream close")
+            .expect("the data written before the drop must reach the peer")
             .unwrap();
+        assert_eq!(&buf[..n], b"x");
+        // Dropping the write half aborts its background writer (the JoinSet
+        // drop is the abort backstop): the peer must not receive any further
+        // data once the writer task is gone.
+        drop(half);
+        tokio::time::timeout(Duration::from_millis(300), reader.read(&mut buf))
+            .await
+            .expect_err("the aborted background writer must not deliver further data");
     }
 
     #[tokio::test]

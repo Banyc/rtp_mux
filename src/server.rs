@@ -156,7 +156,7 @@ fn rejection_log_ticker() -> tokio::time::Interval {
 async fn finish_frame_delivery_accept(
     accept: io::Result<rtp::udp::FrameDeliveryAccept>,
 ) -> io::Result<rtp::udp::FrameDeliveryIo> {
-    accept?.await.map_err(io::Error::other)?
+    accept?.await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,8 +241,8 @@ fn spawn_lane_accept(
         local_addr,
         permit,
     } = admitted;
+    let session_spawner = (*session_spawner).clone();
     mux.spawn(async move {
-        let session_spawner = session_spawner.clone();
         let started = Instant::now();
         let (class, nonce, group) =
             match tokio::time::timeout(HELLO_DEADLINE, read_lane_hello(&mut read)).await {
