@@ -8,6 +8,7 @@ mod group;
 mod lane_rejection;
 mod migrating_write_half;
 mod server;
+mod session;
 mod shared;
 mod stream;
 
@@ -21,4 +22,5 @@ pub use explorer::{ExplorerConfig, ExplorerReport, PathScore, TupleReport};
 pub use migrating_write_half::MigratingWriteHalf;
 pub use mux::LaneClass;
 pub use server::{RtpMuxServer, ServeError};
+pub use session::SessionSpawner;
 pub use stream::{ServerStream, SocketAddrPair};

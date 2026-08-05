@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)]
+
 use rtp_mux::{RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,7 +11,11 @@ const PAYLOAD: usize = 256 * 1024;
 async fn a_session_counts_its_streams_and_the_bytes_they_carried() {
     let server = RtpMuxServer::bind("127.0.0.1:0", false).await.unwrap();
     let addr = server.listener().local_addr();
-    tokio::spawn(server.serve(|stream| {
+    let sessions = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
+    let spawner = rtp_mux::SessionSpawner::new(move |fut| {
+        sessions.lock().unwrap().spawn(fut);
+    });
+    tokio::spawn(server.serve(spawner, |stream| {
         tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(stream);
             let _ = tokio::io::copy(&mut reader, &mut writer).await;

@@ -13,6 +13,11 @@ enum ReaderState {
     Pending {
         rx: tokio::sync::oneshot::Receiver<StreamReader>,
     },
+    PendingGene {
+        gen0: tokio::sync::oneshot::Receiver<StreamReader>,
+        logical_id: u64,
+        router: mux::ResponseRouterHandle,
+    },
     PendingSpliced {
         rx: tokio::sync::oneshot::Receiver<SplicedReader>,
     },
@@ -61,19 +66,13 @@ impl ClientStream {
         let (write, rebind) = MigratingWriteHalf::new_with_rebind(writer);
         let session = crate::connector::StreamRebind::track(rebind, session);
         let name = write.name_handle();
-        let (spliced_tx, spliced_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let Ok(gen0_reader) = reader.await else {
-                return;
-            };
-            let rx = router.inject_response_gene(logical_id, gen0_reader);
-            if let Ok(spliced) = rx.await {
-                let _ = spliced_tx.send(spliced);
-            }
-        });
         Self {
             write,
-            reader_state: ReaderState::PendingSpliced { rx: spliced_rx },
+            reader_state: ReaderState::PendingGene {
+                gen0: reader,
+                logical_id,
+                router,
+            },
             addr,
             name,
             _session: Some(session),
@@ -102,6 +101,24 @@ fn poll_reader_state(
         match state {
             ReaderState::Pending { rx } => match Pin::new(rx).poll(cx) {
                 Poll::Ready(Ok(reader)) => *state = ReaderState::Ready { reader },
+                Poll::Ready(Err(_)) => {
+                    *state = ReaderState::Failed {
+                        reason: "gen-0 reader channel closed before write",
+                    };
+                    continue;
+                }
+                Poll::Pending => return Poll::Pending,
+            },
+            ReaderState::PendingGene {
+                gen0,
+                logical_id,
+                router,
+            } => match Pin::new(gen0).poll(cx) {
+                Poll::Ready(Ok(gen0_reader)) => {
+                    let rx = router.inject_response_gene(*logical_id, gen0_reader);
+                    *state = ReaderState::PendingSpliced { rx };
+                    continue;
+                }
                 Poll::Ready(Err(_)) => {
                     *state = ReaderState::Failed {
                         reason: "gen-0 reader channel closed before write",
@@ -165,6 +182,7 @@ impl AsyncWrite for ClientStream {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::time::Duration;
 

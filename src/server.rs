@@ -26,6 +26,7 @@ use crate::{
     group::{PairMember, SessionPairRegistry},
     lane_rejection::{LaneRejectionClass, LaneRejectionLog, RejectedLaneContext},
     shared::{ADMISSION_REJECTION_LOG_INTERVAL, HELLO_DEADLINE, bulk_lane_addr, server_mux_config},
+    session::SessionSpawner,
     stream::{ServerStream, SocketAddrPair},
 };
 
@@ -96,6 +97,7 @@ impl RtpMuxServer {
     #[instrument(skip_all)]
     pub async fn serve(
         mut self,
+        session_spawner: SessionSpawner,
         handler: impl Fn(ServerStream) + Send + Sync + 'static,
     ) -> Result<(), ServeError> {
         let addr = self.interactive_listener.local_addr();
@@ -135,10 +137,10 @@ impl RtpMuxServer {
                 }
                 _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
-                    handle_lane_accept(result, &mut interactive_backoff, "rtp_mux_interactive", addr, LaneClass::Interactive, &handler, &registry, &groups, &rejections, &mut self.mux).await?;
+                    handle_lane_accept(result, &mut interactive_backoff, "rtp_mux_interactive", addr, LaneClass::Interactive, &handler, &registry, &groups, &rejections, &session_spawner, &mut self.mux).await?;
                 }
                 result = self.bulk_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
-                    handle_lane_accept(result, &mut bulk_backoff, "rtp_mux_bulk", bulk_addr, LaneClass::Bulk, &handler, &registry, &groups, &rejections, &mut self.mux).await?;
+                    handle_lane_accept(result, &mut bulk_backoff, "rtp_mux_bulk", bulk_addr, LaneClass::Bulk, &handler, &registry, &groups, &rejections, &session_spawner, &mut self.mux).await?;
                 }
             }
         }
@@ -168,6 +170,7 @@ async fn handle_lane_accept(
     registry: &Arc<PendingLaneRegistry>,
     groups: &Arc<SessionPairRegistry>,
     rejections: &LaneRejectionLog,
+    session_spawner: &SessionSpawner,
     mux: &mut JoinSet<MuxError>,
 ) -> Result<(), ServeError> {
     let stream = match finish_frame_delivery_accept(accept).await {
@@ -214,6 +217,7 @@ async fn handle_lane_accept(
         Arc::clone(registry),
         Arc::clone(groups),
         rejections.clone(),
+        session_spawner,
         mux,
     );
     Ok(())
@@ -225,6 +229,7 @@ fn spawn_lane_accept(
     registry: Arc<PendingLaneRegistry>,
     groups: Arc<SessionPairRegistry>,
     rejections: LaneRejectionLog,
+    session_spawner: &SessionSpawner,
     mux: &mut JoinSet<MuxError>,
 ) {
     let AdmittedLane {
@@ -237,6 +242,7 @@ fn spawn_lane_accept(
         permit,
     } = admitted;
     mux.spawn(async move {
+        let session_spawner = session_spawner.clone();
         let started = Instant::now();
         let (class, nonce, group) =
             match tokio::time::timeout(HELLO_DEADLINE, read_lane_hello(&mut read)).await {
@@ -400,7 +406,7 @@ fn spawn_lane_accept(
                             group,
                             _permit: permit.take().unwrap(),
                         };
-                        pair_lanes_inner(lane, other, handler.clone(), nonce, &groups);
+                        pair_lanes_inner(lane, other, handler.clone(), nonce, &session_spawner, &groups);
                     }
                     PendingLaneWait::Timeout => {
                         drop(permit.take());
@@ -476,7 +482,7 @@ fn spawn_lane_accept(
                     group,
                     _permit: permit.take().unwrap(),
                 };
-                pair_lanes_inner(lane, other, handler.clone(), nonce, &groups);
+                pair_lanes_inner(lane, other, handler.clone(), nonce, &session_spawner, &groups);
             }
             PendingLaneAdmission::Reject(reason) => {
                 drop(permit);
@@ -633,6 +639,7 @@ fn pair_lanes_inner(
     lane_b: PendingLane,
     handler: StreamHandler,
     nonce: PairingNonce,
+    session_spawner: &SessionSpawner,
     groups: &Arc<SessionPairRegistry>,
 ) {
     counter!("stream.rtp_mux.paired").increment(1);
@@ -643,7 +650,7 @@ fn pair_lanes_inner(
         lane_b.peer,
         lane_b.local_addr,
     );
-    pair_lanes(lane_a, lane_b, handler, addrs, nonce, groups);
+    pair_lanes(lane_a, lane_b, handler, addrs, nonce, session_spawner, groups);
 }
 
 async fn run_pending_lane_expiry(registry: Arc<PendingLaneRegistry>, rejections: LaneRejectionLog) {
@@ -708,6 +715,7 @@ fn pair_lanes(
     handler: StreamHandler,
     addrs: DualLaneSocketAddrs,
     nonce: PairingNonce,
+    session_spawner: &SessionSpawner,
     groups: &Arc<SessionPairRegistry>,
 ) {
     let group_token = lane_a.group;
@@ -726,7 +734,7 @@ fn pair_lanes(
                 local_addr: addrs.interactive_local,
                 peer_addr: addrs.interactive_peer,
             };
-            tokio::spawn(async move {
+            session_spawner.spawn(async move {
                 let paired_at = Instant::now();
                 let accepted_streams =
                     run_dual_mux_accepter(accepter, opener, addr, handler, member).await;
@@ -1002,6 +1010,16 @@ mod tests {
         peer: SocketAddr,
         local_addr: SocketAddr,
     ) -> PreparedLane {
+        prepared_lane_with_class(nonce, group, LaneClass::Interactive, peer, local_addr)
+    }
+
+    fn prepared_lane_with_class(
+        nonce: PairingNonce,
+        group: mux::GroupToken,
+        class: LaneClass,
+        peer: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> PreparedLane {
         let (io, _peer_io) = tokio::io::duplex(64);
         let (read, write) = tokio::io::split(io);
         let mut tasks = JoinSet::new();
@@ -1012,14 +1030,7 @@ mod tests {
             &mut tasks,
         );
         PreparedLane {
-            pending: mux::UnpairedLane::new(
-                LaneClass::Interactive,
-                nonce,
-                group,
-                opener,
-                accepter,
-                tasks,
-            ),
+            pending: mux::UnpairedLane::new(class, nonce, group, opener, accepter, tasks),
             peer,
             local_addr,
         }
@@ -1043,6 +1054,83 @@ mod tests {
             group: mux::GroupToken::generate(),
             _permit: registry.try_admit(peer.ip()).unwrap(),
         }
+    }
+
+    fn pending_lane_with_class(
+        registry: &Arc<PendingLaneRegistry>,
+        nonce: PairingNonce,
+        group: mux::GroupToken,
+        class: LaneClass,
+        peer: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> PendingLane {
+        let PreparedLane {
+            pending,
+            peer,
+            local_addr,
+        } = prepared_lane_with_class(nonce, group, class, peer, local_addr);
+        PendingLane {
+            pending,
+            peer,
+            local_addr,
+            group,
+            _permit: registry.try_admit(peer.ip()).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_session_scope_supervisor_drains_on_normal_shutdown() {
+        let sessions: std::sync::Arc<std::sync::Mutex<JoinSet<()>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(JoinSet::new()));
+        let spawner = SessionSpawner::new({
+            let sessions = std::sync::Arc::clone(&sessions);
+            move |fut| {
+                sessions.lock().unwrap().spawn(fut);
+            }
+        });
+        let registry = PendingLaneRegistry::new();
+        let groups = SessionPairRegistry::new();
+        let nonce = PairingNonce::generate();
+        let group = mux::GroupToken::generate();
+        let peer: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let interactive_local: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let bulk_local: SocketAddr = "10.0.0.2:2001".parse().unwrap();
+        let lane_a = pending_lane_with_class(
+            &registry,
+            nonce,
+            group,
+            LaneClass::Interactive,
+            peer,
+            interactive_local,
+        );
+        let lane_b = pending_lane_with_class(
+            &registry,
+            nonce,
+            group,
+            LaneClass::Bulk,
+            peer,
+            bulk_local,
+        );
+        let addrs =
+            classify_lane_addrs(LaneClass::Interactive, peer, interactive_local, peer, bulk_local);
+        let handler: StreamHandler = Arc::new(|_| {});
+        pair_lanes(lane_a, lane_b, handler, addrs, nonce, &spawner, &groups);
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = sessions.lock().unwrap().try_join_next() {
+                    return result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the session-scope supervisor never drained on normal shutdown")
+        .expect("the session-scope supervisor panicked");
+        assert_eq!(
+            drained,
+            (),
+            "the session-scope supervisor must terminate with a unit output after its mux tasks drain"
+        );
     }
 
     #[tokio::test]

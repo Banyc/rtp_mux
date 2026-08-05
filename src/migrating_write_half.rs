@@ -99,7 +99,7 @@ pub struct MigratingWriteHalf {
     /// write half; never read directly.
     #[allow(dead_code)]
     rebind_guard: RebindSlot,
-    background_writer: tokio::task::JoinHandle<()>,
+    background_writer: tokio::task::JoinSet<()>,
 }
 impl fmt::Debug for MigratingWriteHalf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,7 +108,7 @@ impl fmt::Debug for MigratingWriteHalf {
 }
 impl Drop for MigratingWriteHalf {
     fn drop(&mut self) {
-        self.background_writer.abort();
+        self.background_writer.abort_all();
     }
 }
 impl MigratingWriteHalf {
@@ -125,7 +125,8 @@ impl MigratingWriteHalf {
         let latest = Arc::clone(&rebind.latest);
         let background_error: Arc<Mutex<Option<BackgroundWriteError>>> = Arc::new(Mutex::new(None));
         let background_error_clone = Arc::clone(&background_error);
-        let background_writer = tokio::spawn(async move {
+        let mut background_writer = tokio::task::JoinSet::new();
+        background_writer.spawn(async move {
             let mut rebind_open = true;
             loop {
                 let command = tokio::select! {
@@ -205,10 +206,18 @@ impl MigratingWriteHalf {
     pub fn name_handle(&self) -> mux::StreamName {
         self.name.clone()
     }
+    fn reap_background_writer(&mut self) {
+        while let Some(result) = self.background_writer.try_join_next() {
+            if result.is_err() && !result.as_ref().unwrap_err().is_cancelled() {
+                result.unwrap();
+            }
+        }
+    }
     fn poll_pending_control(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<Option<ControlKind>>> {
+        self.reap_background_writer();
         let Some(pending) = &mut self.pending_control else {
             return Poll::Ready(Ok(None));
         };
@@ -398,5 +407,154 @@ impl tokio::io::AsyncWrite for MigratingWriteHalf {
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_shutdown_inner(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use mux::{Initiation, MuxConfig, MuxError};
+    use tokio::task::JoinSet;
+
+    use super::*;
+
+    async fn make_dual_pair() -> (
+        mux::DualStreamOpener,
+        mux::DualStreamAccepter,
+        JoinSet<MuxError>,
+        JoinSet<MuxError>,
+    ) {
+        fn config(initiation: Initiation) -> MuxConfig {
+            MuxConfig {
+                initiation,
+                heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: true,
+            }
+        }
+        fn lane(
+            client_config: MuxConfig,
+            server_config: MuxConfig,
+        ) -> (
+            mux::StreamOpener,
+            mux::StreamAccepter,
+            JoinSet<MuxError>,
+            mux::StreamOpener,
+            mux::StreamAccepter,
+            JoinSet<MuxError>,
+        ) {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (client_read, client_write) = tokio::io::split(client_io);
+            let (server_read, server_write) = tokio::io::split(server_io);
+            let mut client_tasks = JoinSet::new();
+            let (client_opener, client_accepter) = mux::spawn_mux_no_reconnection(
+                client_read,
+                client_write,
+                client_config,
+                &mut client_tasks,
+            );
+            let mut server_tasks = JoinSet::new();
+            let (server_opener, server_accepter) = mux::spawn_mux_no_reconnection(
+                server_read,
+                server_write,
+                server_config,
+                &mut server_tasks,
+            );
+            (
+                client_opener,
+                client_accepter,
+                client_tasks,
+                server_opener,
+                server_accepter,
+                server_tasks,
+            )
+        }
+        let (ci_o, ci_a, ci_t, si_o, si_a, si_t) =
+            lane(config(Initiation::Client), config(Initiation::Server));
+        let (cb_o, cb_a, cb_t, sb_o, sb_a, sb_t) =
+            lane(config(Initiation::Client), config(Initiation::Server));
+        let mut client_supervisor = JoinSet::new();
+        let (client_opener, _client_accepter) = mux::spawn_dual_mux_paired_supervised(
+            ci_o,
+            ci_a,
+            ci_t,
+            cb_o,
+            cb_a,
+            cb_t,
+            &mut client_supervisor,
+        );
+        let mut server_supervisor = JoinSet::new();
+        let (_server_opener, server_accepter) = mux::spawn_dual_mux_paired_supervised(
+            si_o,
+            si_a,
+            si_t,
+            sb_o,
+            sb_a,
+            sb_t,
+            &mut server_supervisor,
+        );
+        (
+            client_opener,
+            server_accepter,
+            client_supervisor,
+            server_supervisor,
+        )
+    }
+
+    #[tokio::test]
+    async fn dropping_the_write_half_aborts_its_background_writer() {
+        use tokio::io::AsyncReadExt;
+        let (opener, accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (writer, _gen0) = opener.open_migrating_with_reader(50, mux::LaneClass::Interactive);
+        let (half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        assert_eq!(
+            half.background_writer.len(),
+            1,
+            "the writer task must be owned by the object while it lives",
+        );
+        let mut accepter = accepter.into_migrating_only();
+        let accepted = tokio::time::timeout(Duration::from_secs(2), accepter.accept())
+            .await
+            .expect("the stream must be accepted while the writer is alive")
+            .unwrap();
+        let mut reader = match accepted {
+            mux::AcceptedStream::Migrating { reader, writer, .. } => {
+                drop(writer);
+                reader
+            }
+            _ => panic!("expected a migrating stream"),
+        };
+        drop(half);
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut buf))
+            .await
+            .expect("dropping the write half must abort its writer so the peer sees the stream close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_the_background_writer() {
+        use tokio::io::AsyncWriteExt;
+        let (opener, _accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (writer, _gen0) = opener.open_migrating_with_reader(51, mux::LaneClass::Interactive);
+        let (mut half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        assert_eq!(
+            half.background_writer.len(),
+            1,
+            "the writer task must be owned by the object while it lives",
+        );
+        tokio::time::timeout(Duration::from_secs(2), half.shutdown())
+            .await
+            .expect("a normal shutdown must complete")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !half.background_writer.is_empty() {
+                half.reap_background_writer();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the background writer must drain after a normal shutdown");
+        assert!(half.background_writer.is_empty());
     }
 }

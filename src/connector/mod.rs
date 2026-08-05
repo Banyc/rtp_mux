@@ -643,6 +643,7 @@ fn live_dial_waiters(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
 

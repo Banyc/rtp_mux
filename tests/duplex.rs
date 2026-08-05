@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)]
+
 use rtp_mux::{RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer, ServerStream};
 use std::{
     net::SocketAddr,
@@ -17,7 +19,11 @@ async fn response_migration_end_to_end() {
     let addr = server.listener().local_addr();
     let saw_duplex = Arc::new(AtomicBool::new(false));
     let saw_duplex_handler = Arc::clone(&saw_duplex);
-    tokio::spawn(server.serve(move |stream| {
+    let sessions = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
+    let spawner = rtp_mux::SessionSpawner::new(move |fut| {
+        sessions.lock().unwrap().spawn(fut);
+    });
+    tokio::spawn(server.serve(spawner, move |stream| {
         saw_duplex_handler.store(
             matches!(stream, ServerStream::MigratingDuplex { .. }),
             Ordering::SeqCst,

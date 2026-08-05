@@ -26,3 +26,10 @@ tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.3" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints.clippy]
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "every task must be owned by a caller-provided session scope (SessionSpawner) or an object-owned JoinSet so object drop aborts children and normal shutdown drains them; no session or writer task may be spawned detached" },
+    { path = "tokio::task::spawn", reason = "every task must be owned by a caller-provided session scope (SessionSpawner) or an object-owned JoinSet so object drop aborts children and normal shutdown drains them; no session or writer task may be spawned detached" },
+    { path = "tokio::runtime::Handle::spawn", reason = "every task must be owned by a caller-provided session scope (SessionSpawner) or an object-owned JoinSet so object drop aborts children and normal shutdown drains them; no session or writer task may be spawned detached" },
+]
