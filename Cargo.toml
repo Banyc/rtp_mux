@@ -17,8 +17,8 @@ tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.3" }
 
 # [patch."https://github.com/Banyc/mux.git"]
 # mux = { path = "../mux" }
-# [patch."https://github.com/Banyc/rtp.git"]
-# rtp = { path = "../rtp" }
+[patch."https://github.com/Banyc/rtp.git"]
+rtp = { path = "../rtp" }
 # [patch."https://github.com/Banyc/tokio_udp.git"]
 # tokio_udp = { path = "../tokio_udp" }
 # [patch."https://github.com/Banyc/udp_listener.git"]

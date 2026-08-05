@@ -160,6 +160,10 @@ async fn connect_dual_lane_once(
         rtp::udp::FrameDeliveryIo::connect(SocketAddr::new(bind_addr.ip(), 0), bulk_addr, config())
             .await?;
     let nonce = PairingNonce::generate();
+    // Keep the client lanes' rtp sessions alive for the whole mux connection;
+    // dropping their supervisors aborts those sessions.
+    let interactive_rtp_supervisor = interactive.supervisor;
+    let bulk_rtp_supervisor = bulk.supervisor;
     let interactive_reader = interactive.read;
     let mut interactive_writer = interactive.write;
     let bulk_reader = bulk.read;
@@ -227,7 +231,24 @@ async fn connect_dual_lane_once(
         accepter,
         local_addr: interactive_local,
         nonce,
-        supervisor,
+        supervisor: {
+            // Hold each lane's rtp session for the life of the mux connection.
+            // They are awaited (not detached): when the rtp session ends the
+            // task exits and the supervisor JoinSet reaps it.
+            supervisor.spawn(async move {
+                let _ = interactive_rtp_supervisor.await;
+                MuxError::TaskStopped {
+                    task: "interactive_rtp_supervisor",
+                }
+            });
+            supervisor.spawn(async move {
+                let _ = bulk_rtp_supervisor.await;
+                MuxError::TaskStopped {
+                    task: "bulk_rtp_supervisor",
+                }
+            });
+            supervisor
+        },
         probe_tap,
         traffic,
     })

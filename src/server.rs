@@ -190,6 +190,15 @@ async fn handle_lane_accept(
     let peer = stream.peer_addr;
     let read = stream.read;
     let write = stream.write;
+    // The accepted lane's rtp session owner must stay alive for the lane's
+    // whole life (dropping it aborts the session). Hold it in the server's
+    // supervised task set; it completes when the lane's rtp session ends.
+    mux.spawn(async move {
+        let _ = stream.supervisor.await;
+        MuxError::TaskStopped {
+            task: "rtp_lane_supervisor",
+        }
+    });
     let permit = match registry.try_admit(peer.ip()) {
         Ok(permit) => permit,
         Err(reason) => {
