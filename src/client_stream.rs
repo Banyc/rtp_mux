@@ -18,8 +18,16 @@ enum ReaderState {
         logical_id: u64,
         router: mux::ResponseRouterHandle,
     },
-    PendingSpliced {
-        rx: tokio::sync::oneshot::Receiver<SplicedReader>,
+    PendingInject {
+        future: std::sync::Mutex<
+            Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<SplicedReader, tokio::sync::oneshot::error::RecvError>,
+                        > + Send,
+                >,
+            >,
+        >,
     },
     Ready {
         reader: StreamReader,
@@ -115,8 +123,17 @@ fn poll_reader_state(
                 router,
             } => match Pin::new(gen0).poll(cx) {
                 Poll::Ready(Ok(gen0_reader)) => {
-                    let rx = router.inject_response_gene(*logical_id, gen0_reader);
-                    *state = ReaderState::PendingSpliced { rx };
+                    let router = router.clone();
+                    let logical_id = *logical_id;
+                    let future = Box::pin(async move {
+                        router
+                            .inject_response_gene(logical_id, gen0_reader)
+                            .await
+                            .await
+                    });
+                    *state = ReaderState::PendingInject {
+                        future: std::sync::Mutex::new(future),
+                    };
                     continue;
                 }
                 Poll::Ready(Err(_)) => {
@@ -127,16 +144,21 @@ fn poll_reader_state(
                 }
                 Poll::Pending => return Poll::Pending,
             },
-            ReaderState::PendingSpliced { rx } => match Pin::new(rx).poll(cx) {
-                Poll::Ready(Ok(reader)) => *state = ReaderState::ReadySpliced { reader },
-                Poll::Ready(Err(_)) => {
-                    *state = ReaderState::Failed {
-                        reason: "response splice channel closed before write",
-                    };
-                    continue;
+            ReaderState::PendingInject { future } => {
+                let mut guard = future.lock().unwrap();
+                let polled = guard.as_mut().poll(cx);
+                drop(guard);
+                match polled {
+                    Poll::Ready(Ok(reader)) => *state = ReaderState::ReadySpliced { reader },
+                    Poll::Ready(Err(_)) => {
+                        *state = ReaderState::Failed {
+                            reason: "response splice channel closed before write",
+                        };
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
                 }
-                Poll::Pending => return Poll::Pending,
-            },
+            }
             ReaderState::Ready { reader } => return Pin::new(reader).poll_read(cx, buf),
             ReaderState::ReadySpliced { reader } => return Pin::new(reader).poll_read(cx, buf),
             ReaderState::Failed { reason } => {
@@ -196,7 +218,14 @@ mod tests {
     async fn a_failed_reader_keeps_reporting_the_cause_it_first_gave() {
         let (tx, rx) = tokio::sync::oneshot::channel::<SplicedReader>();
         drop(tx);
-        let mut state = ReaderState::PendingSpliced { rx };
+        let future: Pin<
+            Box<
+                dyn Future<Output = Result<SplicedReader, tokio::sync::oneshot::error::RecvError>>
+                    + Send,
+            >,
+        > = Box::pin(async move { rx.await });
+        let future = std::sync::Mutex::new(future);
+        let mut state = ReaderState::PendingInject { future };
         let mut storage = [0u8; 8];
         let mut poll_once = |state: &mut ReaderState| {
             let mut buf = ReadBuf::new(&mut storage);

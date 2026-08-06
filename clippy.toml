@@ -2,4 +2,6 @@ disallowed-methods = [
     { path = "tokio::spawn", reason = "every task must be owned by a caller-provided session scope (SessionSpawner) or an object-owned JoinSet so object drop aborts children and normal shutdown drains them; no session or writer task may be spawned detached" },
     { path = "tokio::task::spawn", reason = "every task must be owned by a caller-provided session scope (SessionSpawner) or an object-owned JoinSet so object drop aborts children and normal shutdown drains them; no session or writer task may be spawned detached" },
     { path = "tokio::runtime::Handle::spawn", reason = "every task must be owned by a caller-provided session scope (SessionSpawner) or an object-owned JoinSet so object drop aborts children and normal shutdown drains them; no session or writer task may be spawned detached" },
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "no unbounded channels: they queue without bound under backpressure and can exhaust memory; use tokio::sync::mpsc::channel(N) so producers await a bounded slot" },
+    { path = "mpsc::unbounded_channel", reason = "no unbounded channels: they queue without bound under backpressure and can exhaust memory; use mpsc::channel(N) so producers await a bounded slot" },
 ]
