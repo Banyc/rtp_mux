@@ -8,6 +8,10 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+type PendingInjectFuture =
+    Pin<Box<dyn Future<Output = Result<SplicedReader, mux::SpliceFeedError>> + Send>>;
+
 enum ReaderState {
     #[cfg_attr(not(test), allow(dead_code))]
     Pending {
@@ -19,7 +23,7 @@ enum ReaderState {
         router: mux::ResponseRouterHandle,
     },
     PendingInject {
-        future: std::sync::Mutex<Pin<Box<dyn Future<Output = Result<SplicedReader, ()>> + Send>>>,
+        future: std::sync::Mutex<PendingInjectFuture>,
     },
     Ready {
         reader: StreamReader,
@@ -119,7 +123,7 @@ fn poll_reader_state(
                     let logical_id = *logical_id;
                     let future = Box::pin(async move {
                         let rx = router.inject_response_gene(logical_id, gen0_reader).await?;
-                        rx.await.map_err(|_| ())
+                        rx.await.map_err(|_| mux::SpliceFeedError::Closed)
                     });
                     *state = ReaderState::PendingInject {
                         future: std::sync::Mutex::new(future),
@@ -135,9 +139,7 @@ fn poll_reader_state(
                 Poll::Pending => return Poll::Pending,
             },
             ReaderState::PendingInject { future } => {
-                let mut guard = future.lock().unwrap();
-                let polled = guard.as_mut().poll(cx);
-                drop(guard);
+                let polled = future.get_mut().unwrap().as_mut().poll(cx);
                 match polled {
                     Poll::Ready(Ok(reader)) => *state = ReaderState::ReadySpliced { reader },
                     Poll::Ready(Err(_)) => {
@@ -208,8 +210,9 @@ mod tests {
     async fn a_failed_reader_keeps_reporting_the_cause_it_first_gave() {
         let (tx, rx) = tokio::sync::oneshot::channel::<SplicedReader>();
         drop(tx);
-        let future: Pin<Box<dyn Future<Output = Result<SplicedReader, ()>> + Send>> =
-            Box::pin(async move { rx.await.map_err(|_| ()) });
+        let future: Pin<
+            Box<dyn Future<Output = Result<SplicedReader, mux::SpliceFeedError>> + Send>,
+        > = Box::pin(async move { rx.await.map_err(|_| mux::SpliceFeedError::Closed) });
         let future = std::sync::Mutex::new(future);
         let mut state = ReaderState::PendingInject { future };
         let mut storage = [0u8; 8];

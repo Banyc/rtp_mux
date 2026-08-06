@@ -1163,7 +1163,7 @@ mod tests {
         );
         let handler: StreamHandler = Arc::new(|_| {});
         pair_lanes(lane_a, lane_b, handler, addrs, nonce, &spawner, &groups);
-        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(result) = sessions.lock().unwrap().try_join_next() {
                     return result;
@@ -1174,11 +1174,6 @@ mod tests {
         .await
         .expect("the session-scope supervisor never drained on normal shutdown")
         .expect("the session-scope supervisor panicked");
-        assert_eq!(
-            drained,
-            (),
-            "the session-scope supervisor must terminate with a unit output after its mux tasks drain"
-        );
     }
 
     #[tokio::test]
