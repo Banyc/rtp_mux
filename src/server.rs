@@ -25,8 +25,8 @@ use crate::{
     },
     group::{PairMember, SessionPairRegistry},
     lane_rejection::{LaneRejectionClass, LaneRejectionLog, RejectedLaneContext},
-    shared::{ADMISSION_REJECTION_LOG_INTERVAL, HELLO_DEADLINE, bulk_lane_addr, server_mux_config},
     session::SessionSpawner,
+    shared::{ADMISSION_REJECTION_LOG_INTERVAL, HELLO_DEADLINE, bulk_lane_addr, server_mux_config},
     stream::{ServerStream, SocketAddrPair},
 };
 
@@ -190,15 +190,10 @@ async fn handle_lane_accept(
     let peer = stream.peer_addr;
     let read = stream.read;
     let write = stream.write;
-    // The accepted lane's rtp session owner must stay alive for the lane's
-    // whole life (dropping it aborts the session). Hold it in the server's
-    // supervised task set; it completes when the lane's rtp session ends.
-    mux.spawn(async move {
-        let _ = stream.supervisor.await;
-        MuxError::TaskStopped {
-            task: "rtp_lane_supervisor",
-        }
-    });
+    // The accepted lane's RTP session owner rides inside the AdmittedLane:
+    // it is transferred into the paired session on success, and dropped
+    // (aborting the session) on rejection, timeout, or failed pairing.
+    let supervisor = stream.supervisor;
     let permit = match registry.try_admit(peer.ip()) {
         Ok(permit) => permit,
         Err(reason) => {
@@ -221,6 +216,7 @@ async fn handle_lane_accept(
             peer,
             local_addr: addr,
             permit,
+            supervisor,
         },
         handler.clone(),
         Arc::clone(registry),
@@ -249,6 +245,7 @@ fn spawn_lane_accept(
         peer,
         local_addr,
         permit,
+        supervisor,
     } = admitted;
     let session_spawner = (*session_spawner).clone();
     mux.spawn(async move {
@@ -365,6 +362,7 @@ fn spawn_lane_accept(
                     pending: mux::UnpairedLane::new(class, nonce, group, opener, accepter, tasks),
                     peer,
                     local_addr,
+                    supervisor,
                 };
                 confirm_reservation_or_reject(
                     &registry,
@@ -414,8 +412,16 @@ fn spawn_lane_accept(
                             local_addr,
                             group,
                             _permit: permit.take().unwrap(),
+                            supervisor,
                         };
-                        pair_lanes_inner(lane, other, handler.clone(), nonce, &session_spawner, &groups);
+                        pair_lanes_inner(
+                            lane,
+                            other,
+                            handler.clone(),
+                            nonce,
+                            &session_spawner,
+                            &groups,
+                        );
                     }
                     PendingLaneWait::Timeout => {
                         drop(permit.take());
@@ -490,8 +496,16 @@ fn spawn_lane_accept(
                     local_addr,
                     group,
                     _permit: permit.take().unwrap(),
+                    supervisor,
                 };
-                pair_lanes_inner(lane, other, handler.clone(), nonce, &session_spawner, &groups);
+                pair_lanes_inner(
+                    lane,
+                    other,
+                    handler.clone(),
+                    nonce,
+                    &session_spawner,
+                    &groups,
+                );
             }
             PendingLaneAdmission::Reject(reason) => {
                 drop(permit);
@@ -659,7 +673,15 @@ fn pair_lanes_inner(
         lane_b.peer,
         lane_b.local_addr,
     );
-    pair_lanes(lane_a, lane_b, handler, addrs, nonce, session_spawner, groups);
+    pair_lanes(
+        lane_a,
+        lane_b,
+        handler,
+        addrs,
+        nonce,
+        session_spawner,
+        groups,
+    );
 }
 
 async fn run_pending_lane_expiry(registry: Arc<PendingLaneRegistry>, rejections: LaneRejectionLog) {
@@ -743,19 +765,32 @@ fn pair_lanes(
                 local_addr: addrs.interactive_local,
                 peer_addr: addrs.interactive_peer,
             };
+            // Both lanes' RTP session owners are awaited for the session's
+            // whole life, so their completion and any driver panic surfaces
+            // here instead of being silently detached. A rejected, timed-out,
+            // or failed pairing never reaches here — it aborts them via the
+            // PendingLane drop instead.
+            let supervisor_a = lane_a.supervisor;
+            let supervisor_b = lane_b.supervisor;
             session_spawner.spawn(async move {
-                let paired_at = Instant::now();
-                let accepted_streams =
-                    run_dual_mux_accepter(accepter, opener, addr, handler, member).await;
-                let error = match tasks.join_next().await {
-                    Some(Ok(error)) => error,
-                    Some(Err(source)) => MuxError::TaskJoin {
-                        task: "dual_lane",
-                        source,
-                    },
-                    None => MuxError::TaskStopped { task: "dual_lane" },
+                let lane_sessions = async {
+                    tokio::join!(supervisor_a, supervisor_b);
                 };
-                warn!(event = "rtp_mux_session_terminated", ?error, ?nonce, dn_interactive = ?addrs.interactive_peer, dn_interactive_local = ?addrs.interactive_local, dn_bulk = ?addrs.bulk_peer, dn_bulk_local = ?addrs.bulk_local, accepted_streams, uptime_ms = paired_at.elapsed().as_millis(), "RTP mux dual-lane session terminated");
+                let mux_session = async {
+                    let paired_at = Instant::now();
+                    let accepted_streams =
+                        run_dual_mux_accepter(accepter, opener, addr, handler, member).await;
+                    let error = match tasks.join_next().await {
+                        Some(Ok(error)) => error,
+                        Some(Err(source)) => MuxError::TaskJoin {
+                            task: "dual_lane",
+                            source,
+                        },
+                        None => MuxError::TaskStopped { task: "dual_lane" },
+                    };
+                    warn!(event = "rtp_mux_session_terminated", ?error, ?nonce, dn_interactive = ?addrs.interactive_peer, dn_interactive_local = ?addrs.interactive_local, dn_bulk = ?addrs.bulk_peer, dn_bulk_local = ?addrs.bulk_local, accepted_streams, uptime_ms = paired_at.elapsed().as_millis(), "RTP mux dual-lane session terminated");
+                };
+                tokio::join!(lane_sessions, mux_session);
             });
         }
         Err(error) => {
@@ -1042,6 +1077,7 @@ mod tests {
             pending: mux::UnpairedLane::new(class, nonce, group, opener, accepter, tasks),
             peer,
             local_addr,
+            supervisor: rtp::socket::SessionHandle::idle(),
         }
     }
 
@@ -1055,6 +1091,7 @@ mod tests {
             pending,
             peer,
             local_addr,
+            supervisor,
         } = prepared_lane(nonce, mux::GroupToken::generate(), peer, local_addr);
         PendingLane {
             pending,
@@ -1062,6 +1099,7 @@ mod tests {
             local_addr,
             group: mux::GroupToken::generate(),
             _permit: registry.try_admit(peer.ip()).unwrap(),
+            supervisor,
         }
     }
 
@@ -1077,6 +1115,7 @@ mod tests {
             pending,
             peer,
             local_addr,
+            supervisor,
         } = prepared_lane_with_class(nonce, group, class, peer, local_addr);
         PendingLane {
             pending,
@@ -1084,6 +1123,7 @@ mod tests {
             local_addr,
             group,
             _permit: registry.try_admit(peer.ip()).unwrap(),
+            supervisor,
         }
     }
 
@@ -1112,16 +1152,15 @@ mod tests {
             peer,
             interactive_local,
         );
-        let lane_b = pending_lane_with_class(
-            &registry,
-            nonce,
-            group,
-            LaneClass::Bulk,
+        let lane_b =
+            pending_lane_with_class(&registry, nonce, group, LaneClass::Bulk, peer, bulk_local);
+        let addrs = classify_lane_addrs(
+            LaneClass::Interactive,
+            peer,
+            interactive_local,
             peer,
             bulk_local,
         );
-        let addrs =
-            classify_lane_addrs(LaneClass::Interactive, peer, interactive_local, peer, bulk_local);
         let handler: StreamHandler = Arc::new(|_| {});
         pair_lanes(lane_a, lane_b, handler, addrs, nonce, &spawner, &groups);
         let drained = tokio::time::timeout(Duration::from_secs(5), async {

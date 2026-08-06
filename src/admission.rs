@@ -1,6 +1,6 @@
 use crate::shared::{MAX_PENDING_LANES, MAX_PENDING_LANES_PER_PEER, PAIRING_DEADLINE};
 use mux::{GroupToken, LaneClass, PairingNonce};
-use rtp::socket::{FrameByteReader, FrameByteWriter};
+use rtp::socket::{FrameByteReader, FrameByteWriter, SessionHandle};
 use std::{
     collections::{HashMap, hash_map},
     net::{IpAddr, SocketAddr},
@@ -16,6 +16,9 @@ pub(crate) struct AdmittedLane {
     pub(crate) peer: SocketAddr,
     pub(crate) local_addr: SocketAddr,
     pub(crate) permit: PendingLanePermit,
+    /// The accepted lane's RTP session owner. Dropping it aborts the session,
+    /// so rejection, timeout, or failed pairing aborts the lane naturally.
+    pub(crate) supervisor: SessionHandle,
 }
 pub(crate) struct PendingLane {
     pub(crate) pending: mux::UnpairedLane,
@@ -23,11 +26,13 @@ pub(crate) struct PendingLane {
     pub(crate) local_addr: SocketAddr,
     pub(crate) group: GroupToken,
     pub(crate) _permit: PendingLanePermit,
+    pub(crate) supervisor: SessionHandle,
 }
 pub(crate) struct PreparedLane {
     pub(crate) pending: mux::UnpairedLane,
     pub(crate) peer: SocketAddr,
     pub(crate) local_addr: SocketAddr,
+    pub(crate) supervisor: SessionHandle,
 }
 pub(crate) struct PendingLanePermit {
     registry: Weak<PendingLaneRegistry>,
@@ -267,6 +272,7 @@ impl PendingLaneRegistry {
             local_addr: lane.local_addr,
             group,
             _permit: permit,
+            supervisor: lane.supervisor,
         };
         state
             .entries
@@ -462,6 +468,7 @@ mod tests {
             local_addr,
             group,
             _permit: registry.try_admit(peer.ip()).unwrap(),
+            supervisor: SessionHandle::idle(),
         }
     }
     #[tokio::test]
