@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod accept_error;
 mod admission;
 mod byte_count;

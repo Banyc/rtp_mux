@@ -19,15 +19,7 @@ enum ReaderState {
         router: mux::ResponseRouterHandle,
     },
     PendingInject {
-        future: std::sync::Mutex<
-            Pin<
-                Box<
-                    dyn Future<
-                            Output = Result<SplicedReader, tokio::sync::oneshot::error::RecvError>,
-                        > + Send,
-                >,
-            >,
-        >,
+        future: std::sync::Mutex<Pin<Box<dyn Future<Output = Result<SplicedReader, ()>> + Send>>>,
     },
     Ready {
         reader: StreamReader,
@@ -126,10 +118,8 @@ fn poll_reader_state(
                     let router = router.clone();
                     let logical_id = *logical_id;
                     let future = Box::pin(async move {
-                        router
-                            .inject_response_gene(logical_id, gen0_reader)
-                            .await
-                            .await
+                        let rx = router.inject_response_gene(logical_id, gen0_reader).await?;
+                        rx.await.map_err(|_| ())
                     });
                     *state = ReaderState::PendingInject {
                         future: std::sync::Mutex::new(future),
@@ -218,12 +208,8 @@ mod tests {
     async fn a_failed_reader_keeps_reporting_the_cause_it_first_gave() {
         let (tx, rx) = tokio::sync::oneshot::channel::<SplicedReader>();
         drop(tx);
-        let future: Pin<
-            Box<
-                dyn Future<Output = Result<SplicedReader, tokio::sync::oneshot::error::RecvError>>
-                    + Send,
-            >,
-        > = Box::pin(async move { rx.await });
+        let future: Pin<Box<dyn Future<Output = Result<SplicedReader, ()>> + Send>> =
+            Box::pin(async move { rx.await.map_err(|_| ()) });
         let future = std::sync::Mutex::new(future);
         let mut state = ReaderState::PendingInject { future };
         let mut storage = [0u8; 8];
