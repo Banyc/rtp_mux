@@ -354,6 +354,7 @@ fn install_session(
     birth: ConnectedDualLaneBirth,
     groups: &mut HashMap<SocketAddr, AddrGroup>,
     supervisors: &mut JoinSet<(SocketAddr, u64, MuxError)>,
+    router_driver: &mut mux::ResponseRouterDriver,
 ) -> Arc<Session> {
     let ConnectedDualLaneBirth {
         opener,
@@ -369,12 +370,13 @@ fn install_session(
         .expect("dial started without an address group");
     let router = match &mut group.router {
         Some(router) => {
-            router.add_accepter(accepter);
+            router.add_accepter(accepter, router_driver);
             router.handle()
         }
         None => {
-            let router = mux::spawn_response_router(accepter);
+            let router = mux::ResponseRouter::new();
             let handle = router.handle();
+            router.add_accepter(accepter, router_driver);
             group.router = Some(router);
             handle
         }
@@ -434,6 +436,7 @@ async fn run_connector(
     draining: SharedDraining,
 ) {
     let mut supervisors: JoinSet<(SocketAddr, u64, MuxError)> = JoinSet::new();
+    let mut router_driver: mux::ResponseRouterDriver = mux::ResponseRouterDriver::new();
     let mut pending_dials: FuturesUnordered<DualLaneDial> = FuturesUnordered::new();
     let mut in_flight_dials: HashSet<SocketAddr> = HashSet::new();
     let mut dial_waiters: HashMap<SocketAddr, Vec<StreamRequest>> = HashMap::new();
@@ -506,6 +509,15 @@ async fn run_connector(
                 }
                 prune_dead_addresses(&mut groups, &mut explorers, &in_flight_dials);
             }
+            Some(res) = router_driver.join_next() => {
+                match res {
+                    Ok(()) => trace!("ResponseRouter accepter task stopped"),
+                    Err(error) if error.is_cancelled() => {
+                        trace!(?error, "ResponseRouter accepter task cancelled")
+                    }
+                    Err(error) => std::panic::resume_unwind(error.into_panic()),
+                }
+            }
             Some((addr, result)) = pending_dials.next() => {
                 in_flight_dials.remove(&addr);
                 let redialed_old = redials.remove(&addr);
@@ -515,7 +527,7 @@ async fn run_connector(
                         if let Some(explorer) = explorers.get_mut(&addr) {
                             explorer.set_active(probe_tap.map(|tap| (Box::new(tap) as Box<dyn ProbeIo>, birth.local_addr)), Instant::now());
                         }
-                        let session = install_session(addr, birth, &mut groups, &mut supervisors);
+                        let session = install_session(addr, birth, &mut groups, &mut supervisors, &mut router_driver);
                         if let Some(RedialInFlight { old, trigger, verdict }) = &redialed_old {
                             let moved = rebind_streams(old, &session);
                             info!(up = ?old.addr.peer_addr, up_local = ?old.addr.local_addr, new_local = ?session.addr.local_addr, trigger = trigger.as_str(), rule = verdict.and_then(|v| v.rule()).map(MigrationRule::as_str), self_rtt = ?verdict.and_then(|v| v.active()).map(|s| s.rtt), self_loss = verdict.and_then(|v| v.active()).map(|s| s.loss), best_rtt = ?verdict.and_then(|v| v.best()).map(|s| s.rtt), best_loss = verdict.and_then(|v| v.best()).map(|s| s.loss), old_mux = %old.stats(), migrated_streams = moved, "RTP mux session redialed");
@@ -570,6 +582,7 @@ async fn run_connector(
                         redials.clear();
                         groups.clear();
                         explorers.clear();
+                        router_driver.abort_all();
                         let _ = completed.send(());
                     }
                     ConnectorCommand::Redial { addr, trigger } => {
@@ -929,7 +942,14 @@ mod tests {
         let (commands, coordinator, sessions) = spawn_test_connector_with_sessions(dialer);
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();
-        let dead = install_session(addr, fake_dead_birth().await, &mut groups, &mut supervisors);
+        let mut router_driver = mux::ResponseRouterDriver::new();
+        let dead = install_session(
+            addr,
+            fake_dead_birth().await,
+            &mut groups,
+            &mut supervisors,
+            &mut router_driver,
+        );
         let dead_id = dead.id;
         sessions.lock().unwrap().insert(addr, dead);
         let stream = enqueue(&commands, addr).await.await.unwrap().unwrap();

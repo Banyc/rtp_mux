@@ -216,13 +216,21 @@ mod tests {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();
+        let mut router_driver = mux::ResponseRouterDriver::new();
         let old = install_session(
             addr,
             fake_connected_birth(addr, None),
             &mut groups,
             &mut supervisors,
+            &mut router_driver,
         );
-        let dead = install_session(addr, fake_dead_birth().await, &mut groups, &mut supervisors);
+        let dead = install_session(
+            addr,
+            fake_dead_birth().await,
+            &mut groups,
+            &mut supervisors,
+            &mut router_driver,
+        );
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
         let _stream = StreamRebind::track(slot.handle(), old.guard());
         assert_eq!(old.live_streams.load(Ordering::Relaxed), 1);
@@ -245,6 +253,7 @@ mod tests {
             fake_connected_birth(addr, None),
             &mut groups,
             &mut supervisors,
+            &mut router_driver,
         );
         assert_eq!(rebind_streams(&old, &live), 1);
         assert!(slot.take().is_some());
@@ -255,13 +264,21 @@ mod tests {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();
+        let mut router_driver = mux::ResponseRouterDriver::new();
         let old = install_session(
             addr,
             fake_connected_birth(addr, None),
             &mut groups,
             &mut supervisors,
+            &mut router_driver,
         );
-        let dead = install_session(addr, fake_dead_birth().await, &mut groups, &mut supervisors);
+        let dead = install_session(
+            addr,
+            fake_dead_birth().await,
+            &mut groups,
+            &mut supervisors,
+            &mut router_driver,
+        );
         *old.successor.lock().unwrap() = Some(Arc::clone(&dead));
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
         let _stream = StreamRebind::track(slot.handle(), old.guard());
@@ -282,17 +299,20 @@ mod tests {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();
+        let mut router_driver = mux::ResponseRouterDriver::new();
         let old = install_session(
             addr,
             fake_connected_birth(addr, None),
             &mut groups,
             &mut supervisors,
+            &mut router_driver,
         );
         let new = install_session(
             addr,
             fake_connected_birth(addr, None),
             &mut groups,
             &mut supervisors,
+            &mut router_driver,
         );
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
         let held = old.streams.lock().unwrap();
