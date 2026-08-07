@@ -15,7 +15,7 @@ use std::{
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use mux::{GroupToken, LaneClass, MuxError, StreamReader};
 use tokio::{sync::oneshot, task::JoinSet};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     byte_count::SessionStats,
@@ -502,7 +502,7 @@ async fn run_connector(
                         }
                     }
                     Err(error) if error.is_cancelled() => trace!(?error, "Dual-Lane MUX task cancelled"),
-                    Err(error) => error!(?error, "Dual-Lane MUX supervision task failed to join"),
+                    Err(error) => std::panic::resume_unwind(error.into_panic()),
                 }
                 prune_dead_addresses(&mut groups, &mut explorers, &in_flight_dials);
             }

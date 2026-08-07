@@ -15,7 +15,7 @@ use mux::{
 use rtp::socket::{FrameByteReader, FrameByteWriter};
 use thiserror::Error;
 use tokio::{net::ToSocketAddrs, task::JoinSet};
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{info, instrument, trace, warn};
 
 use crate::{
     accept_error::AcceptErrorBackoff,
@@ -132,7 +132,7 @@ impl RtpMuxServer {
                         Ok(MuxError::TaskStopped { task: "lane_accept" }) => trace!(?addr, "Lane accept task stopped"),
                         Ok(error) => warn!(?error, ?addr, "MUX error"),
                         Err(error) if error.is_cancelled() => { trace!(?error, "MUX task cancelled (normal shutdown/reset)"); }
-                        Err(error) => error!(?error, ?addr, "MUX supervision task failed to join"),
+                        Err(error) => std::panic::resume_unwind(error.into_panic()),
                     }
                 }
                 Some(joined) = expiry.join_next() => {
@@ -800,10 +800,11 @@ fn pair_lanes(
                         run_dual_mux_accepter(accepter, opener, addr, handler, member).await;
                     let error = match tasks.join_next().await {
                         Some(Ok(error)) => error,
-                        Some(Err(source)) => MuxError::TaskJoin {
+                        Some(Err(source)) if source.is_cancelled() => MuxError::TaskJoin {
                             task: "dual_lane",
                             source,
                         },
+                        Some(Err(source)) => std::panic::resume_unwind(source.into_panic()),
                         None => MuxError::TaskStopped { task: "dual_lane" },
                     };
                     warn!(event = "rtp_mux_session_terminated", ?error, ?nonce, dn_interactive = ?addrs.interactive_peer, dn_interactive_local = ?addrs.interactive_local, dn_bulk = ?addrs.bulk_peer, dn_bulk_local = ?addrs.bulk_local, accepted_streams, uptime_ms = paired_at.elapsed().as_millis(), "RTP mux dual-lane session terminated");

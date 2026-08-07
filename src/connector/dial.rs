@@ -50,10 +50,11 @@ pub(crate) fn dual_supervisor_result(
 ) -> MuxError {
     match result {
         Some(Ok(error)) => error,
-        Some(Err(source)) => MuxError::TaskJoin {
+        Some(Err(source)) if source.is_cancelled() => MuxError::TaskJoin {
             task: "dual_lane",
             source,
         },
+        Some(Err(source)) => std::panic::resume_unwind(source.into_panic()),
         None => MuxError::TaskStopped { task: "dual_lane" },
     }
 }
