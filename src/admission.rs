@@ -742,7 +742,8 @@ mod tests {
             _ => panic!("opposite lane did not enter the pairing wait"),
         };
         let waiting_registry = Arc::clone(&registry);
-        let waiter = tokio::spawn(async move {
+        let mut waiter_tasks = tokio::task::JoinSet::new();
+        waiter_tasks.spawn(async move {
             matches!(
                 waiting_registry
                     .wait_for_pair(nonce, LaneClass::Bulk, peer, expires_at, changed)
@@ -751,7 +752,7 @@ mod tests {
             )
         });
         registry.cancel_reservation(nonce, peer, LaneClass::Interactive);
-        assert!(waiter.await.unwrap());
+        assert!(waiter_tasks.join_next().await.unwrap().unwrap());
         assert!(second.is_some());
     }
     #[tokio::test]

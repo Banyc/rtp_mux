@@ -20,30 +20,38 @@ async fn response_migration_end_to_end() {
     let saw_duplex = Arc::new(AtomicBool::new(false));
     let saw_duplex_handler = Arc::clone(&saw_duplex);
     let sessions = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
-    let spawner = rtp_mux::SessionSpawner::new(move |fut| {
-        sessions.lock().unwrap().spawn(fut);
+    let spawner = rtp_mux::SessionSpawner::new({
+        let sessions = Arc::clone(&sessions);
+        move |fut| {
+            sessions.lock().unwrap().spawn(fut);
+        }
     });
-    tokio::spawn(server.serve(spawner, move |stream| {
-        saw_duplex_handler.store(
-            matches!(stream, ServerStream::MigratingDuplex { .. }),
-            Ordering::SeqCst,
-        );
-        tokio::spawn(async move {
-            let mut stream = stream;
-            let mut req = [0u8; 4];
-            stream.read_exact(&mut req).await.unwrap();
-            assert_eq!(&req, b"ping");
-            let chunk = vec![0x5Au8; CHUNK];
-            for _ in 0..RESPONSE_CHUNKS {
-                stream.write_all(&chunk).await.unwrap();
-            }
-            stream.shutdown().await.unwrap();
-        });
-    }));
+    let mut serve_tasks = tokio::task::JoinSet::new();
+    serve_tasks.spawn({
+        let sessions = Arc::clone(&sessions);
+        server.serve(spawner, move |stream| {
+            saw_duplex_handler.store(
+                matches!(stream, ServerStream::MigratingDuplex { .. }),
+                Ordering::SeqCst,
+            );
+            sessions.lock().unwrap().spawn(async move {
+                let mut stream = stream;
+                let mut req = [0u8; 4];
+                stream.read_exact(&mut req).await.unwrap();
+                assert_eq!(&req, b"ping");
+                let chunk = vec![0x5Au8; CHUNK];
+                for _ in 0..RESPONSE_CHUNKS {
+                    stream.write_all(&chunk).await.unwrap();
+                }
+                stream.shutdown().await.unwrap();
+            });
+        })
+    });
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
     let (connector, driver) =
         RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
-    let _driver = tokio::spawn(driver);
+    let mut driver_tasks = tokio::task::JoinSet::new();
+    driver_tasks.spawn(driver);
     let mut stream = connector.connect_stream(addr).await.unwrap();
     stream.write_all(b"ping").await.unwrap();
     let mut resp = Vec::new();
@@ -54,4 +62,6 @@ async fn response_migration_end_to_end() {
         saw_duplex.load(Ordering::SeqCst),
         "server handler should have received a MigratingDuplex stream"
     );
+    drop(driver_tasks);
+    drop(serve_tasks);
 }

@@ -4,11 +4,39 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use crate::session::SessionSpawner;
+#[derive(Clone)]
+pub(crate) struct GroupDriverSubmitter(tokio::sync::mpsc::Sender<tokio::task::JoinSet<()>>);
+
+impl GroupDriverSubmitter {
+    fn try_submit(&self, driver: tokio::task::JoinSet<()>) -> Result<(), &'static str> {
+        self.0
+            .try_send(driver)
+            .map_err(|_| "group driver submission channel is full or closed")
+    }
+}
+
+pub(crate) struct GroupDriverScope {
+    pub(crate) drivers: tokio::task::JoinSet<()>,
+}
+
+pub(crate) fn group_driver_scope(bound: usize) -> (GroupDriverSubmitter, GroupDriverScope) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::task::JoinSet<()>>(bound);
+    let mut scope = GroupDriverScope {
+        drivers: tokio::task::JoinSet::new(),
+    };
+    scope.drivers.spawn(async move {
+        while let Some(mut driver) = rx.recv().await {
+            while let Some(result) = driver.join_next().await {
+                result.unwrap();
+            }
+        }
+    });
+    (GroupDriverSubmitter(tx), scope)
+}
 
 pub(crate) struct SessionPairRegistry {
     groups: Mutex<HashMap<GroupToken, Weak<SessionPair>>>,
-    session_spawner: SessionSpawner,
+    group_drivers: GroupDriverSubmitter,
 }
 pub(crate) struct SessionPair {
     feed: mux::SpliceRouterHandle,
@@ -33,10 +61,10 @@ impl Drop for PairMember {
 }
 
 impl SessionPairRegistry {
-    pub(crate) fn new(session_spawner: SessionSpawner) -> Arc<Self> {
+    pub(crate) fn new(group_drivers: GroupDriverSubmitter) -> Arc<Self> {
         Arc::new(Self {
             groups: Mutex::new(HashMap::new()),
-            session_spawner,
+            group_drivers,
         })
     }
     pub(crate) fn is_full(&self, token: &GroupToken) -> bool {
@@ -57,12 +85,8 @@ impl SessionPairRegistry {
             match groups.get(&token).and_then(Weak::upgrade) {
                 Some(group) => group,
                 None => {
-                    let (feed, mut driver) = mux::spawn_splice_router();
-                    self.session_spawner.spawn(async move {
-                        while let Some(result) = driver.join_next().await {
-                            result.unwrap();
-                        }
-                    });
+                    let (feed, driver) = mux::spawn_splice_router();
+                    self.group_drivers.try_submit(driver)?;
                     let group = Arc::new(SessionPair {
                         feed,
                         state: Mutex::new(PairState {
@@ -145,34 +169,12 @@ impl PairMember {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SessionFuture;
     use mux::spawn_mux_no_reconnection;
     use tokio::task::JoinSet;
 
-    fn test_session_spawner(driver_tasks: &mut JoinSet<()>) -> SessionSpawner {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionFuture>(8);
-        driver_tasks.spawn(async move {
-            let mut inner = JoinSet::new();
-            loop {
-                tokio::select! {
-                    submitted = rx.recv() => match submitted {
-                        Some(fut) => {
-                            inner.spawn(fut);
-                        }
-                        None => break,
-                    },
-                    joined = inner.join_next(), if !inner.is_empty() => {
-                        joined.unwrap().unwrap();
-                    }
-                }
-            }
-            while let Some(result) = inner.join_next().await {
-                result.unwrap();
-            }
-        });
-        SessionSpawner::new(move |fut| {
-            let _ = tx.try_send(fut);
-        })
+    fn registry_with_scope(bound: usize) -> (Arc<SessionPairRegistry>, GroupDriverScope) {
+        let (group_drivers, scope) = group_driver_scope(bound);
+        (SessionPairRegistry::new(group_drivers), scope)
     }
 
     fn test_opener(tasks: &mut JoinSet<mux::MuxError>) -> DualStreamOpener {
@@ -199,8 +201,7 @@ mod tests {
     #[tokio::test]
     async fn third_concurrent_member_is_rejected() {
         let mut tasks = JoinSet::new();
-        let mut driver_tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
+        let (registry, _driver_scope) = registry_with_scope(8);
         let token = GroupToken::generate();
         let first = registry.join(token, test_opener(&mut tasks)).unwrap();
         let second = registry.join(token, test_opener(&mut tasks)).unwrap();
@@ -214,8 +215,7 @@ mod tests {
     #[tokio::test]
     async fn group_is_dropped_with_its_last_member() {
         let mut tasks = JoinSet::new();
-        let mut driver_tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
+        let (registry, _driver_scope) = registry_with_scope(8);
         let token = GroupToken::generate();
         let member = registry.join(token, test_opener(&mut tasks)).unwrap();
         let weak = Arc::downgrade(&member.group);
@@ -249,8 +249,7 @@ mod tests {
     #[tokio::test]
     async fn a_dead_newest_member_never_takes_over_live_streams() {
         let mut tasks = JoinSet::new();
-        let mut driver_tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
+        let (registry, _driver_scope) = registry_with_scope(8);
         let token = GroupToken::generate();
         let old = registry.join(token, test_opener(&mut tasks)).unwrap();
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
@@ -273,8 +272,7 @@ mod tests {
     #[tokio::test]
     async fn late_registered_writer_is_rebound_to_newest_member() {
         let mut tasks = JoinSet::new();
-        let mut driver_tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
+        let (registry, _driver_scope) = registry_with_scope(8);
         let token = GroupToken::generate();
         let old = registry.join(token, test_opener(&mut tasks)).unwrap();
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
@@ -285,8 +283,7 @@ mod tests {
     #[tokio::test]
     async fn join_rebinds_existing_writers() {
         let mut tasks = JoinSet::new();
-        let mut driver_tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
+        let (registry, _driver_scope) = registry_with_scope(8);
         let token = GroupToken::generate();
         let old = registry.join(token, test_opener(&mut tasks)).unwrap();
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
@@ -309,6 +306,27 @@ mod tests {
         assert!(
             slot.take().is_none(),
             "rebinds queued up instead of collapsing to the newest",
+        );
+    }
+    #[tokio::test]
+    async fn failed_driver_submission_does_not_create_a_group() {
+        let mut tasks = JoinSet::new();
+        let (registry, _driver_scope) = registry_with_scope(1);
+        // Occupy the single slot with a driver whose task parks forever, so the
+        // reaper can never drain it and every later submission is refused.
+        let (_feed_a, mut driver_a) = mux::spawn_splice_router();
+        driver_a.spawn(std::future::pending::<()>());
+        registry.group_drivers.try_submit(driver_a).unwrap();
+        let (_feed_b, driver_b) = mux::spawn_splice_router();
+        let _ = registry.group_drivers.try_submit(driver_b);
+        let token = GroupToken::generate();
+        assert!(
+            registry.join(token, test_opener(&mut tasks)).is_err(),
+            "a group must be rejected when its driver submission is refused",
+        );
+        assert!(
+            registry.groups.lock().unwrap().is_empty(),
+            "a rejected group must not have been inserted",
         );
     }
 }

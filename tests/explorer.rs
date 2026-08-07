@@ -6,21 +6,29 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn spawn_echo_server() -> SocketAddr {
+async fn spawn_echo_server(
+    serve_tasks: &mut tokio::task::JoinSet<Result<(), rtp_mux::ServeError>>,
+) -> (SocketAddr, Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>) {
     let server = RtpMuxServer::bind("127.0.0.1:0", false).await.unwrap();
     let addr = server.listener().local_addr();
     let sessions = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
-    let spawner = rtp_mux::SessionSpawner::new(move |fut| {
-        sessions.lock().unwrap().spawn(fut);
+    let spawner = rtp_mux::SessionSpawner::new({
+        let sessions = Arc::clone(&sessions);
+        move |fut| {
+            sessions.lock().unwrap().spawn(fut);
+        }
     });
-    tokio::spawn(server.serve(spawner, |stream| {
-        tokio::spawn(async move {
-            let (mut reader, mut writer) = tokio::io::split(stream);
-            let _ = tokio::io::copy(&mut reader, &mut writer).await;
-            let _ = writer.shutdown().await;
-        });
-    }));
-    addr
+    serve_tasks.spawn({
+        let sessions = Arc::clone(&sessions);
+        server.serve(spawner, move |stream| {
+            sessions.lock().unwrap().spawn(async move {
+                let (mut reader, mut writer) = tokio::io::split(stream);
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                let _ = writer.shutdown().await;
+            });
+        })
+    });
+    (addr, sessions)
 }
 
 async fn wait_until(mut cond: impl AsyncFnMut() -> bool, deadline: Duration, what: &str) {
@@ -34,7 +42,8 @@ async fn wait_until(mut cond: impl AsyncFnMut() -> bool, deadline: Duration, wha
 #[tokio::test(flavor = "multi_thread")]
 async fn redial_dial_lands_on_the_surrendered_candidate_port() {
     let test = async {
-        let addr = spawn_echo_server().await;
+        let mut serve_tasks = tokio::task::JoinSet::new();
+        let (addr, _sessions) = spawn_echo_server(&mut serve_tasks).await;
         let bind: rtp_mux::BindSelector =
             Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
         let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
@@ -46,7 +55,8 @@ async fn redial_dial_lands_on_the_surrendered_candidate_port() {
             },
             ..RtpMuxConnectorConfig::standard(bind, false)
         });
-        let _driver = tokio::spawn(driver);
+        let mut driver_tasks = tokio::task::JoinSet::new();
+        driver_tasks.spawn(driver);
         let mut stream = connector.connect_stream(addr).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
@@ -102,6 +112,8 @@ async fn redial_dial_lands_on_the_surrendered_candidate_port() {
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong");
         drop((stream, fresh));
+        drop(driver_tasks);
+        drop(serve_tasks);
     };
     tokio::time::timeout(Duration::from_secs(90), test)
         .await

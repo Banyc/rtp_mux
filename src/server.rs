@@ -32,6 +32,8 @@ use crate::{
 
 type StreamHandler = Arc<dyn Fn(ServerStream) + Send + Sync + 'static>;
 
+const GROUP_DRIVER_CHANNEL_BOUND: usize = 16;
+
 struct DualLaneSocketAddrs {
     interactive_peer: SocketAddr,
     interactive_local: SocketAddr,
@@ -65,6 +67,8 @@ pub enum ServeError {
     },
     #[error("Pending-lane expiry worker terminated unexpectedly; addr={addr}")]
     ExpiryWorkerStopped { addr: SocketAddr },
+    #[error("Group-driver scope terminated unexpectedly; addr={addr}")]
+    GroupDriverScopeStopped { addr: SocketAddr },
 }
 
 impl RtpMuxServer {
@@ -111,7 +115,9 @@ impl RtpMuxServer {
         );
         let handler: StreamHandler = Arc::new(handler);
         let registry = PendingLaneRegistry::new();
-        let groups = SessionPairRegistry::new(session_spawner.clone());
+        let (group_drivers, mut group_drivers_scope) =
+            crate::group::group_driver_scope(GROUP_DRIVER_CHANNEL_BOUND);
+        let groups = SessionPairRegistry::new(group_drivers);
         let rejections = LaneRejectionLog::default();
         let mut interactive_backoff = AcceptErrorBackoff::default();
         let mut bulk_backoff = AcceptErrorBackoff::default();
@@ -136,6 +142,10 @@ impl RtpMuxServer {
                 Some(joined) = expiry.join_next() => {
                     joined.unwrap();
                     return Err(ServeError::ExpiryWorkerStopped { addr });
+                }
+                Some(joined) = group_drivers_scope.drivers.join_next() => {
+                    joined.unwrap();
+                    return Err(ServeError::GroupDriverScopeStopped { addr });
                 }
                 _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
@@ -1150,7 +1160,9 @@ mod tests {
             }
         });
         let registry = PendingLaneRegistry::new();
-        let groups = SessionPairRegistry::new(spawner.clone());
+        let (group_drivers, _driver_scope) =
+            crate::group::group_driver_scope(GROUP_DRIVER_CHANNEL_BOUND);
+        let groups = SessionPairRegistry::new(group_drivers);
         let nonce = PairingNonce::generate();
         let group = mux::GroupToken::generate();
         let peer: SocketAddr = "10.0.0.1:1000".parse().unwrap();

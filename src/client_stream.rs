@@ -326,7 +326,8 @@ mod tests {
         let (writer, reader) = opener.open_migrating_with_reader(42, mux::LaneClass::Interactive);
         let mut stream = ClientStream::new(writer, reader, addr);
         let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-        let accepter_task = tokio::spawn(async move {
+        let mut accepter_tasks = tokio::task::JoinSet::new();
+        accepter_tasks.spawn(async move {
             let mut accepter = accepter.into_migrating_only();
             let mut accepted_tx = Some(accepted_tx);
             while let Ok(accepted) = accepter.accept().await {
@@ -369,7 +370,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let receive = tokio::spawn(async move {
+        let mut receive_tasks = tokio::task::JoinSet::new();
+        receive_tasks.spawn(async move {
             let mut reader = reader;
             let _writer = writer;
             let mut bytes = Vec::new();
@@ -377,13 +379,14 @@ mod tests {
             bytes
         });
         stream.shutdown().await.unwrap();
-        let bytes = tokio::time::timeout(Duration::from_secs(3), receive)
+        let bytes = tokio::time::timeout(Duration::from_secs(3), receive_tasks.join_next())
             .await
             .expect("FINAL was not delivered")
+            .unwrap()
             .unwrap();
         assert_eq!(bytes.len(), accepted_big_bytes + small.len());
         assert_eq!(&bytes[bytes.len() - small.len()..], small);
-        accepter_task.abort();
+        accepter_tasks.abort_all();
     }
 
     #[tokio::test]
@@ -398,7 +401,8 @@ mod tests {
         let (writer, reader) = opener.open_migrating_with_reader(43, mux::LaneClass::Interactive);
         let mut client = ClientStream::new(writer, reader, addr);
         let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-        let accepter_task = tokio::spawn(async move {
+        let mut accepter_tasks = tokio::task::JoinSet::new();
+        accepter_tasks.spawn(async move {
             let mut accepter = accepter.into_migrating_only();
             let mut accepted_tx = Some(accepted_tx);
             while let Ok(accepted) = accepter.accept().await {
@@ -455,6 +459,6 @@ mod tests {
         let mut received_response = Vec::new();
         client.read_to_end(&mut received_response).await.unwrap();
         assert_eq!(received_response, b"server-vectored-response");
-        accepter_task.abort();
+        accepter_tasks.abort_all();
     }
 }

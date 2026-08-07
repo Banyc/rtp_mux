@@ -12,20 +12,28 @@ async fn a_session_counts_its_streams_and_the_bytes_they_carried() {
     let server = RtpMuxServer::bind("127.0.0.1:0", false).await.unwrap();
     let addr = server.listener().local_addr();
     let sessions = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
-    let spawner = rtp_mux::SessionSpawner::new(move |fut| {
-        sessions.lock().unwrap().spawn(fut);
+    let spawner = rtp_mux::SessionSpawner::new({
+        let sessions = Arc::clone(&sessions);
+        move |fut| {
+            sessions.lock().unwrap().spawn(fut);
+        }
     });
-    tokio::spawn(server.serve(spawner, |stream| {
-        tokio::spawn(async move {
-            let (mut reader, mut writer) = tokio::io::split(stream);
-            let _ = tokio::io::copy(&mut reader, &mut writer).await;
-            let _ = writer.shutdown().await;
-        });
-    }));
+    let mut serve_tasks = tokio::task::JoinSet::new();
+    serve_tasks.spawn({
+        let sessions = Arc::clone(&sessions);
+        server.serve(spawner, move |stream| {
+            sessions.lock().unwrap().spawn(async move {
+                let (mut reader, mut writer) = tokio::io::split(stream);
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                let _ = writer.shutdown().await;
+            });
+        })
+    });
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
     let (connector, driver) =
         RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
-    let _driver = tokio::spawn(driver);
+    let mut driver_tasks = tokio::task::JoinSet::new();
+    driver_tasks.spawn(driver);
     let mut first = connector.connect_stream(addr).await.unwrap();
     let second = connector.connect_stream(addr).await.unwrap();
     let probe = connector.probe_session(addr).expect("a session must exist");
@@ -62,4 +70,6 @@ async fn a_session_counts_its_streams_and_the_bytes_they_carried() {
     };
     assert_eq!(after.opened_streams, 2, "opened_streams must not go down");
     assert!(after.tx_bytes >= busy.tx_bytes);
+    drop(driver_tasks);
+    drop(serve_tasks);
 }
