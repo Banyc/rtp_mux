@@ -128,11 +128,9 @@ impl RtpMuxServer {
             trace!("Waiting for RTP mux Lane");
             tokio::select! {
                 Some(result) = self.mux.join_next() => {
-                    match result {
-                        Ok(MuxError::TaskStopped { task: "lane_accept" }) => trace!(?addr, "Lane accept task stopped"),
-                        Ok(error) => warn!(?error, ?addr, "MUX error"),
-                        Err(error) if error.is_cancelled() => { trace!(?error, "MUX task cancelled (normal shutdown/reset)"); }
-                        Err(error) => std::panic::resume_unwind(error.into_panic()),
+                    match result.unwrap() {
+                        MuxError::TaskStopped { task: "lane_accept" } => trace!(?addr, "Lane accept task stopped"),
+                        error => warn!(?error, ?addr, "MUX error"),
                     }
                 }
                 Some(joined) = expiry.join_next() => {

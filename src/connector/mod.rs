@@ -521,30 +521,20 @@ async fn run_connector(
                 }
             }
             Some(res) = supervisors.join_next() => {
-                match res {
-                    Ok((addr, session_id, error)) => {
-                        let session = { let mut map = sessions.lock().unwrap(); match map.get(&addr) { Some(session) if session.id == session_id => map.remove(&addr), _ => None } };
-                        match session {
-                            Some(session) => {
-                                warn!(event = "rtp_mux_session_terminated", ?error, nonce = ?session.nonce, up = ?session.addr.peer_addr, up_local = ?session.addr.local_addr, mux = %session.stats(), "RTP mux dual-lane session terminated");
-                                if let Some(explorer) = explorers.get_mut(&addr) { explorer.set_active(None, Instant::now()); }
-                            }
-                            None => debug!(?error, up = ?addr, "RTP mux dual-lane session ended after redial or reset"),
-                        }
+                let (addr, session_id, error) = res.unwrap();
+                let session = { let mut map = sessions.lock().unwrap(); match map.get(&addr) { Some(session) if session.id == session_id => map.remove(&addr), _ => None } };
+                match session {
+                    Some(session) => {
+                        warn!(event = "rtp_mux_session_terminated", ?error, nonce = ?session.nonce, up = ?session.addr.peer_addr, up_local = ?session.addr.local_addr, mux = %session.stats(), "RTP mux dual-lane session terminated");
+                        if let Some(explorer) = explorers.get_mut(&addr) { explorer.set_active(None, Instant::now()); }
                     }
-                    Err(error) if error.is_cancelled() => trace!(?error, "Dual-Lane MUX task cancelled"),
-                    Err(error) => std::panic::resume_unwind(error.into_panic()),
+                    None => debug!(?error, up = ?addr, "RTP mux dual-lane session ended after redial or reset"),
                 }
                 prune_dead_addresses(&mut groups, &mut explorers, &in_flight_dials);
             }
             Some(res) = router_driver.join_next() => {
-                match res {
-                    Ok(()) => trace!("ResponseRouter accepter task stopped"),
-                    Err(error) if error.is_cancelled() => {
-                        trace!(?error, "ResponseRouter accepter task cancelled")
-                    }
-                    Err(error) => std::panic::resume_unwind(error.into_panic()),
-                }
+                res.unwrap();
+                trace!("ResponseRouter accepter task stopped");
             }
             Some((addr, result)) = pending_dials.next() => {
                 in_flight_dials.remove(&addr);
