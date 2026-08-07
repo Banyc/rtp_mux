@@ -111,7 +111,7 @@ impl RtpMuxServer {
         );
         let handler: StreamHandler = Arc::new(handler);
         let registry = PendingLaneRegistry::new();
-        let groups = SessionPairRegistry::new();
+        let groups = SessionPairRegistry::new(session_spawner.clone());
         let rejections = LaneRejectionLog::default();
         let mut interactive_backoff = AcceptErrorBackoff::default();
         let mut bulk_backoff = AcceptErrorBackoff::default();
@@ -1150,7 +1150,7 @@ mod tests {
             }
         });
         let registry = PendingLaneRegistry::new();
-        let groups = SessionPairRegistry::new();
+        let groups = SessionPairRegistry::new(spawner.clone());
         let nonce = PairingNonce::generate();
         let group = mux::GroupToken::generate();
         let peer: SocketAddr = "10.0.0.1:1000".parse().unwrap();

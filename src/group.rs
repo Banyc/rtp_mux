@@ -4,12 +4,14 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+use crate::session::SessionSpawner;
+
 pub(crate) struct SessionPairRegistry {
     groups: Mutex<HashMap<GroupToken, Weak<SessionPair>>>,
+    session_spawner: SessionSpawner,
 }
 pub(crate) struct SessionPair {
     feed: mux::SpliceRouterHandle,
-    _driver: tokio::task::JoinSet<()>,
     state: Mutex<PairState>,
 }
 struct PairState {
@@ -31,9 +33,10 @@ impl Drop for PairMember {
 }
 
 impl SessionPairRegistry {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(session_spawner: SessionSpawner) -> Arc<Self> {
         Arc::new(Self {
             groups: Mutex::new(HashMap::new()),
+            session_spawner,
         })
     }
     pub(crate) fn is_full(&self, token: &GroupToken) -> bool {
@@ -54,10 +57,14 @@ impl SessionPairRegistry {
             match groups.get(&token).and_then(Weak::upgrade) {
                 Some(group) => group,
                 None => {
-                    let (feed, _driver) = mux::spawn_splice_router();
+                    let (feed, mut driver) = mux::spawn_splice_router();
+                    self.session_spawner.spawn(async move {
+                        while let Some(result) = driver.join_next().await {
+                            result.unwrap();
+                        }
+                    });
                     let group = Arc::new(SessionPair {
                         feed,
-                        _driver,
                         state: Mutex::new(PairState {
                             members: 0,
                             next_seq: 0,
@@ -138,8 +145,35 @@ impl PairMember {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionFuture;
     use mux::spawn_mux_no_reconnection;
     use tokio::task::JoinSet;
+
+    fn test_session_spawner(driver_tasks: &mut JoinSet<()>) -> SessionSpawner {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionFuture>(8);
+        driver_tasks.spawn(async move {
+            let mut inner = JoinSet::new();
+            loop {
+                tokio::select! {
+                    submitted = rx.recv() => match submitted {
+                        Some(fut) => {
+                            inner.spawn(fut);
+                        }
+                        None => break,
+                    },
+                    joined = inner.join_next(), if !inner.is_empty() => {
+                        joined.unwrap().unwrap();
+                    }
+                }
+            }
+            while let Some(result) = inner.join_next().await {
+                result.unwrap();
+            }
+        });
+        SessionSpawner::new(move |fut| {
+            let _ = tx.try_send(fut);
+        })
+    }
 
     fn test_opener(tasks: &mut JoinSet<mux::MuxError>) -> DualStreamOpener {
         let lane = || {
@@ -165,7 +199,8 @@ mod tests {
     #[tokio::test]
     async fn third_concurrent_member_is_rejected() {
         let mut tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new();
+        let mut driver_tasks = JoinSet::new();
+        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
         let token = GroupToken::generate();
         let first = registry.join(token, test_opener(&mut tasks)).unwrap();
         let second = registry.join(token, test_opener(&mut tasks)).unwrap();
@@ -179,7 +214,8 @@ mod tests {
     #[tokio::test]
     async fn group_is_dropped_with_its_last_member() {
         let mut tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new();
+        let mut driver_tasks = JoinSet::new();
+        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
         let token = GroupToken::generate();
         let member = registry.join(token, test_opener(&mut tasks)).unwrap();
         let weak = Arc::downgrade(&member.group);
@@ -213,7 +249,8 @@ mod tests {
     #[tokio::test]
     async fn a_dead_newest_member_never_takes_over_live_streams() {
         let mut tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new();
+        let mut driver_tasks = JoinSet::new();
+        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
         let token = GroupToken::generate();
         let old = registry.join(token, test_opener(&mut tasks)).unwrap();
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
@@ -236,7 +273,8 @@ mod tests {
     #[tokio::test]
     async fn late_registered_writer_is_rebound_to_newest_member() {
         let mut tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new();
+        let mut driver_tasks = JoinSet::new();
+        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
         let token = GroupToken::generate();
         let old = registry.join(token, test_opener(&mut tasks)).unwrap();
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
@@ -247,7 +285,8 @@ mod tests {
     #[tokio::test]
     async fn join_rebinds_existing_writers() {
         let mut tasks = JoinSet::new();
-        let registry = SessionPairRegistry::new();
+        let mut driver_tasks = JoinSet::new();
+        let registry = SessionPairRegistry::new(test_session_spawner(&mut driver_tasks));
         let token = GroupToken::generate();
         let old = registry.join(token, test_opener(&mut tasks)).unwrap();
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();

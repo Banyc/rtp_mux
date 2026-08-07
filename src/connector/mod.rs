@@ -533,16 +533,8 @@ async fn run_connector(
                 prune_dead_addresses(&mut groups, &mut explorers, &in_flight_dials);
             }
             Some(res) = router_driver.join_next() => {
-                match res {
-                    Ok(()) => trace!("ResponseRouter accepter task stopped"),
-                    // `reset` deliberately aborts every router accepter task;
-                    // tolerate the resulting cancellation instead of
-                    // unwrapping it.
-                    Err(error) if error.is_cancelled() => {
-                        trace!(?error, "ResponseRouter accepter task cancelled")
-                    }
-                    Err(error) => std::panic::resume_unwind(error.into_panic()),
-                }
+                trace!("ResponseRouter accepter task stopped");
+                res.unwrap();
             }
             Some((addr, result)) = pending_dials.next() => {
                 in_flight_dials.remove(&addr);
@@ -608,7 +600,7 @@ async fn run_connector(
                         redials.clear();
                         groups.clear();
                         explorers.clear();
-                        router_driver.abort_all();
+                        router_driver = mux::ResponseRouterDriver::new();
                         let _ = completed.send(());
                     }
                     ConnectorCommand::Redial { addr, trigger } => {
@@ -682,7 +674,6 @@ fn live_dial_waiters(
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
@@ -694,41 +685,33 @@ mod tests {
 
     fn spawn_test_connector(
         dialer: DualLaneDialer,
-    ) -> (
-        tokio::sync::mpsc::Sender<ConnectorCommand>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let (commands, coordinator, _sessions) = spawn_test_connector_with_sessions(dialer);
-        (commands, coordinator)
+        tasks: &mut JoinSet<()>,
+    ) -> tokio::sync::mpsc::Sender<ConnectorCommand> {
+        let (commands, _sessions) = spawn_test_connector_with_sessions(dialer, tasks);
+        commands
     }
 
     fn spawn_test_connector_with_sessions(
         dialer: DualLaneDialer,
-    ) -> (
-        tokio::sync::mpsc::Sender<ConnectorCommand>,
-        tokio::task::JoinHandle<()>,
-        SharedSessions,
-    ) {
+        tasks: &mut JoinSet<()>,
+    ) -> (tokio::sync::mpsc::Sender<ConnectorCommand>, SharedSessions) {
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let draining: SharedDraining = Arc::new(Mutex::new(HashMap::new()));
-        let coordinator = tokio::spawn(run_connector(
+        tasks.spawn(run_connector(
             command_rx,
             dialer,
             None,
             Arc::clone(&sessions),
             draining,
         ));
-        (commands, coordinator, sessions)
+        (commands, sessions)
     }
 
     fn spawn_test_connector_with_explorer(
         dialer: DualLaneDialer,
-    ) -> (
-        tokio::sync::mpsc::Sender<ConnectorCommand>,
-        tokio::task::JoinHandle<()>,
-        SharedSessions,
-    ) {
+        tasks: &mut JoinSet<()>,
+    ) -> (tokio::sync::mpsc::Sender<ConnectorCommand>, SharedSessions) {
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let draining: SharedDraining = Arc::new(Mutex::new(HashMap::new()));
@@ -741,14 +724,14 @@ mod tests {
             },
             bind: Arc::new(|_| SocketAddr::from(([127, 0, 0, 1], 0))),
         };
-        let coordinator = tokio::spawn(run_connector(
+        tasks.spawn(run_connector(
             command_rx,
             dialer,
             Some(explorer),
             Arc::clone(&sessions),
             draining,
         ));
-        (commands, coordinator, sessions)
+        (commands, sessions)
     }
 
     async fn explorer_candidates(
@@ -813,15 +796,15 @@ mod tests {
         done.await.unwrap();
     }
 
-    async fn stop(
-        commands: tokio::sync::mpsc::Sender<ConnectorCommand>,
-        coordinator: tokio::task::JoinHandle<()>,
-    ) {
+    async fn stop(commands: tokio::sync::mpsc::Sender<ConnectorCommand>, tasks: &mut JoinSet<()>) {
         drop(commands);
-        tokio::time::timeout(Duration::from_secs(1), coordinator)
-            .await
-            .expect("connector coordinator did not stop")
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("connector coordinator did not stop");
     }
 
     pub(super) fn fake_connected_birth(
@@ -965,7 +948,8 @@ mod tests {
                 Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
             }
         });
-        let (commands, coordinator, sessions) = spawn_test_connector_with_sessions(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let (commands, sessions) = spawn_test_connector_with_sessions(dialer, &mut connector_tasks);
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();
         let mut router_driver = mux::ResponseRouterDriver::new();
@@ -990,7 +974,7 @@ mod tests {
             "the dead session is still the one serving this address",
         );
         drop(stream);
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     fn counting_fake_dialer(attempts: Arc<AtomicUsize>) -> DualLaneDialer {
@@ -1015,7 +999,8 @@ mod tests {
                 Box::pin(async move { Ok(fake_connected_birth(addr, terminate)) })
             }
         });
-        let (commands, coordinator, sessions) = spawn_test_connector_with_sessions(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let (commands, sessions) = spawn_test_connector_with_sessions(dialer, &mut connector_tasks);
         drop(enqueue(&commands, addr).await.await.unwrap().unwrap());
         terminate_tx.send(()).unwrap();
         wait_for(
@@ -1030,7 +1015,7 @@ mod tests {
             tokens[0], tokens[1],
             "redial reused the group of the dead session, so its router leaked",
         );
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[test]
@@ -1076,7 +1061,8 @@ mod tests {
             let terminate = terminate_rx.lock().unwrap().take();
             Box::pin(async move { Ok(fake_connected_birth(addr, terminate)) })
         });
-        let (commands, coordinator, sessions) = spawn_test_connector_with_explorer(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let (commands, sessions) = spawn_test_connector_with_explorer(dialer, &mut connector_tasks);
         drop(enqueue(&commands, addr).await.await.unwrap().unwrap());
         wait_for_candidates(
             &commands,
@@ -1098,7 +1084,7 @@ mod tests {
             "the dead address to release its explorer, which otherwise keeps minting sockets and probing an address with no session forever",
         )
         .await;
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1116,7 +1102,8 @@ mod tests {
                 Box::pin(async move { Ok(fake_connected_birth(addr, terminate)) })
             }
         });
-        let (commands, coordinator, sessions) = spawn_test_connector_with_sessions(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let (commands, sessions) = spawn_test_connector_with_sessions(dialer, &mut connector_tasks);
         let held = enqueue(&commands, addr).await.await.unwrap().unwrap();
         terminate_tx.send(()).unwrap();
         wait_for(
@@ -1132,7 +1119,7 @@ mod tests {
             "the group was dropped while a stream still routed responses through it",
         );
         drop(held);
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1156,7 +1143,8 @@ mod tests {
                 }
             }
         });
-        let (commands, coordinator) = spawn_test_connector(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let commands = spawn_test_connector(dialer, &mut connector_tasks);
         let blocked = enqueue(&commands, blocked_addr).await;
         blocked_started.notified().await;
         let error = tokio::time::timeout(Duration::from_secs(1), enqueue(&commands, fast_addr))
@@ -1167,7 +1155,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
         drop(blocked);
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1186,7 +1174,8 @@ mod tests {
                 }
             }
         });
-        let (commands, coordinator) = spawn_test_connector(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let commands = spawn_test_connector(dialer, &mut connector_tasks);
         drop(
             enqueue(&commands, cached_addr)
                 .await
@@ -1208,7 +1197,7 @@ mod tests {
             blocked.await.unwrap().unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1241,7 +1230,8 @@ mod tests {
                 }
             }
         });
-        let (commands, coordinator) = spawn_test_connector(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let commands = spawn_test_connector(dialer, &mut connector_tasks);
         drop(
             enqueue(&commands, session_addr)
                 .await
@@ -1272,7 +1262,7 @@ mod tests {
             blocked.await.unwrap().unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1285,7 +1275,8 @@ mod tests {
                 Box::pin(std::future::pending())
             }
         });
-        let (commands, coordinator) = spawn_test_connector(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let commands = spawn_test_connector(dialer, &mut connector_tasks);
         let mut responses = Vec::new();
         for port in 10_000..10_000 + MAX_CONCURRENT_DUAL_DIALS as u16 {
             responses.push(enqueue(&commands, SocketAddr::from(([192, 0, 2, 1], port))).await);
@@ -1309,7 +1300,7 @@ mod tests {
                 io::ErrorKind::ConnectionAborted,
             );
         }
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1327,7 +1318,8 @@ mod tests {
                 }
             }
         });
-        let (commands, coordinator, sessions) = spawn_test_connector_with_sessions(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let (commands, sessions) = spawn_test_connector_with_sessions(dialer, &mut connector_tasks);
         drop(enqueue(&commands, live_addr).await.await.unwrap().unwrap());
         let mut responses = Vec::new();
         for port in 10_000..10_000 + MAX_CONCURRENT_DUAL_DIALS as u16 {
@@ -1366,7 +1358,7 @@ mod tests {
                 io::ErrorKind::ConnectionAborted
             );
         }
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1374,7 +1366,8 @@ mod tests {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let dialer: DualLaneDialer =
             Arc::new(|_addr, _group, _socket| Box::pin(std::future::pending()));
-        let (commands, coordinator) = spawn_test_connector(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let commands = spawn_test_connector(dialer, &mut connector_tasks);
         let mut responses = Vec::new();
         for _ in 0..MAX_DIAL_WAITERS_PER_ADDR {
             responses.push(enqueue(&commands, addr).await);
@@ -1391,7 +1384,7 @@ mod tests {
                 io::ErrorKind::ConnectionAborted,
             );
         }
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1410,7 +1403,8 @@ mod tests {
                 })
             }
         });
-        let (commands, coordinator) = spawn_test_connector(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let commands = spawn_test_connector(dialer, &mut connector_tasks);
         let first = enqueue(&commands, addr).await;
         for _ in 0..MAX_DIAL_WAITERS_PER_ADDR * 2 {
             drop(enqueue(&commands, addr).await);
@@ -1430,7 +1424,7 @@ mod tests {
             live.await.unwrap().unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted,
         );
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1455,7 +1449,8 @@ mod tests {
                 }
             }
         });
-        let (commands, coordinator) = spawn_test_connector(dialer);
+        let mut connector_tasks = JoinSet::new();
+        let commands = spawn_test_connector(dialer, &mut connector_tasks);
         let first = enqueue(&commands, addr).await;
         first_started.notified().await;
         reset(&commands).await;
@@ -1471,7 +1466,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        stop(commands, coordinator).await;
+        stop(commands, &mut connector_tasks).await;
     }
 
     #[tokio::test]
@@ -1547,7 +1542,8 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let (connector, driver) =
             RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
-        let _driver = tokio::spawn(driver);
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
         let old_stream = connector.connect(addr).await.unwrap();
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.force_redial(addr);
@@ -1585,6 +1581,10 @@ mod tests {
         )
         .await;
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        drop(connector);
+        while let Some(result) = driver_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1593,7 +1593,8 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let (connector, driver) =
             RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
-        let _driver = tokio::spawn(driver);
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
         let opened = connector.connect(addr).await.unwrap();
         let old = connector.probe_session(addr).unwrap();
         connector.force_redial(addr);
@@ -1624,6 +1625,10 @@ mod tests {
             old.live_streams(),
         );
         drop(stream);
+        drop(connector);
+        while let Some(result) = driver_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1646,7 +1651,8 @@ mod tests {
             }
         });
         let (connector, driver) = RtpMuxConnector::with_dialer(dialer);
-        let _driver = tokio::spawn(driver);
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
         let stream = connector.connect(addr).await.unwrap();
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.force_redial(addr);
@@ -1662,6 +1668,10 @@ mod tests {
         assert_eq!(probe.id(), old_id);
         assert_eq!(probe.live_streams(), Some(1));
         drop(stream);
+        drop(connector);
+        while let Some(result) = driver_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1676,7 +1686,8 @@ mod tests {
             }
         });
         let (connector, driver) = RtpMuxConnector::with_dialer(dialer);
-        let _driver = tokio::spawn(driver);
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
         drop(connector.connect(addr).await.unwrap());
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.force_redial(addr);
@@ -1689,9 +1700,15 @@ mod tests {
             "replacement session after redial",
         )
         .await;
-        let tokens = tokens.lock().unwrap();
-        assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0], tokens[1], "redial must reuse the group token");
+        {
+            let tokens = tokens.lock().unwrap();
+            assert_eq!(tokens.len(), 2);
+            assert_eq!(tokens[0], tokens[1], "redial must reuse the group token");
+        }
+        drop(connector);
+        while let Some(result) = driver_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1700,7 +1717,8 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let (connector, driver) =
             RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
-        let _driver = tokio::spawn(driver);
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
         drop(connector.connect(addr).await.unwrap());
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.force_redial(addr);
@@ -1722,6 +1740,10 @@ mod tests {
             connector.draining.lock().unwrap().is_empty(),
             "reset left a stale draining entry, which gates the address forever",
         );
+        drop(connector);
+        while let Some(result) = driver_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1730,7 +1752,8 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let (connector, driver) =
             RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
-        let _driver = tokio::spawn(driver);
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
         let stream = connector.connect(addr).await.unwrap();
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.reoptimize(addr);
@@ -1744,6 +1767,10 @@ mod tests {
         );
         assert_eq!(connector.probe_session(addr).unwrap().id(), old_id);
         drop(stream);
+        drop(connector);
+        while let Some(result) = driver_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test(start_paused = true)]
