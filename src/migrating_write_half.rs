@@ -208,11 +208,7 @@ impl MigratingWriteHalf {
     }
     fn reap_background_writer(&mut self) {
         while let Some(result) = self.background_writer.try_join_next() {
-            if let Err(error) = result
-                && !error.is_cancelled()
-            {
-                std::panic::resume_unwind(error.into_panic());
-            }
+            result.unwrap();
         }
     }
     fn poll_pending_control(

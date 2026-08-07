@@ -8,7 +8,8 @@ pub(crate) struct SessionPairRegistry {
     groups: Mutex<HashMap<GroupToken, Weak<SessionPair>>>,
 }
 pub(crate) struct SessionPair {
-    feed: mux::SpliceRouter,
+    feed: mux::SpliceRouterHandle,
+    _driver: tokio::task::JoinSet<()>,
     state: Mutex<PairState>,
 }
 struct PairState {
@@ -53,8 +54,10 @@ impl SessionPairRegistry {
             match groups.get(&token).and_then(Weak::upgrade) {
                 Some(group) => group,
                 None => {
+                    let (feed, _driver) = mux::spawn_splice_router();
                     let group = Arc::new(SessionPair {
-                        feed: mux::spawn_splice_router(),
+                        feed,
+                        _driver,
                         state: Mutex::new(PairState {
                             members: 0,
                             next_seq: 0,
@@ -103,7 +106,7 @@ impl SessionPairRegistry {
 
 impl PairMember {
     pub(crate) fn feed(&self) -> mux::SpliceRouterHandle {
-        self.group.feed.handle()
+        self.group.feed.clone()
     }
     pub(crate) fn register_writer(&self, writer: crate::migrating_write_half::RebindHandle) {
         let mut state = self.group.state.lock().unwrap();

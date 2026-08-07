@@ -1491,7 +1491,8 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let (connector, driver) =
             RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
-        let _driver = tokio::spawn(driver);
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
         let first = connector.connect(addr).await.unwrap();
         let second = connector.connect(addr).await.unwrap();
         let session = Arc::downgrade(connector.sessions.lock().unwrap().get(&addr).unwrap());
@@ -1526,6 +1527,10 @@ mod tests {
         let fresh = connector.connect(addr).await.unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         drop(fresh);
+        drop(connector);
+        while let Some(result) = driver_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test(start_paused = true)]
