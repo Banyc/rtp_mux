@@ -113,8 +113,12 @@ impl RtpMuxServer {
         );
         let handler: StreamHandler = Arc::new(handler);
         let registry = PendingLaneRegistry::new();
-        let (group_drivers, mut group_drivers_scope) =
+        let (group_drivers, group_drivers_scope) =
             crate::group::group_driver_scope(GROUP_DRIVER_CHANNEL_BOUND);
+        let crate::group::GroupDriverScope {
+            mut submissions,
+            mut drivers,
+        } = group_drivers_scope;
         let groups = SessionPairRegistry::new(group_drivers);
         let rejections = LaneRejectionLog::default();
         let mut interactive_backoff = AcceptErrorBackoff::default();
@@ -141,17 +145,12 @@ impl RtpMuxServer {
                     joined.unwrap();
                     return Err(ServeError::ExpiryWorkerStopped { addr });
                 }
-                Some(mut driver) = group_drivers_scope.submissions.recv() => {
-                    group_drivers_scope.drivers.spawn(async move {
-                        while let Some(result) = driver.join_next().await {
-                            result.unwrap();
-                        }
-                    });
+                Some(driver) = submissions.recv() => {
+                    crate::group::GroupDriverScope::submit_driver_into(&mut drivers, driver);
                 }
-                Some(joined) = group_drivers_scope.drivers.join_next() => {
+                Some(()) = crate::group::GroupDriverScope::reap_driver_from(&mut drivers) => {
                     // A driver-drain future completing is normal (the group's
                     // sessions ended); re-raise any panic it surfaced.
-                    joined.unwrap();
                 }
                 _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {

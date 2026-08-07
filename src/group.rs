@@ -59,6 +59,49 @@ pub(crate) struct GroupDriverScope {
     pub(crate) drivers: tokio::task::JoinSet<()>,
 }
 
+impl GroupDriverScope {
+    /// Spawn one submitted driver's drain into the drain set. The
+    /// drain unwraps every completion, so a child panic surfaces as a panic
+    /// of the drain task (observed by [`GroupDriverScope::reap_driver`] / the
+    /// server's join boundary) instead of being swallowed. The caller keeps
+    /// driving [`GroupDriverScope::reap_driver`] concurrently, so a long-lived
+    /// driver can never block later submissions from being drained (and the
+    /// bounded submission channel from being freed).
+    #[cfg(test)]
+    pub(crate) fn submit_driver(&mut self, driver: tokio::task::JoinSet<()>) {
+        Self::submit_driver_into(&mut self.drivers, driver);
+    }
+
+    /// Wait for one submitted driver's drain to complete and re-raise any
+    /// panic it surfaced. Returns `None` when no drain is running (an empty
+    /// drain set), which `serve`'s select loop treats as a skipped arm.
+    #[cfg(test)]
+    pub(crate) async fn reap_driver(&mut self) -> Option<()> {
+        Self::reap_driver_from(&mut self.drivers).await
+    }
+
+    /// Field-level variant of [`GroupDriverScope::submit_driver`] so `serve`
+    /// can drive the submission receiver and the drain set from disjoint
+    /// fields inside one `select!` loop.
+    pub(crate) fn submit_driver_into(
+        drivers: &mut tokio::task::JoinSet<()>,
+        mut driver: tokio::task::JoinSet<()>,
+    ) {
+        drivers.spawn(async move {
+            while let Some(result) = driver.join_next().await {
+                result.unwrap();
+            }
+        });
+    }
+
+    /// Field-level variant of [`GroupDriverScope::reap_driver`].
+    pub(crate) async fn reap_driver_from(drivers: &mut tokio::task::JoinSet<()>) -> Option<()> {
+        let joined = drivers.join_next().await?;
+        joined.unwrap();
+        Some(())
+    }
+}
+
 pub(crate) fn group_driver_scope(bound: usize) -> (GroupDriverSubmitter, GroupDriverScope) {
     let (tx, submissions) = tokio::sync::mpsc::channel::<tokio::task::JoinSet<()>>(bound);
     let scope = GroupDriverScope {
@@ -342,6 +385,82 @@ mod tests {
             "rebinds queued up instead of collapsing to the newest",
         );
     }
+    #[tokio::test]
+    async fn parked_driver_does_not_block_later_driver_submissions() {
+        let (_submitter, mut scope) = group_driver_scope(2);
+        // Driver A parks forever: one child task that never completes keeps
+        // its drain alive for the whole test.
+        let mut driver_a = JoinSet::new();
+        driver_a.spawn(std::future::pending::<()>());
+        scope.submit_driver(driver_a);
+        // Driver B is submitted while A's drain is still parked and completes
+        // immediately. Its drain must be reaped within a timeout even though
+        // A's drain never finishes, proving later submissions are received
+        // while the first remains alive.
+        let mut driver_b = JoinSet::new();
+        driver_b.spawn(async {});
+        scope.submit_driver(driver_b);
+        tokio::time::timeout(std::time::Duration::from_secs(5), scope.reap_driver())
+            .await
+            .expect("driver B must be reaped while driver A is still parked")
+            .expect("driver B's drain completed");
+        // A is still parked: a second reap must not complete.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), scope.reap_driver())
+                .await
+                .is_err(),
+            "driver A's drain was reaped before it finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_child_panics_the_drain_task() {
+        let (_submitter, mut scope) = group_driver_scope(2);
+        let mut driver = JoinSet::new();
+        driver.spawn(async {
+            panic!("simulated group-driver child panic");
+        });
+        scope.submit_driver(driver);
+        // Reaping the drain must surface the child panic as a JoinError at
+        // the server-owned join boundary, not swallow it.
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move { scope.reap_driver().await });
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), tasks.join_next())
+            .await
+            .expect("the drain task never completed")
+            .expect("the drain task was cancelled");
+        assert!(
+            joined.is_err(),
+            "a panicking child must produce a panicking drain task"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_full_and_scope_closed_are_reported_separately() {
+        let (submitter, scope) = group_driver_scope(1);
+        // The scope's receiver is never polled, so the single bounded slot
+        // stays occupied after the first submission: the second one is
+        // refused as DriverQueueFull.
+        let mut driver_a = JoinSet::new();
+        driver_a.spawn(std::future::pending::<()>());
+        assert_eq!(submitter.try_submit(driver_a), Ok(()));
+        let mut driver_b = JoinSet::new();
+        driver_b.spawn(std::future::pending::<()>());
+        assert_eq!(
+            submitter.try_submit(driver_b),
+            Err(GroupJoinError::DriverQueueFull)
+        );
+        // Dropping the scope closes the submission channel; submissions are
+        // then refused as DriverScopeClosed.
+        drop(scope);
+        let mut driver_c = JoinSet::new();
+        driver_c.spawn(std::future::pending::<()>());
+        assert_eq!(
+            submitter.try_submit(driver_c),
+            Err(GroupJoinError::DriverScopeClosed)
+        );
+    }
+
     #[tokio::test]
     async fn failed_driver_submission_does_not_create_a_group() {
         let mut tasks = JoinSet::new();
