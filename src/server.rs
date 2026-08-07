@@ -67,8 +67,6 @@ pub enum ServeError {
     },
     #[error("Pending-lane expiry worker terminated unexpectedly; addr={addr}")]
     ExpiryWorkerStopped { addr: SocketAddr },
-    #[error("Group-driver scope terminated unexpectedly; addr={addr}")]
-    GroupDriverScopeStopped { addr: SocketAddr },
 }
 
 impl RtpMuxServer {
@@ -143,9 +141,17 @@ impl RtpMuxServer {
                     joined.unwrap();
                     return Err(ServeError::ExpiryWorkerStopped { addr });
                 }
+                Some(mut driver) = group_drivers_scope.submissions.recv() => {
+                    group_drivers_scope.drivers.spawn(async move {
+                        while let Some(result) = driver.join_next().await {
+                            result.unwrap();
+                        }
+                    });
+                }
                 Some(joined) = group_drivers_scope.drivers.join_next() => {
+                    // A driver-drain future completing is normal (the group's
+                    // sessions ended); re-raise any panic it surfaced.
                     joined.unwrap();
-                    return Err(ServeError::GroupDriverScopeStopped { addr });
                 }
                 _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
@@ -781,9 +787,21 @@ fn pair_lanes(
         Ok((opener, accepter)) => {
             let member = match groups.join(group_token, opener.clone()) {
                 Ok(member) => member,
-                Err(reason) => {
-                    warn!(reason, ?nonce, dn_interactive = ?addrs.interactive_peer, "RTP mux session rejected at group join");
-                    counter!("stream.rtp_mux.group_full").increment(1);
+                Err(error) => {
+                    match error {
+                        crate::group::GroupJoinError::GroupFull => {
+                            warn!(?nonce, dn_interactive = ?addrs.interactive_peer, "RTP mux session rejected at group join: group is full");
+                            counter!("stream.rtp_mux.group_full").increment(1);
+                        }
+                        crate::group::GroupJoinError::DriverQueueFull => {
+                            warn!(?nonce, dn_interactive = ?addrs.interactive_peer, "RTP mux session rejected at group join: group-driver queue is full");
+                            counter!("stream.rtp_mux.group_driver_queue_full").increment(1);
+                        }
+                        crate::group::GroupJoinError::DriverScopeClosed => {
+                            warn!(?nonce, dn_interactive = ?addrs.interactive_peer, "RTP mux session rejected at group join: group-driver scope is closed");
+                            counter!("stream.rtp_mux.group_driver_scope_closed").increment(1);
+                        }
+                    }
                     return;
                 }
             };

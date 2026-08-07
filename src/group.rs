@@ -1,36 +1,70 @@
 use mux::{DualStreamOpener, GroupToken};
 use std::{
     collections::HashMap,
+    fmt,
     sync::{Arc, Mutex, Weak},
 };
 
 #[derive(Clone)]
 pub(crate) struct GroupDriverSubmitter(tokio::sync::mpsc::Sender<tokio::task::JoinSet<()>>);
 
-impl GroupDriverSubmitter {
-    fn try_submit(&self, driver: tokio::task::JoinSet<()>) -> Result<(), &'static str> {
-        self.0
-            .try_send(driver)
-            .map_err(|_| "group driver submission channel is full or closed")
+/// Why a session pair could not join its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupJoinError {
+    /// The group already holds its full complement of members.
+    GroupFull,
+    /// The bounded group-driver submission channel is at capacity; the
+    /// server's driver-drain reaper has not caught up.
+    DriverQueueFull,
+    /// The group-driver submission channel is closed; the server's driver
+    /// scope has shut down.
+    DriverScopeClosed,
+}
+
+impl fmt::Display for GroupJoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GroupJoinError::GroupFull => write!(f, "session group is full"),
+            GroupJoinError::DriverQueueFull => {
+                write!(f, "group-driver submission queue is full")
+            }
+            GroupJoinError::DriverScopeClosed => write!(f, "group-driver scope is closed"),
+        }
     }
 }
 
+impl GroupDriverSubmitter {
+    fn try_submit(&self, driver: tokio::task::JoinSet<()>) -> Result<(), GroupJoinError> {
+        match self.0.try_send(driver) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(GroupJoinError::DriverQueueFull)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(GroupJoinError::DriverScopeClosed)
+            }
+        }
+    }
+}
+
+/// Server-side half of the group-driver submission channel: the bounded
+/// receiver of submitted driver `JoinSet`s plus a `JoinSet` of drain futures
+/// (one per submitted driver). [`crate::server::RtpMuxServer::serve`] owns
+/// this scope and drives both: it receives submissions and spawns each
+/// driver's drain into `drivers`, and it reaps `drivers` concurrently, so a
+/// long-lived driver can never block later submissions from being drained
+/// (and the bounded channel from being freed).
 pub(crate) struct GroupDriverScope {
+    pub(crate) submissions: tokio::sync::mpsc::Receiver<tokio::task::JoinSet<()>>,
     pub(crate) drivers: tokio::task::JoinSet<()>,
 }
 
 pub(crate) fn group_driver_scope(bound: usize) -> (GroupDriverSubmitter, GroupDriverScope) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::task::JoinSet<()>>(bound);
-    let mut scope = GroupDriverScope {
+    let (tx, submissions) = tokio::sync::mpsc::channel::<tokio::task::JoinSet<()>>(bound);
+    let scope = GroupDriverScope {
+        submissions,
         drivers: tokio::task::JoinSet::new(),
     };
-    scope.drivers.spawn(async move {
-        while let Some(mut driver) = rx.recv().await {
-            while let Some(result) = driver.join_next().await {
-                result.unwrap();
-            }
-        }
-    });
     (GroupDriverSubmitter(tx), scope)
 }
 
@@ -78,7 +112,7 @@ impl SessionPairRegistry {
         &self,
         token: GroupToken,
         opener: DualStreamOpener,
-    ) -> Result<PairMember, &'static str> {
+    ) -> Result<PairMember, GroupJoinError> {
         let group = {
             let mut groups = self.groups.lock().unwrap();
             groups.retain(|_, weak| weak.strong_count() > 0);
@@ -105,7 +139,7 @@ impl SessionPairRegistry {
         };
         let mut state = group.state.lock().unwrap();
         if state.members >= 2 {
-            return Err("session group is full");
+            return Err(GroupJoinError::GroupFull);
         }
         state.members += 1;
         state.next_seq += 1;
@@ -313,7 +347,7 @@ mod tests {
         let mut tasks = JoinSet::new();
         let (registry, _driver_scope) = registry_with_scope(1);
         // Occupy the single slot with a driver whose task parks forever, so the
-        // reaper can never drain it and every later submission is refused.
+        // bounded channel stays full and every later submission is refused.
         let (_feed_a, mut driver_a) = mux::spawn_splice_router();
         driver_a.spawn(std::future::pending::<()>());
         registry.group_drivers.try_submit(driver_a).unwrap();
