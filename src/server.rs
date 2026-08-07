@@ -63,6 +63,8 @@ pub enum ServeError {
         source: io::Error,
         addr: SocketAddr,
     },
+    #[error("Pending-lane expiry worker terminated unexpectedly; addr={addr}")]
+    ExpiryWorkerStopped { addr: SocketAddr },
 }
 
 impl RtpMuxServer {
@@ -114,14 +116,12 @@ impl RtpMuxServer {
         let mut interactive_backoff = AcceptErrorBackoff::default();
         let mut bulk_backoff = AcceptErrorBackoff::default();
         let mut rejection_log = rejection_log_ticker();
+        let mut expiry: JoinSet<()> = JoinSet::new();
         {
             let registry = Arc::clone(&registry);
             let rejections = rejections.clone();
-            self.mux.spawn(async move {
+            expiry.spawn(async move {
                 run_pending_lane_expiry(registry, rejections).await;
-                MuxError::TaskStopped {
-                    task: "pending_lane_expiry",
-                }
             });
         }
         loop {
@@ -134,6 +134,10 @@ impl RtpMuxServer {
                         Err(error) if error.is_cancelled() => { trace!(?error, "MUX task cancelled (normal shutdown/reset)"); }
                         Err(error) => error!(?error, ?addr, "MUX supervision task failed to join"),
                     }
+                }
+                Some(joined) = expiry.join_next() => {
+                    joined.unwrap();
+                    return Err(ServeError::ExpiryWorkerStopped { addr });
                 }
                 _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
