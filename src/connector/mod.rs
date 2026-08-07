@@ -402,7 +402,7 @@ fn install_session(
             router.handle()
         }
         None => {
-            let router = mux::ResponseRouter::new();
+            let mut router = mux::ResponseRouter::new();
             let handle = router.handle();
             router.add_accepter(accepter, router_driver);
             group.router = Some(router);
@@ -533,8 +533,16 @@ async fn run_connector(
                 prune_dead_addresses(&mut groups, &mut explorers, &in_flight_dials);
             }
             Some(res) = router_driver.join_next() => {
-                res.unwrap();
-                trace!("ResponseRouter accepter task stopped");
+                match res {
+                    Ok(()) => trace!("ResponseRouter accepter task stopped"),
+                    // `reset` deliberately aborts every router accepter task;
+                    // tolerate the resulting cancellation instead of
+                    // unwrapping it.
+                    Err(error) if error.is_cancelled() => {
+                        trace!(?error, "ResponseRouter accepter task cancelled")
+                    }
+                    Err(error) => std::panic::resume_unwind(error.into_panic()),
+                }
             }
             Some((addr, result)) = pending_dials.next() => {
                 in_flight_dials.remove(&addr);
