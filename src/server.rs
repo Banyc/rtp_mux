@@ -799,12 +799,7 @@ fn pair_lanes(
                     let accepted_streams =
                         run_dual_mux_accepter(accepter, opener, addr, handler, member).await;
                     let error = match tasks.join_next().await {
-                        Some(Ok(error)) => error,
-                        Some(Err(source)) if source.is_cancelled() => MuxError::TaskJoin {
-                            task: "dual_lane",
-                            source,
-                        },
-                        Some(Err(source)) => std::panic::resume_unwind(source.into_panic()),
+                        Some(result) => result.unwrap(),
                         None => MuxError::TaskStopped { task: "dual_lane" },
                     };
                     warn!(event = "rtp_mux_session_terminated", ?error, ?nonce, dn_interactive = ?addrs.interactive_peer, dn_interactive_local = ?addrs.interactive_local, dn_bulk = ?addrs.bulk_peer, dn_bulk_local = ?addrs.bulk_local, accepted_streams, uptime_ms = paired_at.elapsed().as_millis(), "RTP mux dual-lane session terminated");

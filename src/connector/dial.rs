@@ -49,12 +49,7 @@ pub(crate) fn dual_supervisor_result(
     result: Option<Result<MuxError, tokio::task::JoinError>>,
 ) -> MuxError {
     match result {
-        Some(Ok(error)) => error,
-        Some(Err(source)) if source.is_cancelled() => MuxError::TaskJoin {
-            task: "dual_lane",
-            source,
-        },
-        Some(Err(source)) => std::panic::resume_unwind(source.into_panic()),
+        Some(result) => result.unwrap(),
         None => MuxError::TaskStopped { task: "dual_lane" },
     }
 }
