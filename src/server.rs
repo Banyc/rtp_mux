@@ -137,10 +137,10 @@ impl RtpMuxServer {
                 }
                 _ = rejection_log.tick() => rejections.flush(),
                 result = self.interactive_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
-                    handle_lane_accept(result, &mut interactive_backoff, "rtp_mux_interactive", addr, LaneClass::Interactive, &handler, &registry, &groups, &rejections, &session_spawner, &mut self.mux).await?;
+                    handle_lane_accept(result, &handler, &registry, &groups, &rejections, &session_spawner, &mut self.mux, HandleLaneAcceptConfig { backoff: &mut interactive_backoff, backoff_name: "rtp_mux_interactive", addr, lane: LaneClass::Interactive }).await?;
                 }
                 result = self.bulk_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
-                    handle_lane_accept(result, &mut bulk_backoff, "rtp_mux_bulk", bulk_addr, LaneClass::Bulk, &handler, &registry, &groups, &rejections, &session_spawner, &mut self.mux).await?;
+                    handle_lane_accept(result, &handler, &registry, &groups, &rejections, &session_spawner, &mut self.mux, HandleLaneAcceptConfig { backoff: &mut bulk_backoff, backoff_name: "rtp_mux_bulk", addr: bulk_addr, lane: LaneClass::Bulk }).await?;
                 }
             }
         }
@@ -159,20 +159,34 @@ async fn finish_frame_delivery_accept(
     accept?.await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_lane_accept(
-    accept: io::Result<rtp::udp::FrameDeliveryAccept>,
-    backoff: &mut AcceptErrorBackoff,
+/// Per-lane settings for [`handle_lane_accept`]: the bits that vary between
+/// the interactive and bulk lanes but are not part of the shared accept
+/// machinery (handler, registries, spawner, mux join set).
+#[derive(Debug)]
+struct HandleLaneAcceptConfig<'a> {
+    backoff: &'a mut AcceptErrorBackoff,
     backoff_name: &'static str,
     addr: SocketAddr,
     lane: LaneClass,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_lane_accept(
+    accept: io::Result<rtp::udp::FrameDeliveryAccept>,
     handler: &StreamHandler,
     registry: &Arc<PendingLaneRegistry>,
     groups: &Arc<SessionPairRegistry>,
     rejections: &LaneRejectionLog,
     session_spawner: &SessionSpawner,
     mux: &mut JoinSet<MuxError>,
+    config: HandleLaneAcceptConfig<'_>,
 ) -> Result<(), ServeError> {
+    let HandleLaneAcceptConfig {
+        backoff,
+        backoff_name,
+        addr,
+        lane,
+    } = config;
     let stream = match finish_frame_delivery_accept(accept).await {
         Ok(stream) => {
             backoff.accepted(backoff_name, addr);
