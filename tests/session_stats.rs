@@ -23,7 +23,9 @@ async fn a_session_counts_its_streams_and_the_bytes_they_carried() {
         });
     }));
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
-    let connector = RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
+    let (connector, driver) =
+        RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
+    let _driver = tokio::spawn(driver);
     let mut first = connector.connect_stream(addr).await.unwrap();
     let second = connector.connect_stream(addr).await.unwrap();
     let probe = connector.probe_session(addr).expect("a session must exist");

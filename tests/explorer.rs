@@ -37,7 +37,7 @@ async fn redial_dial_lands_on_the_surrendered_candidate_port() {
         let addr = spawn_echo_server().await;
         let bind: rtp_mux::BindSelector =
             Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
-        let connector = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
+        let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
             explorer: ExplorerConfig {
                 enabled: true,
                 candidates: 4,
@@ -46,6 +46,7 @@ async fn redial_dial_lands_on_the_surrendered_candidate_port() {
             },
             ..RtpMuxConnectorConfig::standard(bind, false)
         });
+        let _driver = tokio::spawn(driver);
         let mut stream = connector.connect_stream(addr).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];

@@ -41,7 +41,9 @@ async fn response_migration_end_to_end() {
         });
     }));
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
-    let connector = RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
+    let (connector, driver) =
+        RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
+    let _driver = tokio::spawn(driver);
     let mut stream = connector.connect_stream(addr).await.unwrap();
     stream.write_all(b"ping").await.unwrap();
     let mut resp = Vec::new();

@@ -18,7 +18,7 @@ pub use byte_count::SessionStats;
 pub use client_stream::ClientStream;
 pub use connector::{
     BindSelector, BulkAddrSelector, OpenedStream, RtpMuxConnector, RtpMuxConnectorConfig,
-    SessionView,
+    RtpMuxConnectorDriver, SessionView,
 };
 pub use explorer::{ExplorerConfig, ExplorerReport, PathScore, TupleReport};
 pub use migrating_write_half::MigratingWriteHalf;

@@ -91,7 +91,9 @@ async fn xsession_migration_end_to_end() {
         let addr = spawn_cmd_server().await;
         let bind: rtp_mux::BindSelector =
             Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
-        let connector = RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
+        let (connector, driver) =
+            RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
+        let _driver = tokio::spawn(driver);
         let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let downloaded = Arc::new(AtomicUsize::new(0));
         let mut down = connector.connect_stream(addr).await.unwrap();

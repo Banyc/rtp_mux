@@ -139,12 +139,34 @@ pub struct RtpMuxConnector {
     commands: tokio::sync::mpsc::Sender<ConnectorCommand>,
     sessions: SharedSessions,
     draining: SharedDraining,
-    _connector: JoinSet<()>,
 }
 
 impl std::fmt::Debug for RtpMuxConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RtpMuxConnector").finish_non_exhaustive()
+    }
+}
+
+/// The driver future for an [`RtpMuxConnector`].
+///
+/// [`RtpMuxConnector::with_config`] / [`RtpMuxConnector::new`] return the
+/// handle paired with a `RtpMuxConnectorDriver`. The driver runs the
+/// connector's command loop (reaping per-session supervisors and the
+/// response-router driver) and must be spawned into a caller-owned,
+/// actively-reaped `JoinSet` so its termination is observed and its drop
+/// aborts the connector task. The handle alone holds no task and is safe
+/// to share by `Arc`; it is inert until the driver is spawned.
+pub struct RtpMuxConnectorDriver {
+    inner: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+}
+
+impl std::future::Future for RtpMuxConnectorDriver {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.inner.as_mut().poll(cx)
     }
 }
 
@@ -172,11 +194,11 @@ impl SessionView {
 }
 
 impl RtpMuxConnector {
-    pub fn new(bind: BindSelector, fec: bool) -> Self {
+    pub fn new(bind: BindSelector, fec: bool) -> (Self, RtpMuxConnectorDriver) {
         Self::with_config(RtpMuxConnectorConfig::standard(bind, fec))
     }
 
-    pub fn with_config(config: RtpMuxConnectorConfig) -> Self {
+    pub fn with_config(config: RtpMuxConnectorConfig) -> (Self, RtpMuxConnectorDriver) {
         let RtpMuxConnectorConfig {
             bind,
             bulk_addr,
@@ -198,28 +220,34 @@ impl RtpMuxConnector {
     }
 
     #[cfg(test)]
-    fn with_dialer(dialer: DualLaneDialer) -> Self {
+    fn with_dialer(dialer: DualLaneDialer) -> (Self, RtpMuxConnectorDriver) {
         Self::with_dialer_and_explorer(dialer, None)
     }
 
-    fn with_dialer_and_explorer(dialer: DualLaneDialer, explorer: Option<ExplorerContext>) -> Self {
+    fn with_dialer_and_explorer(
+        dialer: DualLaneDialer,
+        explorer: Option<ExplorerContext>,
+    ) -> (Self, RtpMuxConnectorDriver) {
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let draining: SharedDraining = Arc::new(Mutex::new(HashMap::new()));
-        let mut connector = JoinSet::new();
-        connector.spawn(run_connector(
-            command_rx,
-            dialer,
-            explorer,
-            Arc::clone(&sessions),
-            Arc::clone(&draining),
-        ));
-        Self {
-            commands,
-            sessions,
-            draining,
-            _connector: connector,
-        }
+        let driver = RtpMuxConnectorDriver {
+            inner: Box::pin(run_connector(
+                command_rx,
+                dialer,
+                explorer,
+                Arc::clone(&sessions),
+                Arc::clone(&draining),
+            )),
+        };
+        (
+            Self {
+                commands,
+                sessions,
+                draining,
+            },
+            driver,
+        )
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<OpenedStream> {
@@ -1453,11 +1481,13 @@ mod tests {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let other_addr: SocketAddr = "192.0.2.2:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let mut connector =
+        let (connector, driver) =
             RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
         let first = connector.connect(addr).await.unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        connector._connector.abort_all();
+        driver_tasks.abort_all();
         let second = connector.connect(addr).await.unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         let error = connector.connect(other_addr).await.unwrap_err();
@@ -1469,7 +1499,9 @@ mod tests {
     async fn live_stream_gauge_and_graceful_redial() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let (connector, driver) =
+            RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let _driver = tokio::spawn(driver);
         let first = connector.connect(addr).await.unwrap();
         let second = connector.connect(addr).await.unwrap();
         let session = Arc::downgrade(connector.sessions.lock().unwrap().get(&addr).unwrap());
@@ -1510,7 +1542,9 @@ mod tests {
     async fn redial_is_skipped_while_the_previous_generation_drains() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let (connector, driver) =
+            RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let _driver = tokio::spawn(driver);
         let old_stream = connector.connect(addr).await.unwrap();
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.force_redial(addr);
@@ -1554,7 +1588,9 @@ mod tests {
     async fn a_stream_opened_before_a_redial_lands_on_the_new_session() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let (connector, driver) =
+            RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let _driver = tokio::spawn(driver);
         let opened = connector.connect(addr).await.unwrap();
         let old = connector.probe_session(addr).unwrap();
         connector.force_redial(addr);
@@ -1606,7 +1642,8 @@ mod tests {
                 }
             }
         });
-        let connector = RtpMuxConnector::with_dialer(dialer);
+        let (connector, driver) = RtpMuxConnector::with_dialer(dialer);
+        let _driver = tokio::spawn(driver);
         let stream = connector.connect(addr).await.unwrap();
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.force_redial(addr);
@@ -1635,7 +1672,8 @@ mod tests {
                 Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
             }
         });
-        let connector = RtpMuxConnector::with_dialer(dialer);
+        let (connector, driver) = RtpMuxConnector::with_dialer(dialer);
+        let _driver = tokio::spawn(driver);
         drop(connector.connect(addr).await.unwrap());
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.force_redial(addr);
@@ -1657,7 +1695,9 @@ mod tests {
     async fn reset_clears_the_draining_generation() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let (connector, driver) =
+            RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let _driver = tokio::spawn(driver);
         drop(connector.connect(addr).await.unwrap());
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.force_redial(addr);
@@ -1685,7 +1725,9 @@ mod tests {
     async fn reoptimize_without_explorer_data_never_redials() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let connector = RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let (connector, driver) =
+            RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let _driver = tokio::spawn(driver);
         let stream = connector.connect(addr).await.unwrap();
         let old_id = connector.probe_session(addr).unwrap().id();
         connector.reoptimize(addr);
