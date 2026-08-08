@@ -40,12 +40,12 @@ async fn listening_side_can_open_a_stream_to_the_dialing_side() {
             let server = session_rx.recv().await.unwrap();
             let (server_opener, _server_accepter, _, server_driver) = server.into_parts();
             let (_client_opener, mut client_accepter, _, client_driver) = client.into_parts();
-            submitter.submit(Box::pin(async move {
-                let _ = server_driver.await;
-            }));
-            submitter.submit(Box::pin(async move {
-                let _ = client_driver.await;
-            }));
+            // Both session drivers must stay alive until the body finishes:
+            // a driver returning its MuxError early (the session ended) is a
+            // failure, so `submit_required` panics with the returned error
+            // and the root reaper cascades it into the test.
+            submitter.submit_required("server session driver", server_driver);
+            submitter.submit_required("client session driver", client_driver);
             let (opened, accepted) = tokio::join!(
                 server_opener.open(LaneClass::Interactive),
                 client_accepter.accept(),

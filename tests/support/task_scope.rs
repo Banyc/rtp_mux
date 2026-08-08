@@ -39,6 +39,23 @@ impl TestTaskSubmitter {
             }
         }
     }
+
+    /// Submit a REQUIRED test-owned task: like [`TestTaskSubmitter::submit`]
+    /// but the future must stay alive until the test body completes.
+    /// Completing early (e.g. a session driver returning a `MuxError` while
+    /// the body is still running) panics with the returned value, so the
+    /// root reaper cascades the panic into the test instead of discarding
+    /// the completion silently.
+    pub(crate) fn submit_required<F, T>(&self, name: &'static str, fut: F)
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: std::fmt::Debug,
+    {
+        self.submit(Box::pin(async move {
+            let output = fut.await;
+            panic!("required task '{name}' exited before the test body completed: {output:?}");
+        }));
+    }
 }
 
 /// An actively-polled scope of test-owned background tasks. The test body
