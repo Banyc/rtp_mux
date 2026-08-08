@@ -10,6 +10,35 @@ mod support;
 
 use support::TestScope;
 
+/// `submit_required` is used only by this test, so it lives here instead of
+/// the shared `support` module — that module is compiled into every test
+/// binary, and each binary that never calls the method would flag it as dead
+/// code.
+trait RequiredSubmit {
+    /// Submit a test-owned task that must stay alive until the test body
+    /// completes. Completing early (e.g. a session driver returning a
+    /// `MuxError` while the body is still running) panics with the returned
+    /// value, so the root reaper cascades the panic into the test instead of
+    /// discarding the completion silently.
+    fn submit_required<F, T>(&self, name: &'static str, fut: F)
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: std::fmt::Debug;
+}
+
+impl RequiredSubmit for support::task_scope::TestTaskSubmitter {
+    fn submit_required<F, T>(&self, name: &'static str, fut: F)
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: std::fmt::Debug,
+    {
+        self.submit(Box::pin(async move {
+            let output = fut.await;
+            panic!("required task '{name}' exited before the test body completed: {output:?}");
+        }));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn listening_side_can_open_a_stream_to_the_dialing_side() {
     let mut scope = TestScope::new();
