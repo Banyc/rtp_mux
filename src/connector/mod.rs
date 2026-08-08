@@ -402,7 +402,8 @@ fn install_session(
             router.handle()
         }
         None => {
-            let mut router = mux::ResponseRouter::new();
+            let (mut router, driver) = mux::ResponseRouter::new();
+            router_driver.fold_driver(driver);
             let handle = router.handle();
             router.add_accepter(accepter, router_driver);
             group.router = Some(router);
