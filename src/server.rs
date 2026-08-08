@@ -18,6 +18,7 @@ use tokio::{net::ToSocketAddrs, task::JoinSet};
 use tracing::{info, instrument, trace, warn};
 
 use crate::{
+    BidirectionalSession,
     accept_error::AcceptErrorBackoff,
     admission::{
         AdmittedLane, ExpiredPendingLane, PendingLane, PendingLaneAdmission, PendingLaneRegistry,
@@ -31,6 +32,13 @@ use crate::{
 };
 
 type StreamHandler = Arc<dyn Fn(ServerStream) + Send + Sync + 'static>;
+type SessionHandler = Arc<dyn Fn(BidirectionalSession) + Send + Sync + 'static>;
+
+#[derive(Clone)]
+enum Handler {
+    Streams(StreamHandler),
+    Sessions(SessionHandler),
+}
 
 const GROUP_DRIVER_CHANNEL_BOUND: usize = 16;
 
@@ -100,9 +108,30 @@ impl RtpMuxServer {
 
     #[instrument(skip_all)]
     pub async fn serve(
-        mut self,
+        self,
         session_spawner: SessionSpawner,
         handler: impl Fn(ServerStream) + Send + Sync + 'static,
+    ) -> Result<(), ServeError> {
+        self.serve_with_handler(session_spawner, Handler::Streams(Arc::new(handler)))
+            .await
+    }
+
+    /// Serve fully paired sessions while leaving both stream directions under
+    /// caller control.
+    #[instrument(skip_all)]
+    pub async fn serve_sessions(
+        self,
+        session_spawner: SessionSpawner,
+        handler: impl Fn(BidirectionalSession) + Send + Sync + 'static,
+    ) -> Result<(), ServeError> {
+        self.serve_with_handler(session_spawner, Handler::Sessions(Arc::new(handler)))
+            .await
+    }
+
+    async fn serve_with_handler(
+        mut self,
+        session_spawner: SessionSpawner,
+        handler: Handler,
     ) -> Result<(), ServeError> {
         let addr = self.interactive_listener.local_addr();
         let bulk_addr = self.bulk_listener.local_addr();
@@ -111,7 +140,6 @@ impl RtpMuxServer {
             ?bulk_addr,
             "Listening (interactive + bulk dual-lane)"
         );
-        let handler: StreamHandler = Arc::new(handler);
         let registry = PendingLaneRegistry::new();
         let (group_drivers, group_drivers_scope) =
             crate::group::group_driver_scope(GROUP_DRIVER_CHANNEL_BOUND);
@@ -190,7 +218,7 @@ struct HandleLaneAcceptConfig<'a> {
 #[allow(clippy::too_many_arguments)]
 async fn handle_lane_accept(
     accept: io::Result<rtp::udp::FrameDeliveryAccept>,
-    handler: &StreamHandler,
+    handler: &Handler,
     registry: &Arc<PendingLaneRegistry>,
     groups: &Arc<SessionPairRegistry>,
     rejections: &LaneRejectionLog,
@@ -261,7 +289,7 @@ async fn handle_lane_accept(
 
 fn spawn_lane_accept(
     admitted: AdmittedLane,
-    handler: StreamHandler,
+    handler: Handler,
     registry: Arc<PendingLaneRegistry>,
     groups: Arc<SessionPairRegistry>,
     rejections: LaneRejectionLog,
@@ -691,7 +719,7 @@ fn record_rejected_lane(
 fn pair_lanes_inner(
     lane_a: PendingLane,
     lane_b: PendingLane,
-    handler: StreamHandler,
+    handler: Handler,
     nonce: PairingNonce,
     session_spawner: &SessionSpawner,
     groups: &Arc<SessionPairRegistry>,
@@ -774,7 +802,7 @@ fn classify_lane_addrs(
 fn pair_lanes(
     lane_a: PendingLane,
     lane_b: PendingLane,
-    handler: StreamHandler,
+    handler: Handler,
     addrs: DualLaneSocketAddrs,
     nonce: PairingNonce,
     session_spawner: &SessionSpawner,
@@ -784,6 +812,31 @@ fn pair_lanes(
     let mut tasks = JoinSet::new();
     match complete_pairing(lane_a.pending, lane_b.pending, &mut tasks) {
         Ok((opener, accepter)) => {
+            let addr = SocketAddrPair {
+                local_addr: addrs.interactive_local,
+                peer_addr: addrs.interactive_peer,
+            };
+            let Handler::Streams(handler) = handler else {
+                let Handler::Sessions(handler) = handler else {
+                    unreachable!();
+                };
+                let supervisor_a = lane_a.supervisor;
+                let supervisor_b = lane_b.supervisor;
+                tasks.spawn(async move {
+                    let _ = supervisor_a.await;
+                    MuxError::TaskStopped {
+                        task: "interactive_rtp_supervisor",
+                    }
+                });
+                tasks.spawn(async move {
+                    let _ = supervisor_b.await;
+                    MuxError::TaskStopped {
+                        task: "bulk_rtp_supervisor",
+                    }
+                });
+                handler(BidirectionalSession::new(opener, accepter, addr, tasks));
+                return;
+            };
             let member = match groups.join(group_token, opener.clone()) {
                 Ok(member) => member,
                 Err(error) => {
@@ -804,14 +857,10 @@ fn pair_lanes(
                     return;
                 }
             };
-            let addr = SocketAddrPair {
-                local_addr: addrs.interactive_local,
-                peer_addr: addrs.interactive_peer,
-            };
             // Both lanes' RTP session owners are awaited for the session's
             // whole life, so their completion and any driver panic surfaces
             // here instead of being silently detached. A rejected, timed-out,
-            // or failed pairing never reaches here — it aborts them via the
+            // or failed pairing never reaches here -- it aborts them via the
             // PendingLane drop instead.
             let supervisor_a = lane_a.supervisor;
             let supervisor_b = lane_b.supervisor;
@@ -1202,7 +1251,7 @@ mod tests {
             peer,
             bulk_local,
         );
-        let handler: StreamHandler = Arc::new(|_| {});
+        let handler = Handler::Streams(Arc::new(|_| {}));
         pair_lanes(lane_a, lane_b, handler, addrs, nonce, &spawner, &groups);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {

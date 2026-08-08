@@ -2,6 +2,7 @@
 
 mod accept_error;
 mod admission;
+mod bidirectional;
 mod byte_count;
 mod client_stream;
 mod connector;
@@ -14,6 +15,9 @@ mod session;
 mod shared;
 mod stream;
 
+pub use bidirectional::{
+    BidirectionalSession, BidirectionalSessionDriver, connect_bidirectional_session,
+};
 pub use byte_count::SessionStats;
 pub use client_stream::ClientStream;
 pub use connector::{

@@ -1,5 +1,5 @@
 mod cross_session;
-mod dial;
+pub(crate) mod dial;
 
 use std::{
     collections::{HashMap, HashSet},
