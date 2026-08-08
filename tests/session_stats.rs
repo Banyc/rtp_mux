@@ -26,7 +26,7 @@ async fn a_session_counts_its_streams_and_the_bytes_they_carried() {
             submitter.submit(fut);
         }
     });
-    scope.spawn(async move {
+    scope.spawn_required("rtp_mux server serve loop", async move {
         let _ = server
             .serve(spawner, {
                 let submitter = submitter.clone();
@@ -43,7 +43,7 @@ async fn a_session_counts_its_streams_and_the_bytes_they_carried() {
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
     let (connector, driver) =
         RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
-    scope.spawn(driver);
+    scope.spawn_required("rtp_mux connector driver", driver);
     scope
         .run(async {
             let mut first = connector.connect_stream(addr).await.unwrap();

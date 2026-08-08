@@ -23,7 +23,7 @@ async fn spawn_echo_server(scope: &mut TestScope) -> SocketAddr {
             submitter.submit(fut);
         }
     });
-    scope.spawn(async move {
+    scope.spawn_required("rtp_mux server serve loop", async move {
         let _ = server
             .serve(spawner, {
                 let submitter = submitter.clone();
@@ -62,7 +62,7 @@ async fn redial_dial_lands_on_the_surrendered_candidate_port() {
         },
         ..RtpMuxConnectorConfig::standard(bind, false)
     });
-    scope.spawn(driver);
+    scope.spawn_required("rtp_mux connector driver", driver);
     tokio::time::timeout(
         Duration::from_secs(90),
         scope.run(async {

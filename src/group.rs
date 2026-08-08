@@ -414,6 +414,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "simulated group-driver child panic")]
     async fn panicking_child_panics_the_drain_task() {
         let (_submitter, mut scope) = group_driver_scope(2);
         let mut driver = JoinSet::new();
@@ -421,18 +422,10 @@ mod tests {
             panic!("simulated group-driver child panic");
         });
         scope.submit_driver(driver);
-        // Reaping the drain must surface the child panic as a JoinError at
-        // the server-owned join boundary, not swallow it.
-        let mut tasks = JoinSet::new();
-        tasks.spawn(async move { scope.reap_driver().await });
-        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), tasks.join_next())
-            .await
-            .expect("the drain task never completed")
-            .expect("the drain task was cancelled");
-        assert!(
-            joined.is_err(),
-            "a panicking child must produce a panicking drain task"
-        );
+        // The drain unwraps every joined child, so the child panic propagates
+        // out of `reap_driver` (which returns `Option<()>`) and cascades into
+        // this test instead of being inspected as a JoinError.
+        let _ = scope.reap_driver().await;
     }
 
     #[tokio::test]

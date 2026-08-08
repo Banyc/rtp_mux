@@ -42,7 +42,7 @@ async fn spawn_cmd_server(scope: &mut TestScope) -> SocketAddr {
             submitter.submit(fut);
         }
     });
-    scope.spawn(async move {
+    scope.spawn_required("rtp_mux server serve loop", async move {
         let _ = server
             .serve(spawner, {
                 let submitter = submitter.clone();
@@ -109,7 +109,7 @@ async fn xsession_migration_end_to_end() {
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
     let (connector, driver) =
         RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
-    scope.spawn(driver);
+    scope.spawn_required("rtp_mux connector driver", driver);
     tokio::time::timeout(
         Duration::from_secs(120),
         scope.run(async {
