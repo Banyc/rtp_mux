@@ -90,6 +90,7 @@ pub async fn connect_bidirectional_session(
         config.bind,
         config.bulk_addr,
         config.fec,
+        config.handshake,
         GroupToken::generate(),
         None,
     )

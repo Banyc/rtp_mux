@@ -59,6 +59,7 @@ pub(crate) async fn connect_dual_lane(
     bind: BindSelector,
     bulk_addr: BulkAddrSelector,
     fec: bool,
+    handshake: bool,
     group: GroupToken,
     socket: Option<tokio_udp::UdpSocket>,
 ) -> io::Result<ConnectedDualLaneBirth> {
@@ -69,6 +70,7 @@ pub(crate) async fn connect_dual_lane(
             Arc::clone(&bind),
             Arc::clone(&bulk_addr),
             fec,
+            handshake,
             group,
             socket.take(),
         )
@@ -129,31 +131,39 @@ where
     ))
 }
 
+/// The rtp connection tuning shared by both RTP lanes of a dual-lane birth:
+/// the handshake toggle is per-connector-instance (no global or environment
+/// state) and must match the server's mode.
+fn rtp_connect_config(fec: bool, handshake: bool) -> rtp::udp::ConnectConfig<'static> {
+    rtp::udp::ConnectConfig {
+        handshake,
+        fec,
+        ..rtp::udp::ConnectConfig::default()
+    }
+}
+
 async fn connect_dual_lane_once(
     addr: SocketAddr,
     bind: BindSelector,
     bulk_addr: BulkAddrSelector,
     fec: bool,
+    handshake: bool,
     group: GroupToken,
     socket: Option<tokio_udp::UdpSocket>,
 ) -> io::Result<ConnectedDualLaneBirth> {
     let bind_addr = bind(addr);
     let bulk_addr = bulk_addr(addr)?;
-    let config = || rtp::udp::ConnectConfig {
-        handshake: false,
-        fec,
-        ..rtp::udp::ConnectConfig::default()
-    };
+    let config = rtp_connect_config(fec, handshake);
     let mut interactive = match socket {
         Some(socket) => {
-            rtp::udp::FrameDeliveryIo::connect_with_socket(socket, addr, config()).await?
+            rtp::udp::FrameDeliveryIo::connect_with_socket(socket, addr, config.clone()).await?
         }
-        None => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, config()).await?,
+        None => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, config.clone()).await?,
     };
     let interactive_local = interactive.local_addr;
     let probe_tap = interactive.probe_tap.take();
     let bulk =
-        rtp::udp::FrameDeliveryIo::connect(SocketAddr::new(bind_addr.ip(), 0), bulk_addr, config())
+        rtp::udp::FrameDeliveryIo::connect(SocketAddr::new(bind_addr.ip(), 0), bulk_addr, config)
             .await?;
     let nonce = PairingNonce::generate();
     // Keep the client lanes' rtp sessions alive for the whole mux connection;
@@ -248,4 +258,19 @@ async fn connect_dual_lane_once(
         probe_tap,
         traffic,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rtp_connect_config;
+
+    #[test]
+    fn rtp_connect_config_uses_requested_handshake_mode() {
+        let protected = rtp_connect_config(false, true);
+        assert!(protected.handshake);
+        assert!(!protected.fec);
+        let unprotected_fec = rtp_connect_config(true, false);
+        assert!(!unprotected_fec.handshake);
+        assert!(unprotected_fec.fec);
+    }
 }

@@ -55,6 +55,7 @@ pub struct RtpMuxServer {
     bulk_listener: rtp::udp::Listener,
     mux: JoinSet<MuxError>,
     fec: bool,
+    handshake: bool,
 }
 
 enum BirthHeartbeatFailure {
@@ -95,7 +96,17 @@ impl RtpMuxServer {
             bulk_listener,
             mux: JoinSet::new(),
             fec,
+            handshake: true,
         }
+    }
+
+    /// Toggle the RTP opening handshake for this server instance (enabled by
+    /// default).  The peer connector must use the matching mode: a mismatch
+    /// is a deployment error that times out — never negotiated, retried
+    /// without a handshake, or silently downgraded.
+    pub fn with_handshake(mut self, handshake: bool) -> Self {
+        self.handshake = handshake;
+        self
     }
 
     pub fn listener(&self) -> &rtp::udp::Listener {
@@ -153,6 +164,16 @@ impl RtpMuxServer {
         let mut bulk_backoff = AcceptErrorBackoff::default();
         let mut rejection_log = rejection_log_ticker();
         let mut expiry: JoinSet<()> = JoinSet::new();
+        // Handshake-accept tasks.  Each polled connection yields an unspawned
+        // `FrameDeliveryAccept` that performs the (optional) RTP opening
+        // handshake and session setup; it must never be awaited inline in the
+        // accept loop, because polling `next_conn` is what dispatches the
+        // client's later Confirm datagram — an inline await deadlocks every
+        // handshaked lane.  Scoped to this function: dropping the server
+        // aborts every pending handshake.  Established lanes still live in
+        // `self.mux`; no channel, semaphore, or other sync primitive.
+        let mut rtp_accepts: JoinSet<(io::Result<rtp::udp::FrameDeliveryIo>, LaneClass)> =
+            JoinSet::new();
         {
             let registry = Arc::clone(&registry);
             let rejections = rejections.clone();
@@ -181,11 +202,52 @@ impl RtpMuxServer {
                     // sessions ended); re-raise any panic it surfaced.
                 }
                 _ = rejection_log.tick() => rejections.flush(),
-                result = self.interactive_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
-                    handle_lane_accept(result, &handler, &registry, &groups, &rejections, &session_spawner, &mut self.mux, HandleLaneAcceptConfig { backoff: &mut interactive_backoff, backoff_name: "rtp_mux_interactive", addr, lane: LaneClass::Interactive }).await?;
+                Some(joined) = rtp_accepts.join_next() => {
+                    // Reap a finished handshake-accept task.  Unwrap the
+                    // JoinError so a panicked handshake task cascades.
+                    let (accept, lane) = joined.unwrap();
+                    let (backoff, backoff_name, local_addr) = match lane {
+                        LaneClass::Interactive => {
+                            (&mut interactive_backoff, "rtp_mux_interactive", addr)
+                        }
+                        LaneClass::Bulk => (&mut bulk_backoff, "rtp_mux_bulk", bulk_addr),
+                    };
+                    handle_lane_accept(
+                        accept,
+                        &handler,
+                        &registry,
+                        &groups,
+                        &rejections,
+                        &session_spawner,
+                        &mut self.mux,
+                        HandleLaneAcceptConfig {
+                            backoff,
+                            backoff_name,
+                            addr: local_addr,
+                            lane,
+                        },
+                    )
+                    .await?;
                 }
-                result = self.bulk_listener.accept_frame_delivery(rtp::udp::AcceptConfig { fec: self.fec, ..rtp::udp::AcceptConfig::default() }) => {
-                    handle_lane_accept(result, &handler, &registry, &groups, &rejections, &session_spawner, &mut self.mux, HandleLaneAcceptConfig { backoff: &mut bulk_backoff, backoff_name: "rtp_mux_bulk", addr: bulk_addr, lane: LaneClass::Bulk }).await?;
+                result = accept_rtp_frame_delivery(
+                    &self.interactive_listener,
+                    rtp::udp::AcceptConfig {
+                        fec: self.fec,
+                        ..rtp::udp::AcceptConfig::default()
+                    },
+                    self.handshake,
+                ) => {
+                    spawn_frame_delivery_accept(result, LaneClass::Interactive, &mut rtp_accepts);
+                }
+                result = accept_rtp_frame_delivery(
+                    &self.bulk_listener,
+                    rtp::udp::AcceptConfig {
+                        fec: self.fec,
+                        ..rtp::udp::AcceptConfig::default()
+                    },
+                    self.handshake,
+                ) => {
+                    spawn_frame_delivery_accept(result, LaneClass::Bulk, &mut rtp_accepts);
                 }
             }
         }
@@ -196,6 +258,33 @@ fn rejection_log_ticker() -> tokio::time::Interval {
     let mut ticker = tokio::time::interval(ADMISSION_REJECTION_LOG_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker
+}
+
+/// Poll `listener` for the next connection and select the handshake mode:
+/// the protected path runs the RTP opening handshake inside the returned
+/// unspawned accept future; the unprotected path skips it.  Both RTP lanes
+/// share the one per-server handshake setting.
+async fn accept_rtp_frame_delivery(
+    listener: &rtp::udp::Listener,
+    config: rtp::udp::AcceptConfig,
+    handshake: bool,
+) -> io::Result<rtp::udp::FrameDeliveryAccept> {
+    if handshake {
+        listener.accept_frame_delivery_with_handshake(config).await
+    } else {
+        listener.accept_frame_delivery(config).await
+    }
+}
+
+/// Hand the polled connection's unspawned accept future to the server-owned
+/// reap set, tagged with its lane class, so the accept loop never awaits the
+/// handshake inline.
+fn spawn_frame_delivery_accept(
+    accept: io::Result<rtp::udp::FrameDeliveryAccept>,
+    lane: LaneClass,
+    accepts: &mut JoinSet<(io::Result<rtp::udp::FrameDeliveryIo>, LaneClass)>,
+) {
+    accepts.spawn(async move { (finish_frame_delivery_accept(accept).await, lane) });
 }
 
 async fn finish_frame_delivery_accept(
@@ -217,7 +306,7 @@ struct HandleLaneAcceptConfig<'a> {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_lane_accept(
-    accept: io::Result<rtp::udp::FrameDeliveryAccept>,
+    accept: io::Result<rtp::udp::FrameDeliveryIo>,
     handler: &Handler,
     registry: &Arc<PendingLaneRegistry>,
     groups: &Arc<SessionPairRegistry>,
@@ -232,7 +321,7 @@ async fn handle_lane_accept(
         addr,
         lane,
     } = config;
-    let stream = match finish_frame_delivery_accept(accept).await {
+    let stream = match accept {
         Ok(stream) => {
             backoff.accepted(backoff_name, addr);
             stream

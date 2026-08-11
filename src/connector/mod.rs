@@ -47,6 +47,7 @@ pub struct RtpMuxConnectorConfig {
     pub bind: BindSelector,
     pub bulk_addr: BulkAddrSelector,
     pub fec: bool,
+    pub handshake: bool,
     pub explorer: ExplorerConfig,
 }
 
@@ -56,8 +57,18 @@ impl RtpMuxConnectorConfig {
             bind,
             bulk_addr: Arc::new(crate::shared::bulk_lane_addr),
             fec,
+            handshake: true,
             explorer: ExplorerConfig::default(),
         }
+    }
+
+    /// Toggle the RTP opening handshake for this connector instance (enabled
+    /// by default).  The peer server must use the matching mode: a mismatch
+    /// is a deployment error that times out — never negotiated, retried
+    /// without a handshake, or silently downgraded.
+    pub fn with_handshake(mut self, handshake: bool) -> Self {
+        self.handshake = handshake;
+        self
     }
 }
 
@@ -203,6 +214,7 @@ impl RtpMuxConnector {
             bind,
             bulk_addr,
             fec,
+            handshake,
             explorer,
         } = config;
         let explorer = explorer.enabled.then(|| ExplorerContext {
@@ -212,9 +224,9 @@ impl RtpMuxConnector {
         let dialer: DualLaneDialer = Arc::new(move |addr, group, socket| {
             let bind = Arc::clone(&bind);
             let bulk_addr = Arc::clone(&bulk_addr);
-            Box::pin(
-                async move { connect_dual_lane(addr, bind, bulk_addr, fec, group, socket).await },
-            )
+            Box::pin(async move {
+                connect_dual_lane(addr, bind, bulk_addr, fec, handshake, group, socket).await
+            })
         });
         Self::with_dialer_and_explorer(dialer, explorer)
     }
