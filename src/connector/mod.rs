@@ -167,6 +167,7 @@ impl std::fmt::Debug for RtpMuxConnector {
 /// actively-reaped `JoinSet` so its termination is observed and its drop
 /// aborts the connector task. The handle alone holds no task and is safe
 /// to share by `Arc`; it is inert until the driver is spawned.
+#[must_use = "the RTP mux connector driver must be spawned into an actively-reaped task scope"]
 pub struct RtpMuxConnectorDriver {
     inner: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
 }
@@ -372,16 +373,34 @@ fn spawn_session_watcher(
     session_id: u64,
     mut supervisor: JoinSet<MuxError>,
     mut kill_rx: tokio::sync::mpsc::Receiver<()>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     supervisors.spawn(async move {
         let error = tokio::select! {
-            result = supervisor.join_next() => dual_supervisor_result(result),
+            result = supervisor.join_next() => {
+                // The mux session ended: finish with the first result and
+                // abort/reap every sibling so a racing panic still crosses
+                // the boundary instead of being hidden by a JoinSet drop.
+                crate::task_scope::finish_with_first(&mut supervisor, result)
+                    .await
+                    .unwrap_or(MuxError::TaskStopped { task: "dual_lane" })
+            }
             kill = kill_rx.recv() => {
                 if kill.is_none() {
                     tokio::time::sleep(SESSION_LINGER).await;
                 }
+                crate::task_scope::abort_and_reap(&mut supervisor).await;
                 MuxError::TaskStopped {
                     task: "dual_lane_redialed",
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                // Connector final exit: drain the session's mux supervisor
+                // (abort children, reap panics) instead of letting its drop
+                // epilog hide completed values.
+                crate::task_scope::abort_and_reap(&mut supervisor).await;
+                MuxError::TaskStopped {
+                    task: "connector_shutdown",
                 }
             }
         };
@@ -395,6 +414,7 @@ fn install_session(
     groups: &mut HashMap<SocketAddr, AddrGroup>,
     supervisors: &mut JoinSet<(SocketAddr, u64, MuxError)>,
     router_driver: &mut mux::ResponseRouterDriver,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> Arc<Session> {
     let ConnectedDualLaneBirth {
         opener,
@@ -440,7 +460,14 @@ fn install_session(
         streams: Mutex::new(Vec::new()),
         successor: Mutex::new(None),
     });
-    spawn_session_watcher(supervisors, addr, session.id, supervisor, kill_rx);
+    spawn_session_watcher(
+        supervisors,
+        addr,
+        session.id,
+        supervisor,
+        kill_rx,
+        shutdown_rx.clone(),
+    );
     let group = groups
         .get_mut(&addr)
         .expect("dial started without an address group");
@@ -478,6 +505,7 @@ async fn run_connector(
 ) {
     let mut supervisors: JoinSet<(SocketAddr, u64, MuxError)> = JoinSet::new();
     let mut router_driver: mux::ResponseRouterDriver = mux::ResponseRouterDriver::new();
+    let (watcher_shutdown, watcher_shutdown_rx) = tokio::sync::watch::channel(false);
     let mut pending_dials: FuturesUnordered<DualLaneDial> = FuturesUnordered::new();
     let mut in_flight_dials: HashSet<SocketAddr> = HashSet::new();
     let mut dial_waiters: HashMap<SocketAddr, Vec<StreamRequest>> = HashMap::new();
@@ -558,7 +586,14 @@ async fn run_connector(
                         if let Some(explorer) = explorers.get_mut(&addr) {
                             explorer.set_active(probe_tap.map(|tap| (Box::new(tap) as Box<dyn ProbeIo>, birth.local_addr)), Instant::now());
                         }
-                        let session = install_session(addr, birth, &mut groups, &mut supervisors, &mut router_driver);
+                        let session = install_session(
+                            addr,
+                            birth,
+                            &mut groups,
+                            &mut supervisors,
+                            &mut router_driver,
+                            &watcher_shutdown_rx,
+                        );
                         if let Some(RedialInFlight { old, trigger, verdict }) = &redialed_old {
                             let moved = rebind_streams(old, &session);
                             info!(up = ?old.addr.peer_addr, up_local = ?old.addr.local_addr, new_local = ?session.addr.local_addr, trigger = trigger.as_str(), rule = verdict.and_then(|v| v.rule()).map(MigrationRule::as_str), self_rtt = ?verdict.and_then(|v| v.active()).map(|s| s.rtt), self_loss = verdict.and_then(|v| v.active()).map(|s| s.loss), best_rtt = ?verdict.and_then(|v| v.best()).map(|s| s.rtt), best_loss = verdict.and_then(|v| v.best()).map(|s| s.loss), old_mux = %old.stats(), migrated_streams = moved, "RTP mux session redialed");
@@ -587,8 +622,7 @@ async fn run_connector(
             }
             command = commands.recv() => {
                 let Some(command) = command else { break };
-                match command {
-                    ConnectorCommand::Reset { completed } => {
+                match command {                    ConnectorCommand::Reset { completed } => {
                         let sessions_to_kill: Vec<_> = sessions
                             .lock()
                             .unwrap()
@@ -613,6 +647,7 @@ async fn run_connector(
                         redials.clear();
                         groups.clear();
                         explorers.clear();
+                        router_driver.shutdown().await;
                         router_driver = mux::ResponseRouterDriver::new();
                         let _ = completed.send(());
                     }
@@ -665,6 +700,15 @@ async fn run_connector(
                 }
             }
         }
+    }
+    // Final exit: signal the session watchers so each drains its own mux
+    // supervisor, reap every response-router child, then drain the watchers
+    // themselves so no completed session value, error, or panic is hidden by
+    // a JoinSet drop.
+    watcher_shutdown.send_replace(true);
+    router_driver.shutdown().await;
+    while let Some(joined) = supervisors.join_next().await {
+        joined.unwrap();
     }
 }
 
@@ -966,12 +1010,14 @@ mod tests {
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();
         let mut router_driver = mux::ResponseRouterDriver::new();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let dead = install_session(
             addr,
             fake_dead_birth().await,
             &mut groups,
             &mut supervisors,
             &mut router_driver,
+            &shutdown_rx,
         );
         let dead_id = dead.id;
         sessions.lock().unwrap().insert(addr, dead);

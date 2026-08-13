@@ -174,6 +174,24 @@ async fn connect_dual_lane_once(
     let mut interactive_writer = interactive.write;
     let bulk_reader = bulk.read;
     let mut bulk_writer = bulk.write;
+    // Hold each lane's rtp session for the life of the mux connection.  The
+    // watchers are spawned before the lane hellos so the sessions are
+    // supervised (and reaped) even when a hello fails; they await (not
+    // detach) so an rtp-session end exits the task and the supervisor reaps
+    // it.
+    let mut supervisor = JoinSet::new();
+    supervisor.spawn(async move {
+        interactive_rtp_supervisor.await;
+        MuxError::TaskStopped {
+            task: "interactive_rtp_supervisor",
+        }
+    });
+    supervisor.spawn(async move {
+        bulk_rtp_supervisor.await;
+        MuxError::TaskStopped {
+            task: "bulk_rtp_supervisor",
+        }
+    });
     if let Err(error) = mux::write_lane_hello(
         &mut interactive_writer,
         LaneClass::Interactive,
@@ -182,6 +200,7 @@ async fn connect_dual_lane_once(
     )
     .await
     {
+        crate::task_scope::abort_and_reap(&mut supervisor).await;
         return Err(io::Error::other(format!(
             "interactive lane hello: {error:?}"
         )));
@@ -189,6 +208,7 @@ async fn connect_dual_lane_once(
     if let Err(error) = mux::write_lane_hello(&mut bulk_writer, LaneClass::Bulk, nonce, group).await
     {
         let _ = interactive_writer.send_kill_and_abort().await;
+        crate::task_scope::abort_and_reap(&mut supervisor).await;
         return Err(io::Error::other(format!("bulk lane hello: {error:?}")));
     }
     let traffic = Arc::new(SessionByteCounters::default());
@@ -214,7 +234,6 @@ async fn connect_dual_lane_once(
             BIRTH_LIVENESS_DEADLINE,
             &mut bulk_tasks,
         );
-    let mut supervisor = JoinSet::new();
     let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
         interactive_opener,
         interactive_accepter,
@@ -226,35 +245,40 @@ async fn connect_dual_lane_once(
     );
     let birth_deadline = tokio::time::sleep(BIRTH_LIVENESS_DEADLINE + BIRTH_LIVENESS_GRACE);
     tokio::pin!(birth_deadline);
-    tokio::select! {
-        biased;
-        result = supervisor.join_next() => { let error = dual_supervisor_result(result); return Err(io::Error::new(io::ErrorKind::BrokenPipe, format!("dual-lane birth liveness failed: {error:?}"))); }
-        ready = async { tokio::try_join!(interactive_ready, bulk_ready) } => { if ready.is_err() { return Err(io::Error::new(io::ErrorKind::BrokenPipe, "dual-lane birth readiness channel closed")); } }
-        () = &mut birth_deadline => { return Err(io::Error::new(io::ErrorKind::TimedOut, "dual-lane birth liveness deadline exceeded")); }
+    // The liveness race: whichever arm fires first selects the failure.  The
+    // supervisor is aborted and reaped exactly once, after the winner is
+    // known, so a racing sibling panic still crosses the boundary.
+    let failure = tokio::select! {
+        result = supervisor.join_next() => Some((
+            io::ErrorKind::BrokenPipe,
+            format!(
+                "dual-lane birth liveness failed: {:?}",
+                dual_supervisor_result(result)
+            ),
+        )),
+        ready = async { tokio::try_join!(interactive_ready, bulk_ready) } => {
+            ready.err().map(|_| (
+                io::ErrorKind::BrokenPipe,
+                "dual-lane birth readiness channel closed".to_owned(),
+            ))
+        },
+        () = &mut birth_deadline => {
+            Some((
+                io::ErrorKind::TimedOut,
+                "dual-lane birth liveness deadline exceeded".to_owned(),
+            ))
+        },
+    };
+    if let Some((kind, message)) = failure {
+        crate::task_scope::abort_and_reap(&mut supervisor).await;
+        return Err(io::Error::new(kind, message));
     }
     Ok(ConnectedDualLaneBirth {
         opener,
         accepter,
         local_addr: interactive_local,
         nonce,
-        supervisor: {
-            // Hold each lane's rtp session for the life of the mux connection.
-            // They are awaited (not detached): when the rtp session ends the
-            // task exits and the supervisor JoinSet reaps it.
-            supervisor.spawn(async move {
-                let _ = interactive_rtp_supervisor.await;
-                MuxError::TaskStopped {
-                    task: "interactive_rtp_supervisor",
-                }
-            });
-            supervisor.spawn(async move {
-                let _ = bulk_rtp_supervisor.await;
-                MuxError::TaskStopped {
-                    task: "bulk_rtp_supervisor",
-                }
-            });
-            supervisor
-        },
+        supervisor,
         probe_tap,
         traffic,
     })

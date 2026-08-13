@@ -217,12 +217,14 @@ mod tests {
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();
         let mut router_driver = mux::ResponseRouterDriver::new();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let old = install_session(
             addr,
             fake_connected_birth(addr, None),
             &mut groups,
             &mut supervisors,
             &mut router_driver,
+            &shutdown_rx,
         );
         let dead = install_session(
             addr,
@@ -230,6 +232,7 @@ mod tests {
             &mut groups,
             &mut supervisors,
             &mut router_driver,
+            &shutdown_rx,
         );
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
         let _stream = StreamRebind::track(slot.handle(), old.guard());
@@ -254,6 +257,7 @@ mod tests {
             &mut groups,
             &mut supervisors,
             &mut router_driver,
+            &shutdown_rx,
         );
         assert_eq!(rebind_streams(&old, &live), 1);
         assert!(slot.take().is_some());
@@ -265,12 +269,14 @@ mod tests {
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();
         let mut router_driver = mux::ResponseRouterDriver::new();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let old = install_session(
             addr,
             fake_connected_birth(addr, None),
             &mut groups,
             &mut supervisors,
             &mut router_driver,
+            &shutdown_rx,
         );
         let dead = install_session(
             addr,
@@ -278,6 +284,7 @@ mod tests {
             &mut groups,
             &mut supervisors,
             &mut router_driver,
+            &shutdown_rx,
         );
         *old.successor.lock().unwrap() = Some(Arc::clone(&dead));
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
@@ -300,12 +307,14 @@ mod tests {
         let mut groups = one_address_group(addr);
         let mut supervisors = JoinSet::new();
         let mut router_driver = mux::ResponseRouterDriver::new();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let old = install_session(
             addr,
             fake_connected_birth(addr, None),
             &mut groups,
             &mut supervisors,
             &mut router_driver,
+            &shutdown_rx,
         );
         let new = install_session(
             addr,
@@ -313,6 +322,7 @@ mod tests {
             &mut groups,
             &mut supervisors,
             &mut router_driver,
+            &shutdown_rx,
         );
         let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
         let held = old.streams.lock().unwrap();

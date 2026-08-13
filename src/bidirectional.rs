@@ -17,7 +17,6 @@ pub struct BidirectionalSession {
     addr: SocketAddrPair,
     driver: BidirectionalSessionDriver,
 }
-
 impl BidirectionalSession {
     pub(crate) fn new(
         opener: DualStreamOpener,
@@ -49,15 +48,16 @@ impl BidirectionalSession {
     }
 }
 
+#[must_use = "the bidirectional RTP mux session driver must be awaited or spawned into an actively-reaped task scope"]
 pub struct BidirectionalSessionDriver(Pin<Box<dyn Future<Output = MuxError> + Send + 'static>>);
 
 impl BidirectionalSessionDriver {
     fn new(mut supervisor: JoinSet<MuxError>) -> Self {
         Self(Box::pin(async move {
-            match supervisor.join_next().await {
-                Some(result) => result.unwrap(),
-                None => MuxError::TaskStopped { task: "dual_lane" },
-            }
+            let first = supervisor.join_next().await;
+            crate::task_scope::finish_with_first(&mut supervisor, first)
+                .await
+                .unwrap_or(MuxError::TaskStopped { task: "dual_lane" })
         }))
     }
 }

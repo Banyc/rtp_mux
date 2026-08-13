@@ -14,6 +14,7 @@ mod server;
 mod session;
 mod shared;
 mod stream;
+mod task_scope;
 
 pub use bidirectional::{
     BidirectionalSession, BidirectionalSessionDriver, connect_bidirectional_session,
