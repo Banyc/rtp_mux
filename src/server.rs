@@ -123,8 +123,25 @@ impl RtpMuxServer {
         session_spawner: SessionSpawner,
         handler: impl Fn(ServerStream) + Send + Sync + 'static,
     ) -> Result<(), ServeError> {
-        self.serve_with_handler(session_spawner, Handler::Streams(Arc::new(handler)))
+        self.serve_with_handler(session_spawner, Handler::Streams(Arc::new(handler)), None)
             .await
+    }
+
+    /// Serve with a cooperative shutdown signal; see
+    /// [`RtpMuxServer::serve_sessions_with_shutdown`].
+    #[instrument(skip_all)]
+    pub async fn serve_with_shutdown(
+        self,
+        session_spawner: SessionSpawner,
+        handler: impl Fn(ServerStream) + Send + Sync + 'static,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), ServeError> {
+        self.serve_with_handler(
+            session_spawner,
+            Handler::Streams(Arc::new(handler)),
+            Some(shutdown_rx),
+        )
+        .await
     }
 
     /// Serve fully paired sessions while leaving both stream directions under
@@ -135,14 +152,34 @@ impl RtpMuxServer {
         session_spawner: SessionSpawner,
         handler: impl Fn(BidirectionalSession) + Send + Sync + 'static,
     ) -> Result<(), ServeError> {
-        self.serve_with_handler(session_spawner, Handler::Sessions(Arc::new(handler)))
+        self.serve_with_handler(session_spawner, Handler::Sessions(Arc::new(handler)), None)
             .await
+    }
+
+    /// Serve fully paired sessions with a cooperative shutdown signal.  When
+    /// `shutdown_rx` observes `true`, the server stops admitting lanes,
+    /// reaps every nested scope (pending handshakes, mux sessions, expiry,
+    /// group drivers), and returns.
+    #[instrument(skip_all)]
+    pub async fn serve_sessions_with_shutdown(
+        self,
+        session_spawner: SessionSpawner,
+        handler: impl Fn(BidirectionalSession) + Send + Sync + 'static,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), ServeError> {
+        self.serve_with_handler(
+            session_spawner,
+            Handler::Sessions(Arc::new(handler)),
+            Some(shutdown_rx),
+        )
+        .await
     }
 
     async fn serve_with_handler(
         mut self,
         session_spawner: SessionSpawner,
         handler: Handler,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(), ServeError> {
         let addr = self.interactive_listener.local_addr();
         let bulk_addr = self.bulk_listener.local_addr();
@@ -152,12 +189,8 @@ impl RtpMuxServer {
             "Listening (interactive + bulk dual-lane)"
         );
         let registry = PendingLaneRegistry::new();
-        let (group_drivers, group_drivers_scope) =
+        let (group_drivers, mut group_drivers_scope) =
             crate::group::group_driver_scope(GROUP_DRIVER_CHANNEL_BOUND);
-        let crate::group::GroupDriverScope {
-            mut submissions,
-            mut drivers,
-        } = group_drivers_scope;
         let groups = SessionPairRegistry::new(group_drivers);
         let rejections = LaneRejectionLog::default();
         let mut interactive_backoff = AcceptErrorBackoff::default();
@@ -181,7 +214,16 @@ impl RtpMuxServer {
                 run_pending_lane_expiry(registry, rejections).await;
             });
         }
-        loop {
+        // Cooperative shutdown: pin the shutdown future (when supplied) and
+        // select it alongside the serving arms.  serve/serve_sessions pass
+        // None so the arm is disabled entirely.
+        let shutdown_future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            match shutdown_rx {
+                Some(shutdown_rx) => Box::pin(wait_for_shutdown(shutdown_rx)),
+                None => Box::pin(std::future::pending()),
+            };
+        tokio::pin!(shutdown_future);
+        let selected: Result<(), ServeError> = loop {
             trace!("Waiting for RTP mux Lane");
             tokio::select! {
                 Some(result) = self.mux.join_next() => {
@@ -192,12 +234,17 @@ impl RtpMuxServer {
                 }
                 Some(joined) = expiry.join_next() => {
                     joined.unwrap();
-                    return Err(ServeError::ExpiryWorkerStopped { addr });
+                    break Err(ServeError::ExpiryWorkerStopped { addr });
                 }
-                Some(driver) = submissions.recv() => {
-                    crate::group::GroupDriverScope::submit_driver_into(&mut drivers, driver);
+                Some(driver) = group_drivers_scope.submissions.recv() => {
+                    let shutdown_rx = group_drivers_scope.subscribe_shutdown();
+                    crate::group::GroupDriverScope::submit_driver_into(
+                        &mut group_drivers_scope.drivers,
+                        driver,
+                        shutdown_rx,
+                    );
                 }
-                Some(()) = crate::group::GroupDriverScope::reap_driver_from(&mut drivers) => {
+                Some(()) = crate::group::GroupDriverScope::reap_driver_from(&mut group_drivers_scope.drivers) => {
                     // A driver-drain future completing is normal (the group's
                     // sessions ended); re-raise any panic it surfaced.
                 }
@@ -212,7 +259,7 @@ impl RtpMuxServer {
                         }
                         LaneClass::Bulk => (&mut bulk_backoff, "rtp_mux_bulk", bulk_addr),
                     };
-                    handle_lane_accept(
+                    match handle_lane_accept(
                         accept,
                         &handler,
                         &registry,
@@ -227,7 +274,11 @@ impl RtpMuxServer {
                             lane,
                         },
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(error) => break Err(error),
+                    }
                 }
                 result = accept_rtp_frame_delivery(
                     &self.interactive_listener,
@@ -249,7 +300,32 @@ impl RtpMuxServer {
                 ) => {
                     spawn_frame_delivery_accept(result, LaneClass::Bulk, &mut rtp_accepts);
                 }
+                _ = &mut shutdown_future => {
+                    info!(?addr, ?bulk_addr, "RTP mux server shutting down cooperatively");
+                    break Ok(());
+                }
             }
+        };
+        // Cooperative epilog: stop admitting lanes and reap every nested
+        // scope before returning so no child value, error, or panic is
+        // hidden by a JoinSet drop.
+        crate::task_scope::abort_and_reap(&mut rtp_accepts).await;
+        crate::task_scope::abort_and_reap(&mut self.mux).await;
+        crate::task_scope::abort_and_reap(&mut expiry).await;
+        drop(groups);
+        group_drivers_scope.shutdown().await;
+        rejections.flush();
+        selected
+    }
+}
+
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
         }
     }
 }

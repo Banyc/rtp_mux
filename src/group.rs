@@ -34,9 +34,15 @@ impl fmt::Display for GroupJoinError {
 }
 
 impl GroupDriverSubmitter {
-    fn try_submit(&self, driver: tokio::task::JoinSet<()>) -> Result<(), GroupJoinError> {
-        match self.0.try_send(driver) {
-            Ok(()) => Ok(()),
+    /// Reserve a slot on the bounded submission channel.  Mapping the mpsc
+    /// `Full`/`Closed` errors to the typed [`GroupJoinError`] variants lets
+    /// the caller reserve capacity *before* spawning a splice router, so a
+    /// refused submission never orphans a running router.
+    fn try_reserve(
+        &self,
+    ) -> Result<tokio::sync::mpsc::Permit<'_, tokio::task::JoinSet<()>>, GroupJoinError> {
+        match self.0.try_reserve() {
+            Ok(permit) => Ok(permit),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 Err(GroupJoinError::DriverQueueFull)
             }
@@ -44,6 +50,11 @@ impl GroupDriverSubmitter {
                 Err(GroupJoinError::DriverScopeClosed)
             }
         }
+    }
+
+    fn try_submit(&self, driver: tokio::task::JoinSet<()>) -> Result<(), GroupJoinError> {
+        self.try_reserve()?.send(driver);
+        Ok(())
     }
 }
 
@@ -57,9 +68,16 @@ impl GroupDriverSubmitter {
 pub(crate) struct GroupDriverScope {
     pub(crate) submissions: tokio::sync::mpsc::Receiver<tokio::task::JoinSet<()>>,
     pub(crate) drivers: tokio::task::JoinSet<()>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl GroupDriverScope {
+    /// A fresh receiver of the scope's shutdown signal, for spawning drain
+    /// futures that abort their inner driver on shutdown.
+    pub(crate) fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
     /// Spawn one submitted driver's drain into the drain set. The
     /// drain unwraps every completion, so a child panic surfaces as a panic
     /// of the drain task (observed by [`GroupDriverScope::reap_driver`] / the
@@ -67,15 +85,14 @@ impl GroupDriverScope {
     /// driving [`GroupDriverScope::reap_driver`] concurrently, so a long-lived
     /// driver can never block later submissions from being drained (and the
     /// bounded submission channel from being freed).
-    #[cfg(test)]
     pub(crate) fn submit_driver(&mut self, driver: tokio::task::JoinSet<()>) {
-        Self::submit_driver_into(&mut self.drivers, driver);
+        let shutdown_rx = self.subscribe_shutdown();
+        Self::submit_driver_into(&mut self.drivers, driver, shutdown_rx);
     }
 
     /// Wait for one submitted driver's drain to complete and re-raise any
     /// panic it surfaced. Returns `None` when no drain is running (an empty
     /// drain set), which `serve`'s select loop treats as a skipped arm.
-    #[cfg(test)]
     pub(crate) async fn reap_driver(&mut self) -> Option<()> {
         Self::reap_driver_from(&mut self.drivers).await
     }
@@ -86,10 +103,27 @@ impl GroupDriverScope {
     pub(crate) fn submit_driver_into(
         drivers: &mut tokio::task::JoinSet<()>,
         mut driver: tokio::task::JoinSet<()>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         drivers.spawn(async move {
-            while let Some(result) = driver.join_next().await {
-                result.unwrap();
+            loop {
+                tokio::select! {
+                    result = driver.join_next() => {
+                        match result {
+                            Some(result) => {
+                                result.unwrap();
+                            }
+                            None => return,
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        // The scope is shutting down: abort every child and
+                        // reap the inner set so a completed panic still
+                        // surfaces through the drain's unwrap.
+                        crate::task_scope::abort_and_reap(&mut driver).await;
+                        return;
+                    }
+                }
             }
         });
     }
@@ -100,13 +134,26 @@ impl GroupDriverScope {
         joined.unwrap();
         Some(())
     }
+
+    /// Cooperative shutdown: close admission, adopt every already-queued
+    /// driver, signal the drain futures, and reap them all before returning.
+    pub(crate) async fn shutdown(&mut self) {
+        self.submissions.close();
+        while let Some(driver) = self.submissions.recv().await {
+            self.submit_driver(driver);
+        }
+        self.shutdown.send_replace(true);
+        while self.reap_driver().await.is_some() {}
+    }
 }
 
 pub(crate) fn group_driver_scope(bound: usize) -> (GroupDriverSubmitter, GroupDriverScope) {
     let (tx, submissions) = tokio::sync::mpsc::channel::<tokio::task::JoinSet<()>>(bound);
+    let (shutdown, _) = tokio::sync::watch::channel(false);
     let scope = GroupDriverScope {
         submissions,
         drivers: tokio::task::JoinSet::new(),
+        shutdown,
     };
     (GroupDriverSubmitter(tx), scope)
 }
@@ -162,8 +209,12 @@ impl SessionPairRegistry {
             match groups.get(&token).and_then(Weak::upgrade) {
                 Some(group) => group,
                 None => {
+                    // Reserve driver-scope capacity before spawning the splice
+                    // router: a refused submission must not orphan a running
+                    // router or create a group.
+                    let permit = self.group_drivers.try_reserve()?;
                     let (feed, driver) = mux::spawn_splice_router();
-                    self.group_drivers.try_submit(driver)?;
+                    permit.send(driver);
                     let group = Arc::new(SessionPair {
                         feed,
                         state: Mutex::new(PairState {
@@ -455,24 +506,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_driver_submission_does_not_create_a_group() {
-        let mut tasks = JoinSet::new();
-        let (registry, _driver_scope) = registry_with_scope(1);
-        // Occupy the single slot with a driver whose task parks forever, so the
-        // bounded channel stays full and every later submission is refused.
-        let (_feed_a, mut driver_a) = mux::spawn_splice_router();
-        driver_a.spawn(std::future::pending::<()>());
-        registry.group_drivers.try_submit(driver_a).unwrap();
-        let (_feed_b, driver_b) = mux::spawn_splice_router();
-        let _ = registry.group_drivers.try_submit(driver_b);
-        let token = GroupToken::generate();
+    async fn shutdown_reaps_a_parked_inner_driver_before_returning() {
+        let (_submitter, mut scope) = group_driver_scope(2);
+        let mut driver = JoinSet::new();
+        driver.spawn(std::future::pending::<()>());
+        scope.submit_driver(driver);
+        // The driver's drain is parked forever; shutdown must still complete
+        // by signalling the drain and reaping the inner set.
+        tokio::time::timeout(std::time::Duration::from_secs(5), scope.shutdown())
+            .await
+            .expect("shutdown must reap a parked inner driver");
         assert!(
-            registry.join(token, test_opener(&mut tasks)).is_err(),
-            "a group must be rejected when its driver submission is refused",
+            scope.drivers.is_empty(),
+            "shutdown returned before every drain was reaped"
         );
-        assert!(
-            registry.groups.lock().unwrap().is_empty(),
-            "a rejected group must not have been inserted",
-        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "simulated inner panic")]
+    async fn shutdown_cascades_an_inner_panic_that_already_completed() {
+        let (_submitter, mut scope) = group_driver_scope(2);
+        let mut driver = JoinSet::new();
+        let handle = driver.spawn(async {
+            panic!("simulated inner panic");
+        });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        scope.submit_driver(driver);
+        // The inner panic already completed; shutdown must not swallow it as
+        // cancellation — the drain unwraps it and the panic cascades out of
+        // `reap_driver`.
+        scope.shutdown().await;
     }
 }

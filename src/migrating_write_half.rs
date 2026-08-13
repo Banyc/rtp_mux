@@ -94,6 +94,7 @@ pub struct MigratingWriteHalf {
     background_error: Arc<Mutex<Option<BackgroundWriteError>>>,
     shutdown_started: bool,
     shutdown_complete: bool,
+    shutdown_result: Option<io::Result<()>>,
     name: mux::StreamName,
     /// Keeps the rebind wake channel's sender alive for the lifetime of the
     /// write half; never read directly.
@@ -197,6 +198,7 @@ impl MigratingWriteHalf {
             background_error,
             shutdown_started: false,
             shutdown_complete: false,
+            shutdown_result: None,
             name,
             rebind_guard: rebind,
             background_writer,
@@ -226,8 +228,13 @@ impl MigratingWriteHalf {
         };
         self.pending_control = None;
         if kind == ControlKind::Shutdown {
-            self.shutdown_complete = true;
             self.write_tx.close();
+            self.shutdown_result = Some(match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_io()),
+                Err(_) => Err(self.background_io_error("RTP mux background writer stopped")),
+            });
+            return Poll::Ready(Ok(Some(kind)));
         }
         match result {
             Ok(Ok(())) => Poll::Ready(Ok(Some(kind))),
@@ -341,39 +348,85 @@ impl MigratingWriteHalf {
         }
     }
     pub(crate) fn poll_shutdown_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.poll_pending_control(cx) {
-            Poll::Ready(Ok(Some(ControlKind::Shutdown))) => return Poll::Ready(Ok(())),
-            Poll::Ready(Ok(_)) => {}
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending => return Poll::Pending,
-        }
         if self.shutdown_complete {
             return Poll::Ready(Ok(()));
         }
-        if self.background_error.lock().unwrap().is_some() {
-            self.shutdown_complete = true;
-            return Poll::Ready(Err(self.background_io_error("background write error")));
+        if !self.shutdown_started {
+            if self.background_error.lock().unwrap().is_some() {
+                self.write_tx.close();
+                self.shutdown_result =
+                    Some(Err(self.background_io_error("background write error")));
+                return self.poll_shutdown_epilog(cx);
+            }
+            let (reply, response) = tokio::sync::oneshot::channel();
+            match self.write_tx.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    // Send Shutdown once: only count the shutdown as started
+                    // once the command is actually on the channel, so a
+                    // pending reserve is retried on the next poll.
+                    match self.write_tx.send_item(WriteCommand::Shutdown(reply)) {
+                        Ok(()) => {
+                            self.shutdown_started = true;
+                            self.pending_control = Some(PendingControl {
+                                kind: ControlKind::Shutdown,
+                                reply: response,
+                            });
+                            cx.waker().wake_by_ref();
+                        }
+                        Err(_) => {
+                            self.write_tx.close();
+                            self.shutdown_result = Some(Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "write channel closed during shutdown",
+                            )));
+                            return self.poll_shutdown_epilog(cx);
+                        }
+                    }
+                }
+                Poll::Ready(Err(_)) => {
+                    self.write_tx.close();
+                    self.shutdown_result = Some(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "write channel closed during shutdown",
+                    )));
+                    return self.poll_shutdown_epilog(cx);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
-        self.shutdown_started = true;
-        let (reply, response) = tokio::sync::oneshot::channel();
-        match self.write_tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let _ = self.write_tx.send_item(WriteCommand::Shutdown(reply));
-                self.pending_control = Some(PendingControl {
-                    kind: ControlKind::Shutdown,
-                    reply: response,
-                });
-                cx.waker().wake_by_ref();
-                Poll::Pending
+        match self.poll_pending_control(cx) {
+            Poll::Ready(Ok(Some(ControlKind::Shutdown))) => {}
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(error)) => {
+                self.write_tx.close();
+                self.shutdown_result = Some(Err(error));
+                return self.poll_shutdown_epilog(cx);
             }
-            Poll::Ready(Err(_)) => {
-                self.shutdown_complete = true;
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "write channel closed during shutdown",
-                )))
+            Poll::Pending => return Poll::Pending,
+        }
+        // The finalize reply is in (stored in `shutdown_result`); return only
+        // once the background writer task itself has fully ended.
+        self.poll_shutdown_epilog(cx)
+    }
+
+    /// Join the background writer: `AsyncWrite::poll_shutdown` must not
+    /// report completion while the writer task is still unwinding after it
+    /// sent its finalize reply.  Returns the stored finalize result only
+    /// after the `JoinSet` is empty.
+    fn poll_shutdown_epilog(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match Pin::new(&mut self.background_writer).poll_join_next(cx) {
+                Poll::Ready(Some(result)) => result.unwrap(),
+                Poll::Ready(None) => {
+                    self.shutdown_complete = true;
+                    return Poll::Ready(
+                        self.shutdown_result
+                            .take()
+                            .expect("shutdown epilog polled without a result"),
+                    );
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
