@@ -249,6 +249,7 @@ async fn connect_dual_lane_once(
     // supervisor is aborted and reaped exactly once, after the winner is
     // known, so a racing sibling panic still crosses the boundary.
     let failure = tokio::select! {
+        biased;
         result = supervisor.join_next() => Some((
             io::ErrorKind::BrokenPipe,
             format!(
