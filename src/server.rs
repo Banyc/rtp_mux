@@ -26,6 +26,7 @@ use crate::{
     },
     group::{PairMember, SessionPairRegistry},
     lane_rejection::{LaneRejectionClass, LaneRejectionLog, RejectedLaneContext},
+    lane_transport,
     session::SessionSpawner,
     shared::{ADMISSION_REJECTION_LOG_INTERVAL, HELLO_DEADLINE, bulk_lane_addr, server_mux_config},
     stream::{ServerStream, SocketAddrPair},
@@ -54,7 +55,10 @@ pub struct RtpMuxServer {
     interactive_listener: rtp::udp::Listener,
     bulk_listener: rtp::udp::Listener,
     mux: JoinSet<MuxError>,
-    fec: bool,
+    interactive_fec_tuning: rtp::FecTuning,
+    interactive_instream_group_fec: bool,
+    interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
+    bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     handshake: bool,
 }
 
@@ -79,23 +83,26 @@ pub enum ServeError {
 }
 
 impl RtpMuxServer {
-    pub async fn bind(addr: impl ToSocketAddrs + Clone + Debug, fec: bool) -> io::Result<Self> {
+    pub async fn bind(addr: impl ToSocketAddrs + Clone + Debug) -> io::Result<Self> {
         let interactive_listener = rtp::udp::Listener::bind(addr).await?;
         let bulk_addr = bulk_lane_addr(interactive_listener.local_addr())?;
         let bulk_listener = rtp::udp::Listener::bind(bulk_addr).await?;
-        Ok(Self::new(interactive_listener, bulk_listener, fec))
+        Ok(Self::new(interactive_listener, bulk_listener))
     }
 
     pub fn new(
         interactive_listener: rtp::udp::Listener,
         bulk_listener: rtp::udp::Listener,
-        fec: bool,
     ) -> Self {
+        let transport_defaults = rtp::udp::AcceptConfig::default();
         Self {
             interactive_listener,
             bulk_listener,
             mux: JoinSet::new(),
-            fec,
+            interactive_fec_tuning: transport_defaults.fec_tuning,
+            interactive_instream_group_fec: transport_defaults.instream_group_fec,
+            interactive_metrics_observer: None,
+            bulk_metrics_observer: None,
             handshake: true,
         }
     }
@@ -106,6 +113,32 @@ impl RtpMuxServer {
     /// without a handshake, or silently downgraded.
     pub fn with_handshake(mut self, handshake: bool) -> Self {
         self.handshake = handshake;
+        self
+    }
+
+    /// Attach the per-lane metrics observers: the interactive lane keeps its
+    /// own observer and the bulk lane keeps its own, independent of the
+    /// lane-aware FEC policy.
+    pub fn with_metrics_observers(
+        mut self,
+        interactive: Option<rtp::metrics::MetricsObserver>,
+        bulk: Option<rtp::metrics::MetricsObserver>,
+    ) -> Self {
+        self.interactive_metrics_observer = interactive;
+        self.bulk_metrics_observer = bulk;
+        self
+    }
+
+    /// Tune the interactive lane's FEC (the bulk lane stays FEC-free): the
+    /// tuning and in-stream group flag apply only to the interactive lane's
+    /// transport configuration.
+    pub fn with_interactive_fec_tuning(
+        mut self,
+        tuning: rtp::FecTuning,
+        instream_group_fec: bool,
+    ) -> Self {
+        self.interactive_fec_tuning = tuning;
+        self.interactive_instream_group_fec = instream_group_fec;
         self
     }
 
@@ -282,20 +315,24 @@ impl RtpMuxServer {
                 }
                 result = accept_rtp_frame_delivery(
                     &self.interactive_listener,
-                    rtp::udp::AcceptConfig {
-                        fec: self.fec,
-                        ..rtp::udp::AcceptConfig::default()
-                    },
+                    lane_transport::accept_config(
+                        self.interactive_fec_tuning,
+                        self.interactive_instream_group_fec,
+                        LaneClass::Interactive,
+                        self.interactive_metrics_observer.clone(),
+                    ),
                     self.handshake,
                 ) => {
                     spawn_frame_delivery_accept(result, LaneClass::Interactive, &mut rtp_accepts);
                 }
                 result = accept_rtp_frame_delivery(
                     &self.bulk_listener,
-                    rtp::udp::AcceptConfig {
-                        fec: self.fec,
-                        ..rtp::udp::AcceptConfig::default()
-                    },
+                    lane_transport::accept_config(
+                        self.interactive_fec_tuning,
+                        self.interactive_instream_group_fec,
+                        LaneClass::Bulk,
+                        self.bulk_metrics_observer.clone(),
+                    ),
                     self.handshake,
                 ) => {
                     spawn_frame_delivery_accept(result, LaneClass::Bulk, &mut rtp_accepts);

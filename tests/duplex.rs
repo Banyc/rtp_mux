@@ -20,7 +20,7 @@ const CHUNK: usize = 64 * 1024;
 #[tokio::test(flavor = "multi_thread")]
 async fn response_migration_end_to_end() {
     let mut scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0", false).await.unwrap();
+    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
     let addr = server.listener().local_addr();
     let saw_duplex = Arc::new(AtomicBool::new(false));
     let saw_duplex_handler = Arc::clone(&saw_duplex);
@@ -59,8 +59,7 @@ async fn response_migration_end_to_end() {
             .await;
     });
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
-    let (connector, driver) =
-        RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
+    let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind));
     scope.spawn_required("rtp_mux connector driver", driver);
     scope
         .run(async {

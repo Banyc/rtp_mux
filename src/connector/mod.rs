@@ -46,20 +46,41 @@ pub type BulkAddrSelector =
 pub struct RtpMuxConnectorConfig {
     pub bind: BindSelector,
     pub bulk_addr: BulkAddrSelector,
-    pub fec: bool,
+    pub interactive_fec_tuning: rtp::FecTuning,
+    pub interactive_instream_group_fec: bool,
+    pub interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
+    pub bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     pub handshake: bool,
     pub explorer: ExplorerConfig,
 }
 
 impl RtpMuxConnectorConfig {
-    pub fn standard(bind: BindSelector, fec: bool) -> Self {
+    pub fn standard(bind: BindSelector) -> Self {
+        let transport_defaults = rtp::udp::ConnectConfig::default();
         Self {
             bind,
             bulk_addr: Arc::new(crate::shared::bulk_lane_addr),
-            fec,
+            interactive_fec_tuning: transport_defaults.fec_tuning,
+            interactive_instream_group_fec: transport_defaults.instream_group_fec,
+            interactive_metrics_observer: None,
+            bulk_metrics_observer: None,
             handshake: true,
             explorer: ExplorerConfig::default(),
         }
+    }
+
+    /// Tune the interactive lane's FEC (the bulk lane stays FEC-free): the
+    /// tuning and in-stream group flag apply only to the interactive lane's
+    /// transport configuration; the bulk lane always disables ordinary FEC
+    /// and in-stream FEC.
+    pub fn with_interactive_fec_tuning(
+        mut self,
+        tuning: rtp::FecTuning,
+        instream_group_fec: bool,
+    ) -> Self {
+        self.interactive_fec_tuning = tuning;
+        self.interactive_instream_group_fec = instream_group_fec;
+        self
     }
 
     /// Toggle the RTP opening handshake for this connector instance (enabled
@@ -206,15 +227,18 @@ impl SessionView {
 }
 
 impl RtpMuxConnector {
-    pub fn new(bind: BindSelector, fec: bool) -> (Self, RtpMuxConnectorDriver) {
-        Self::with_config(RtpMuxConnectorConfig::standard(bind, fec))
+    pub fn new(bind: BindSelector) -> (Self, RtpMuxConnectorDriver) {
+        Self::with_config(RtpMuxConnectorConfig::standard(bind))
     }
 
     pub fn with_config(config: RtpMuxConnectorConfig) -> (Self, RtpMuxConnectorDriver) {
         let RtpMuxConnectorConfig {
             bind,
             bulk_addr,
-            fec,
+            interactive_fec_tuning,
+            interactive_instream_group_fec,
+            interactive_metrics_observer,
+            bulk_metrics_observer,
             handshake,
             explorer,
         } = config;
@@ -225,8 +249,22 @@ impl RtpMuxConnector {
         let dialer: DualLaneDialer = Arc::new(move |addr, group, socket| {
             let bind = Arc::clone(&bind);
             let bulk_addr = Arc::clone(&bulk_addr);
+            let interactive_metrics_observer = interactive_metrics_observer.clone();
+            let bulk_metrics_observer = bulk_metrics_observer.clone();
             Box::pin(async move {
-                connect_dual_lane(addr, bind, bulk_addr, fec, handshake, group, socket).await
+                connect_dual_lane(
+                    addr,
+                    bind,
+                    bulk_addr,
+                    interactive_fec_tuning,
+                    interactive_instream_group_fec,
+                    interactive_metrics_observer,
+                    bulk_metrics_observer,
+                    handshake,
+                    group,
+                    socket,
+                )
+                .await
             })
         });
         Self::with_dialer_and_explorer(dialer, explorer)

@@ -58,7 +58,10 @@ pub(crate) async fn connect_dual_lane(
     addr: SocketAddr,
     bind: BindSelector,
     bulk_addr: BulkAddrSelector,
-    fec: bool,
+    interactive_fec_tuning: rtp::FecTuning,
+    interactive_instream_group_fec: bool,
+    interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
+    bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     handshake: bool,
     group: GroupToken,
     socket: Option<tokio_udp::UdpSocket>,
@@ -69,7 +72,10 @@ pub(crate) async fn connect_dual_lane(
             addr,
             Arc::clone(&bind),
             Arc::clone(&bulk_addr),
-            fec,
+            interactive_fec_tuning,
+            interactive_instream_group_fec,
+            interactive_metrics_observer.clone(),
+            bulk_metrics_observer.clone(),
             handshake,
             group,
             socket.take(),
@@ -131,40 +137,52 @@ where
     ))
 }
 
-/// The rtp connection tuning shared by both RTP lanes of a dual-lane birth:
-/// the handshake toggle is per-connector-instance (no global or environment
-/// state) and must match the server's mode.
-fn rtp_connect_config(fec: bool, handshake: bool) -> rtp::udp::ConnectConfig<'static> {
-    rtp::udp::ConnectConfig {
-        handshake,
-        fec,
-        ..rtp::udp::ConnectConfig::default()
-    }
-}
-
 async fn connect_dual_lane_once(
     addr: SocketAddr,
     bind: BindSelector,
     bulk_addr: BulkAddrSelector,
-    fec: bool,
+    interactive_fec_tuning: rtp::FecTuning,
+    interactive_instream_group_fec: bool,
+    interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
+    bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     handshake: bool,
     group: GroupToken,
     socket: Option<tokio_udp::UdpSocket>,
 ) -> io::Result<ConnectedDualLaneBirth> {
     let bind_addr = bind(addr);
     let bulk_addr = bulk_addr(addr)?;
-    let config = rtp_connect_config(fec, handshake);
+    // Each lane builds its own transport config through the lane-aware
+    // policy; the interactive config is never reused for the bulk lane,
+    // which must stay FEC-free while keeping its own metrics observer.
+    let interactive_config = crate::lane_transport::connect_config(
+        interactive_fec_tuning,
+        interactive_instream_group_fec,
+        handshake,
+        LaneClass::Interactive,
+        interactive_metrics_observer,
+    );
+    let bulk_config = crate::lane_transport::connect_config(
+        interactive_fec_tuning,
+        interactive_instream_group_fec,
+        handshake,
+        LaneClass::Bulk,
+        bulk_metrics_observer,
+    );
     let mut interactive = match socket {
         Some(socket) => {
-            rtp::udp::FrameDeliveryIo::connect_with_socket(socket, addr, config.clone()).await?
+            rtp::udp::FrameDeliveryIo::connect_with_socket(socket, addr, interactive_config.clone())
+                .await?
         }
-        None => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, config.clone()).await?,
+        None => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, interactive_config).await?,
     };
     let interactive_local = interactive.local_addr;
     let probe_tap = interactive.probe_tap.take();
-    let bulk =
-        rtp::udp::FrameDeliveryIo::connect(SocketAddr::new(bind_addr.ip(), 0), bulk_addr, config)
-            .await?;
+    let bulk = rtp::udp::FrameDeliveryIo::connect(
+        SocketAddr::new(bind_addr.ip(), 0),
+        bulk_addr,
+        bulk_config,
+    )
+    .await?;
     let nonce = PairingNonce::generate();
     // Keep the client lanes' rtp sessions alive for the whole mux connection;
     // dropping their supervisors aborts those sessions.
@@ -283,19 +301,4 @@ async fn connect_dual_lane_once(
         probe_tap,
         traffic,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::rtp_connect_config;
-
-    #[test]
-    fn rtp_connect_config_uses_requested_handshake_mode() {
-        let protected = rtp_connect_config(false, true);
-        assert!(protected.handshake);
-        assert!(!protected.fec);
-        let unprotected_fec = rtp_connect_config(true, false);
-        assert!(!unprotected_fec.handshake);
-        assert!(unprotected_fec.fec);
-    }
 }

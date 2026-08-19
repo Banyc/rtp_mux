@@ -9,6 +9,7 @@ mod connector;
 mod explorer;
 mod group;
 mod lane_rejection;
+mod lane_transport;
 mod migrating_write_half;
 mod server;
 mod session;

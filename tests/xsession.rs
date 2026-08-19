@@ -30,7 +30,7 @@ const CMD_DOWNLOAD: u8 = b'D';
 const CMD_UPLOAD: u8 = b'U';
 
 async fn spawn_cmd_server(scope: &mut TestScope) -> SocketAddr {
-    let server = RtpMuxServer::bind("127.0.0.1:0", false).await.unwrap();
+    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
     let addr = server.listener().local_addr();
     // The serve loop and every future it spawns (session supervisors and
     // per-stream command handlers) are submitted through the bounded reaper,
@@ -107,8 +107,7 @@ async fn xsession_migration_end_to_end() {
     let mut scope = TestScope::new();
     let addr = spawn_cmd_server(&mut scope).await;
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
-    let (connector, driver) =
-        RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
+    let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind));
     scope.spawn_required("rtp_mux connector driver", driver);
     tokio::time::timeout(
         Duration::from_secs(120),

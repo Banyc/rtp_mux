@@ -98,9 +98,9 @@ async fn run_ping_pong(mut scope: TestScope, server: RtpMuxServer, config: RtpMu
 #[tokio::test(flavor = "multi_thread")]
 async fn listening_side_can_open_a_stream_to_the_dialing_side() {
     let scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0", false).await.unwrap();
+    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
-    run_ping_pong(scope, server, RtpMuxConnectorConfig::standard(bind, false)).await;
+    run_ping_pong(scope, server, RtpMuxConnectorConfig::standard(bind)).await;
 }
 
 /// Matching-disabled handshake mode still opens a full dual-lane session with
@@ -109,7 +109,7 @@ async fn listening_side_can_open_a_stream_to_the_dialing_side() {
 #[tokio::test(flavor = "multi_thread")]
 async fn matching_disabled_handshake_mode_opens_session() {
     let scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0", false)
+    let server = RtpMuxServer::bind("127.0.0.1:0")
         .await
         .unwrap()
         .with_handshake(false);
@@ -117,7 +117,7 @@ async fn matching_disabled_handshake_mode_opens_session() {
     run_ping_pong(
         scope,
         server,
-        RtpMuxConnectorConfig::standard(bind, false).with_handshake(false),
+        RtpMuxConnectorConfig::standard(bind).with_handshake(false),
     )
     .await;
 }
@@ -130,7 +130,7 @@ async fn matching_disabled_handshake_mode_opens_session() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mismatched_handshake_mode_does_not_open_session() {
     let mut scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0", false)
+    let server = RtpMuxServer::bind("127.0.0.1:0")
         .await
         .unwrap()
         .with_handshake(false);
@@ -156,7 +156,7 @@ async fn mismatched_handshake_mode_does_not_open_session() {
     // silently downgraded — the connect must time out.
     let outcome = tokio::time::timeout(
         Duration::from_secs(2),
-        connect_bidirectional_session(addr, RtpMuxConnectorConfig::standard(bind, false)),
+        connect_bidirectional_session(addr, RtpMuxConnectorConfig::standard(bind)),
     )
     .await;
     assert!(

@@ -14,7 +14,7 @@ const PAYLOAD: usize = 256 * 1024;
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_counts_its_streams_and_the_bytes_they_carried() {
     let mut scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0", false).await.unwrap();
+    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
     let addr = server.listener().local_addr();
     // The serve loop and every future it spawns (session supervisors and
     // per-stream echo handlers) are submitted through the bounded reaper, so
@@ -41,8 +41,7 @@ async fn a_session_counts_its_streams_and_the_bytes_they_carried() {
             .await;
     });
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
-    let (connector, driver) =
-        RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind, false));
+    let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(bind));
     scope.spawn_required("rtp_mux connector driver", driver);
     scope
         .run(async {

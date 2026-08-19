@@ -11,7 +11,7 @@ mod support;
 use support::TestScope;
 
 async fn spawn_echo_server(scope: &mut TestScope) -> SocketAddr {
-    let server = RtpMuxServer::bind("127.0.0.1:0", false).await.unwrap();
+    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
     let addr = server.listener().local_addr();
     // The serve loop and every future it spawns (session supervisors and
     // per-stream echo handlers) are submitted through the bounded reaper, so
@@ -60,7 +60,7 @@ async fn redial_dial_lands_on_the_surrendered_candidate_port() {
             probe_mean_interval: Duration::from_millis(200),
             rotation_period: Duration::from_secs(3600),
         },
-        ..RtpMuxConnectorConfig::standard(bind, false)
+        ..RtpMuxConnectorConfig::standard(bind)
     });
     scope.spawn_required("rtp_mux connector driver", driver);
     tokio::time::timeout(
