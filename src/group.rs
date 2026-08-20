@@ -51,12 +51,6 @@ impl GroupDriverSubmitter {
             }
         }
     }
-
-    #[cfg(test)]
-    fn try_submit(&self, driver: tokio::task::JoinSet<()>) -> Result<(), GroupJoinError> {
-        self.try_reserve()?.send(driver);
-        Ok(())
-    }
 }
 
 /// Server-side half of the group-driver submission channel: the bounded
@@ -484,26 +478,25 @@ mod tests {
     async fn queue_full_and_scope_closed_are_reported_separately() {
         let (submitter, scope) = group_driver_scope(1);
         // The scope's receiver is never polled, so the single bounded slot
-        // stays occupied after the first submission: the second one is
+        // stays occupied after the first reservation: the second one is
         // refused as DriverQueueFull.
+        let permit_a = submitter
+            .try_reserve()
+            .expect("first reservation must succeed");
         let mut driver_a = JoinSet::new();
         driver_a.spawn(std::future::pending::<()>());
-        assert_eq!(submitter.try_submit(driver_a), Ok(()));
-        let mut driver_b = JoinSet::new();
-        driver_b.spawn(std::future::pending::<()>());
-        assert_eq!(
-            submitter.try_submit(driver_b),
+        permit_a.send(driver_a);
+        assert!(matches!(
+            submitter.try_reserve(),
             Err(GroupJoinError::DriverQueueFull)
-        );
-        // Dropping the scope closes the submission channel; submissions are
+        ));
+        // Dropping the scope closes the submission channel; reservations are
         // then refused as DriverScopeClosed.
         drop(scope);
-        let mut driver_c = JoinSet::new();
-        driver_c.spawn(std::future::pending::<()>());
-        assert_eq!(
-            submitter.try_submit(driver_c),
+        assert!(matches!(
+            submitter.try_reserve(),
             Err(GroupJoinError::DriverScopeClosed)
-        );
+        ));
     }
 
     #[tokio::test]
