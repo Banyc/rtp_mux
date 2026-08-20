@@ -52,6 +52,7 @@ impl GroupDriverSubmitter {
         }
     }
 
+    #[cfg(test)]
     fn try_submit(&self, driver: tokio::task::JoinSet<()>) -> Result<(), GroupJoinError> {
         self.try_reserve()?.send(driver);
         Ok(())

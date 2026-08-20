@@ -32,9 +32,7 @@ use cross_session::{
     Session, SharedDraining, SharedSessions, live_session, prune_dead_addresses, rebind_streams,
 };
 pub(crate) use cross_session::{SessionGuard, StreamRebind};
-use dial::{
-    ConnectedDualLaneBirth, DualLaneDial, DualLaneDialer, connect_dual_lane, dual_supervisor_result,
-};
+use dial::{ConnectedDualLaneBirth, DualLaneDial, DualLaneDialer, connect_dual_lane};
 
 const SESSION_LINGER: Duration = Duration::from_secs(3);
 
