@@ -13,7 +13,7 @@ use std::{
 };
 
 use futures::stream::{FuturesUnordered, StreamExt as _};
-use mux::{GroupToken, LaneClass, MuxError, StreamReader};
+use mux::{GroupToken, LaneClass, MuxError};
 use tokio::{sync::oneshot, task::JoinSet};
 use tracing::{debug, info, trace, warn};
 
@@ -44,10 +44,10 @@ pub type BulkAddrSelector =
 pub struct RtpMuxConnectorConfig {
     pub bind: BindSelector,
     pub bulk_addr: BulkAddrSelector,
-    pub interactive_fec_tuning: rtp::FecTuning,
+    pub interactive_fec_tuning: crate::FecTuning,
     pub interactive_instream_group_fec: bool,
-    pub interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
-    pub bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
+    pub interactive_metrics_observer: Option<crate::MetricsObserver>,
+    pub bulk_metrics_observer: Option<crate::MetricsObserver>,
     pub handshake: bool,
     pub explorer: ExplorerConfig,
 }
@@ -73,7 +73,7 @@ impl RtpMuxConnectorConfig {
     /// and in-stream FEC.
     pub fn with_interactive_fec_tuning(
         mut self,
-        tuning: rtp::FecTuning,
+        tuning: crate::FecTuning,
         instream_group_fec: bool,
     ) -> Self {
         self.interactive_fec_tuning = tuning;
@@ -93,10 +93,10 @@ impl RtpMuxConnectorConfig {
 
 #[derive(Debug)]
 pub struct OpenedStream {
-    pub writer: mux::MigratingStreamWriter,
-    pub reader: oneshot::Receiver<StreamReader>,
+    pub writer: crate::MigratingStreamWriter,
+    pub reader: oneshot::Receiver<crate::StreamReader>,
     pub addr: SocketAddrPair,
-    pub response: (u64, mux::ResponseRouterHandle),
+    pub response: (u64, crate::ResponseRouterHandle),
     guard: SessionGuard,
 }
 

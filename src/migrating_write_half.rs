@@ -95,7 +95,7 @@ pub struct MigratingWriteHalf {
     shutdown_started: bool,
     shutdown_complete: bool,
     shutdown_result: Option<io::Result<()>>,
-    name: mux::StreamName,
+    name: crate::StreamName,
     /// Keeps the rebind wake channel's sender alive for the lifetime of the
     /// write half; never read directly.
     #[allow(dead_code)]
@@ -205,7 +205,7 @@ impl MigratingWriteHalf {
         };
         (half, handle)
     }
-    pub fn name_handle(&self) -> mux::StreamName {
+    pub fn name_handle(&self) -> crate::StreamName {
         self.name.clone()
     }
     fn reap_background_writer(&mut self) {

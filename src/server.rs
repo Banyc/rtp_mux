@@ -90,10 +90,7 @@ impl RtpMuxServer {
         Ok(Self::new(interactive_listener, bulk_listener))
     }
 
-    pub fn new(
-        interactive_listener: rtp::udp::Listener,
-        bulk_listener: rtp::udp::Listener,
-    ) -> Self {
+    pub fn new(interactive_listener: crate::Listener, bulk_listener: crate::Listener) -> Self {
         let transport_defaults = rtp::udp::AcceptConfig::default();
         Self {
             interactive_listener,
@@ -121,8 +118,8 @@ impl RtpMuxServer {
     /// lane-aware FEC policy.
     pub fn with_metrics_observers(
         mut self,
-        interactive: Option<rtp::metrics::MetricsObserver>,
-        bulk: Option<rtp::metrics::MetricsObserver>,
+        interactive: Option<crate::MetricsObserver>,
+        bulk: Option<crate::MetricsObserver>,
     ) -> Self {
         self.interactive_metrics_observer = interactive;
         self.bulk_metrics_observer = bulk;
@@ -134,7 +131,7 @@ impl RtpMuxServer {
     /// transport configuration.
     pub fn with_interactive_fec_tuning(
         mut self,
-        tuning: rtp::FecTuning,
+        tuning: crate::FecTuning,
         instream_group_fec: bool,
     ) -> Self {
         self.interactive_fec_tuning = tuning;
@@ -142,11 +139,11 @@ impl RtpMuxServer {
         self
     }
 
-    pub fn listener(&self) -> &rtp::udp::Listener {
+    pub fn listener(&self) -> &crate::Listener {
         &self.interactive_listener
     }
 
-    pub fn bulk_listener(&self) -> &rtp::udp::Listener {
+    pub fn bulk_listener(&self) -> &crate::Listener {
         &self.bulk_listener
     }
 

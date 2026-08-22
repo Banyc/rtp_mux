@@ -28,7 +28,9 @@ pub use connector::{
 };
 pub use explorer::{ExplorerConfig, ExplorerReport, PathScore, TupleReport};
 pub use migrating_write_half::MigratingWriteHalf;
-pub use mux::LaneClass;
+pub use mux::{LaneClass, MigratingStreamWriter, ResponseRouterHandle, StreamName, StreamReader};
+pub use rtp::metrics::MetricsObserver;
+pub use rtp::{FecTuning, udp::Listener};
 pub use server::{RtpMuxServer, ServeError};
 pub use session::SessionSpawner;
 pub use stream::{ServerStream, SocketAddrPair};
