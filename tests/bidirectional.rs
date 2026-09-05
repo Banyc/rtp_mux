@@ -122,6 +122,75 @@ async fn matching_disabled_handshake_mode_opens_session() {
     .await;
 }
 
+/// Matching obfuscation keys on both endpoints still open a full dual-lane
+/// session with payload exchange: every RTP datagram is chacha20-obfuscated
+/// on the wire and transparently decrypted by the peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn matching_obfuscation_keys_open_session() {
+    let scope = TestScope::new();
+    let key = rtp_mux::ObfuscationKey::from_bytes([7; 32]);
+    let server = RtpMuxServer::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .with_obfuscation_key(Some(key));
+    let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
+    run_ping_pong(
+        scope,
+        server,
+        RtpMuxConnectorConfig::standard(bind).with_obfuscation_key(Some(key)),
+    )
+    .await;
+}
+
+/// A mismatched obfuscation key is a deployment error that times out: the
+/// server decrypts the client's datagrams with a different key, so the
+/// opening handshake never completes and no session opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn mismatched_obfuscation_keys_do_not_open_session() {
+    let mut scope = TestScope::new();
+    let server = RtpMuxServer::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .with_obfuscation_key(Some(rtp_mux::ObfuscationKey::from_bytes([7; 32])));
+    let addr = server.listener().local_addr();
+    let (session_tx, mut session_rx) = tokio::sync::mpsc::channel(1);
+    let submitter = scope.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let spawner = rtp_mux::SessionSpawner::new({
+        let submitter = submitter.clone();
+        move |fut| submitter.submit(fut)
+    });
+    scope.spawn_required("rtp_mux session server", async move {
+        let _ = server
+            .serve_sessions(spawner, move |session| {
+                session_tx
+                    .try_send(session)
+                    .expect("session receiver must be ready");
+            })
+            .await;
+    });
+    let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
+    // The client uses a different key than the server: never negotiated,
+    // retried without obfuscation, or silently downgraded — the connect must
+    // time out.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_bidirectional_session(
+            addr,
+            RtpMuxConnectorConfig::standard(bind)
+                .with_obfuscation_key(Some(rtp_mux::ObfuscationKey::from_bytes([9; 32]))),
+        ),
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "mismatched obfuscation keys must not open a session"
+    );
+    assert!(
+        session_rx.try_recv().is_err(),
+        "a mismatched server delivered a session"
+    );
+}
+
 /// A mismatched handshake mode is a deployment error that times out: the
 /// server disabled the RTP opening handshake while the client (default)
 /// expects it.  The client's opening handshake waits on its internal

@@ -23,6 +23,22 @@ use crate::{
 
 use super::{BindSelector, BulkAddrSelector};
 
+/// The dial policy for one dual-lane birth: the address selectors, the
+/// lane-aware transport knobs, and the datagram-obfuscation key. The peer
+/// address, group token, and optional pre-bound socket are the data
+/// arguments to [`connect_dual_lane`]; everything here is caller policy.
+#[derive(Clone)]
+pub(crate) struct DualLaneSettings {
+    pub bind: BindSelector,
+    pub bulk_addr: BulkAddrSelector,
+    pub interactive_fec_tuning: rtp::FecTuning,
+    pub interactive_instream_group_fec: bool,
+    pub interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
+    pub bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
+    pub handshake: bool,
+    pub obfuscation_key: Option<crate::ObfuscationKey>,
+}
+
 pub(crate) struct ConnectedDualLaneBirth {
     pub(crate) opener: mux::DualStreamOpener,
     pub(crate) accepter: mux::DualStreamAccepter,
@@ -38,8 +54,16 @@ pub(crate) type DualLaneDial = Pin<
 >;
 type DualLaneDialResult =
     Pin<Box<dyn Future<Output = io::Result<ConnectedDualLaneBirth>> + Send + 'static>>;
+/// A dial that carries a per-connection obfuscation-key override: `Some(k)`
+/// replaces the connector-level key for the new session, `None` falls back
+/// to the connector-level key (or no obfuscation).
 pub(crate) type DualLaneDialer = Arc<
-    dyn Fn(SocketAddr, GroupToken, Option<tokio_udp::UdpSocket>) -> DualLaneDialResult
+    dyn Fn(
+            SocketAddr,
+            GroupToken,
+            Option<tokio_udp::UdpSocket>,
+            Option<crate::ObfuscationKey>,
+        ) -> DualLaneDialResult
         + Send
         + Sync
         + 'static,
@@ -56,30 +80,13 @@ pub(crate) fn dual_supervisor_result(
 
 pub(crate) async fn connect_dual_lane(
     addr: SocketAddr,
-    bind: BindSelector,
-    bulk_addr: BulkAddrSelector,
-    interactive_fec_tuning: rtp::FecTuning,
-    interactive_instream_group_fec: bool,
-    interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
-    bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
-    handshake: bool,
     group: GroupToken,
     socket: Option<tokio_udp::UdpSocket>,
+    settings: DualLaneSettings,
 ) -> io::Result<ConnectedDualLaneBirth> {
     let mut socket = socket;
     retry_dual_connect(addr, || {
-        connect_dual_lane_once(
-            addr,
-            Arc::clone(&bind),
-            Arc::clone(&bulk_addr),
-            interactive_fec_tuning,
-            interactive_instream_group_fec,
-            interactive_metrics_observer.clone(),
-            bulk_metrics_observer.clone(),
-            handshake,
-            group,
-            socket.take(),
-        )
+        connect_dual_lane_once(addr, group, socket.take(), settings.clone())
     })
     .await
 }
@@ -139,34 +146,45 @@ where
 
 async fn connect_dual_lane_once(
     addr: SocketAddr,
-    bind: BindSelector,
-    bulk_addr: BulkAddrSelector,
-    interactive_fec_tuning: rtp::FecTuning,
-    interactive_instream_group_fec: bool,
-    interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
-    bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
-    handshake: bool,
     group: GroupToken,
     socket: Option<tokio_udp::UdpSocket>,
+    settings: DualLaneSettings,
 ) -> io::Result<ConnectedDualLaneBirth> {
+    let DualLaneSettings {
+        bind,
+        bulk_addr,
+        interactive_fec_tuning,
+        interactive_instream_group_fec,
+        interactive_metrics_observer,
+        bulk_metrics_observer,
+        handshake,
+        obfuscation_key,
+    } = settings;
     let bind_addr = bind(addr);
     let bulk_addr = bulk_addr(addr)?;
     // Each lane builds its own transport config through the lane-aware
     // policy; the interactive config is never reused for the bulk lane,
     // which must stay FEC-free while keeping its own metrics observer.
-    let interactive_config = crate::lane_transport::connect_config(
+    let base = crate::lane_transport::ConnectSettings {
         interactive_fec_tuning,
         interactive_instream_group_fec,
         handshake,
+        metrics_observer: None,
+        obfuscation_key,
+    };
+    let interactive_config = crate::lane_transport::connect_config(
         LaneClass::Interactive,
-        interactive_metrics_observer,
+        crate::lane_transport::ConnectSettings {
+            metrics_observer: interactive_metrics_observer,
+            ..base.clone()
+        },
     );
     let bulk_config = crate::lane_transport::connect_config(
-        interactive_fec_tuning,
-        interactive_instream_group_fec,
-        handshake,
         LaneClass::Bulk,
-        bulk_metrics_observer,
+        crate::lane_transport::ConnectSettings {
+            metrics_observer: bulk_metrics_observer,
+            ..base
+        },
     );
     let mut interactive = match socket {
         Some(socket) => {

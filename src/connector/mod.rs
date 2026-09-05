@@ -32,7 +32,9 @@ use cross_session::{
     Session, SharedDraining, SharedSessions, live_session, prune_dead_addresses, rebind_streams,
 };
 pub(crate) use cross_session::{SessionGuard, StreamRebind};
-use dial::{ConnectedDualLaneBirth, DualLaneDial, DualLaneDialer, connect_dual_lane};
+use dial::{
+    ConnectedDualLaneBirth, DualLaneDial, DualLaneDialer, DualLaneSettings, connect_dual_lane,
+};
 
 const SESSION_LINGER: Duration = Duration::from_secs(3);
 
@@ -49,6 +51,7 @@ pub struct RtpMuxConnectorConfig {
     pub interactive_metrics_observer: Option<crate::MetricsObserver>,
     pub bulk_metrics_observer: Option<crate::MetricsObserver>,
     pub handshake: bool,
+    pub obfuscation_key: Option<crate::ObfuscationKey>,
     pub explorer: ExplorerConfig,
 }
 
@@ -63,6 +66,7 @@ impl RtpMuxConnectorConfig {
             interactive_metrics_observer: None,
             bulk_metrics_observer: None,
             handshake: true,
+            obfuscation_key: None,
             explorer: ExplorerConfig::default(),
         }
     }
@@ -88,6 +92,41 @@ impl RtpMuxConnectorConfig {
     pub fn with_handshake(mut self, handshake: bool) -> Self {
         self.handshake = handshake;
         self
+    }
+
+    /// Enable datagram obfuscation for both lanes: every RTP datagram is
+    /// prefixed with a 24-byte random nonce and chacha20-encrypted with this
+    /// key. The peer server must use the same key; `None` (the default)
+    /// sends datagrams in the clear.
+    pub fn with_obfuscation_key(mut self, key: Option<crate::ObfuscationKey>) -> Self {
+        self.obfuscation_key = key;
+        self
+    }
+}
+
+impl From<RtpMuxConnectorConfig> for DualLaneSettings {
+    fn from(config: RtpMuxConnectorConfig) -> Self {
+        let RtpMuxConnectorConfig {
+            bind,
+            bulk_addr,
+            interactive_fec_tuning,
+            interactive_instream_group_fec,
+            interactive_metrics_observer,
+            bulk_metrics_observer,
+            handshake,
+            obfuscation_key,
+            explorer: _,
+        } = config;
+        Self {
+            bind,
+            bulk_addr,
+            interactive_fec_tuning,
+            interactive_instream_group_fec,
+            interactive_metrics_observer,
+            bulk_metrics_observer,
+            handshake,
+            obfuscation_key,
+        }
     }
 }
 
@@ -150,6 +189,7 @@ enum ConnectorCommand {
     Connect {
         addr: SocketAddr,
         lane: LaneClass,
+        obfuscation_key: Option<crate::ObfuscationKey>,
         response: oneshot::Sender<io::Result<OpenedStream>>,
     },
     Redial {
@@ -230,40 +270,22 @@ impl RtpMuxConnector {
     }
 
     pub fn with_config(config: RtpMuxConnectorConfig) -> (Self, RtpMuxConnectorDriver) {
-        let RtpMuxConnectorConfig {
-            bind,
-            bulk_addr,
-            interactive_fec_tuning,
-            interactive_instream_group_fec,
-            interactive_metrics_observer,
-            bulk_metrics_observer,
-            handshake,
-            explorer,
-        } = config;
-        let explorer = explorer.enabled.then(|| ExplorerContext {
-            config: explorer,
-            bind: Arc::clone(&bind),
+        let explorer = config.explorer.enabled.then(|| ExplorerContext {
+            config: config.explorer.clone(),
+            bind: Arc::clone(&config.bind),
         });
-        let dialer: DualLaneDialer = Arc::new(move |addr, group, socket| {
-            let bind = Arc::clone(&bind);
-            let bulk_addr = Arc::clone(&bulk_addr);
-            let interactive_metrics_observer = interactive_metrics_observer.clone();
-            let bulk_metrics_observer = bulk_metrics_observer.clone();
-            Box::pin(async move {
-                connect_dual_lane(
-                    addr,
-                    bind,
-                    bulk_addr,
-                    interactive_fec_tuning,
-                    interactive_instream_group_fec,
-                    interactive_metrics_observer,
-                    bulk_metrics_observer,
-                    handshake,
-                    group,
-                    socket,
-                )
-                .await
-            })
+        let dial_settings = DualLaneSettings::from(config);
+        let dialer: DualLaneDialer = Arc::new(move |addr, group, socket, requested_key| {
+            // A per-connection key override replaces the connector-level
+            // key; `None` falls back to the connector-level key.
+            let settings = match requested_key {
+                Some(key) => DualLaneSettings {
+                    obfuscation_key: Some(key),
+                    ..dial_settings.clone()
+                },
+                None => dial_settings.clone(),
+            };
+            Box::pin(async move { connect_dual_lane(addr, group, socket, settings).await })
         });
         Self::with_dialer_and_explorer(dialer, explorer)
     }
@@ -308,6 +330,19 @@ impl RtpMuxConnector {
         addr: SocketAddr,
         lane: LaneClass,
     ) -> io::Result<OpenedStream> {
+        self.connect_with_lane_and_key(addr, lane, None).await
+    }
+
+    /// Connect to `addr` on `lane`, overriding the connector-level
+    /// obfuscation key with `obfuscation_key` for a newly-established
+    /// session. `None` falls back to the connector-level key (or no
+    /// obfuscation). Existing sessions are reused regardless of the key.
+    pub async fn connect_with_lane_and_key(
+        &self,
+        addr: SocketAddr,
+        lane: LaneClass,
+        obfuscation_key: Option<crate::ObfuscationKey>,
+    ) -> io::Result<OpenedStream> {
         if let Some(session) = live_session(&self.sessions, addr) {
             return Ok(session.open_stream(lane));
         }
@@ -316,6 +351,7 @@ impl RtpMuxConnector {
             .send(ConnectorCommand::Connect {
                 addr,
                 lane,
+                obfuscation_key,
                 response,
             })
             .await
@@ -338,6 +374,19 @@ impl RtpMuxConnector {
         lane: LaneClass,
     ) -> io::Result<ClientStream> {
         self.connect_with_lane(addr, lane)
+            .await
+            .map(OpenedStream::into_stream)
+    }
+
+    /// [`Self::connect_stream_with_lane`] with a per-connection obfuscation
+    /// key override for a newly-established session.
+    pub async fn connect_stream_with_lane_and_key(
+        &self,
+        addr: SocketAddr,
+        lane: LaneClass,
+        obfuscation_key: Option<crate::ObfuscationKey>,
+    ) -> io::Result<ClientStream> {
+        self.connect_with_lane_and_key(addr, lane, obfuscation_key)
             .await
             .map(OpenedStream::into_stream)
     }
@@ -548,8 +597,12 @@ async fn run_connector(
     let mut groups: HashMap<SocketAddr, AddrGroup> = HashMap::new();
     let mut redials: HashMap<SocketAddr, RedialInFlight> = HashMap::new();
     let mut explorers: HashMap<SocketAddr, PathExplorer<SocketCandidate>> = HashMap::new();
+    // The per-address obfuscation key in effect for the address's session,
+    // so a redial rebuilds the session with the same key it was born with.
+    let mut addr_keys: HashMap<SocketAddr, Option<crate::ObfuscationKey>> = HashMap::new();
     let start_dial =
         |addr: SocketAddr,
+         obfuscation_key: Option<crate::ObfuscationKey>,
          groups: &mut HashMap<SocketAddr, AddrGroup>,
          pending_dials: &mut FuturesUnordered<DualLaneDial>,
          in_flight_dials: &mut HashSet<SocketAddr>,
@@ -574,7 +627,7 @@ async fn run_connector(
             in_flight_dials.insert(addr);
             let dialer = Arc::clone(&dialer);
             pending_dials.push(Box::pin(async move {
-                let result = dialer(addr, token, socket).await;
+                let result = dialer(addr, token, socket, obfuscation_key).await;
                 (addr, result)
             }));
         };
@@ -707,13 +760,27 @@ async fn run_connector(
                         };
                         let Some(old) = sessions.lock().unwrap().get(&addr).cloned() else { continue; };
                         redials.insert(addr, RedialInFlight { old, trigger, verdict });
-                        start_dial(addr, &mut groups, &mut pending_dials, &mut in_flight_dials, &mut explorers);
+                        // Rebuild the session with the same obfuscation key
+                        // the address's session was born with.
+                        start_dial(
+                            addr,
+                            addr_keys.get(&addr).copied().flatten(),
+                            &mut groups,
+                            &mut pending_dials,
+                            &mut in_flight_dials,
+                            &mut explorers,
+                        );
                     }
                     ConnectorCommand::ExplorerReport { addr, response } => {
                         let report = explorers.get(&addr).map(PathExplorer::report).unwrap_or_default();
                         let _ = response.send(report);
                     }
-                    ConnectorCommand::Connect { addr, lane, response } => {
+                    ConnectorCommand::Connect {
+                        addr,
+                        lane,
+                        obfuscation_key,
+                        response,
+                    } => {
                         if let Some(session) = live_session(&sessions, addr) {
                             if !response.is_closed() { let _ = response.send(Ok(session.open_stream(lane))); }
                             continue;
@@ -730,7 +797,15 @@ async fn run_connector(
                         }
                         dial_waiters.entry(addr).or_default().push(request);
                         if !is_in_flight {
-                            start_dial(addr, &mut groups, &mut pending_dials, &mut in_flight_dials, &mut explorers);
+                            addr_keys.insert(addr, obfuscation_key);
+                            start_dial(
+                                addr,
+                                obfuscation_key,
+                                &mut groups,
+                                &mut pending_dials,
+                                &mut in_flight_dials,
+                                &mut explorers,
+                            );
                         }
                     }
                 }
@@ -873,6 +948,7 @@ mod tests {
             .send(ConnectorCommand::Connect {
                 addr,
                 lane: LaneClass::Interactive,
+                obfuscation_key: None,
                 response,
             })
             .await
@@ -1036,7 +1112,7 @@ mod tests {
         let dials = Arc::new(AtomicUsize::new(0));
         let dialer: DualLaneDialer = Arc::new({
             let dials = Arc::clone(&dials);
-            move |addr, _group, _socket| {
+            move |addr, _group, _socket, _key| {
                 dials.fetch_add(1, Ordering::Relaxed);
                 Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
             }
@@ -1073,7 +1149,7 @@ mod tests {
     }
 
     fn counting_fake_dialer(attempts: Arc<AtomicUsize>) -> DualLaneDialer {
-        Arc::new(move |addr, _group, _socket| {
+        Arc::new(move |addr, _group, _socket, _key| {
             attempts.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
         })
@@ -1088,7 +1164,7 @@ mod tests {
         let dialer: DualLaneDialer = Arc::new({
             let tokens = Arc::clone(&tokens);
             let terminate_rx = Arc::clone(&terminate_rx);
-            move |addr, group, _socket| {
+            move |addr, group, _socket, _key| {
                 tokens.lock().unwrap().push(group);
                 let terminate = terminate_rx.lock().unwrap().take();
                 Box::pin(async move { Ok(fake_connected_birth(addr, terminate)) })
@@ -1152,7 +1228,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
         let (terminate_tx, terminate_rx) = oneshot::channel();
         let terminate_rx = Arc::new(Mutex::new(Some(terminate_rx)));
-        let dialer: DualLaneDialer = Arc::new(move |addr, _group, _socket| {
+        let dialer: DualLaneDialer = Arc::new(move |addr, _group, _socket, _key| {
             let terminate = terminate_rx.lock().unwrap().take();
             Box::pin(async move { Ok(fake_connected_birth(addr, terminate)) })
         });
@@ -1191,7 +1267,7 @@ mod tests {
         let dialer: DualLaneDialer = Arc::new({
             let tokens = Arc::clone(&tokens);
             let terminate_rx = Arc::clone(&terminate_rx);
-            move |addr, group, _socket| {
+            move |addr, group, _socket, _key| {
                 tokens.lock().unwrap().push(group);
                 let terminate = terminate_rx.lock().unwrap().take();
                 Box::pin(async move { Ok(fake_connected_birth(addr, terminate)) })
@@ -1224,7 +1300,7 @@ mod tests {
         let blocked_started = Arc::new(tokio::sync::Notify::new());
         let dialer: DualLaneDialer = Arc::new({
             let blocked_started = Arc::clone(&blocked_started);
-            move |addr, _group, _socket| {
+            move |addr, _group, _socket, _key| {
                 if addr == blocked_addr {
                     blocked_started.notify_one();
                     Box::pin(std::future::pending())
@@ -1260,7 +1336,7 @@ mod tests {
         let blocked_started = Arc::new(tokio::sync::Notify::new());
         let dialer: DualLaneDialer = Arc::new({
             let blocked_started = Arc::clone(&blocked_started);
-            move |addr, _group, _socket| {
+            move |addr, _group, _socket, _key| {
                 if addr == cached_addr {
                     Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
                 } else {
@@ -1307,7 +1383,7 @@ mod tests {
             let terminate_rx = Arc::clone(&terminate_rx);
             let attempts = Arc::clone(&attempts);
             let blocked_started = Arc::clone(&blocked_started);
-            move |addr, _group, _socket| {
+            move |addr, _group, _socket, _key| {
                 if addr == blocked_addr {
                     blocked_started.notify_one();
                     return Box::pin(std::future::pending());
@@ -1365,7 +1441,7 @@ mod tests {
         let dial_count = Arc::new(AtomicUsize::new(0));
         let dialer: DualLaneDialer = Arc::new({
             let dial_count = Arc::clone(&dial_count);
-            move |_addr, _group, _socket| {
+            move |_addr, _group, _socket, _key| {
                 dial_count.fetch_add(1, Ordering::SeqCst);
                 Box::pin(std::future::pending())
             }
@@ -1404,7 +1480,7 @@ mod tests {
         let dial_count = Arc::new(AtomicUsize::new(0));
         let dialer: DualLaneDialer = Arc::new({
             let dial_count = Arc::clone(&dial_count);
-            move |addr, _group, _socket| {
+            move |addr, _group, _socket, _key| {
                 dial_count.fetch_add(1, Ordering::SeqCst);
                 if addr == live_addr {
                     Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
@@ -1460,7 +1536,7 @@ mod tests {
     async fn connector_enforces_waiter_capacity_and_reset_fails_every_waiter() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let dialer: DualLaneDialer =
-            Arc::new(|_addr, _group, _socket| Box::pin(std::future::pending()));
+            Arc::new(|_addr, _group, _socket, _key| Box::pin(std::future::pending()));
         let mut connector_tasks = JoinSet::new();
         let commands = spawn_test_connector(dialer, &mut connector_tasks);
         let mut responses = Vec::new();
@@ -1486,7 +1562,7 @@ mod tests {
     async fn closed_waiters_do_not_consume_per_destination_capacity() {
         let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
         let barrier_addr: SocketAddr = "192.0.2.2:50000".parse().unwrap();
-        let dialer: DualLaneDialer = Arc::new(move |dial_addr, _group, _socket| {
+        let dialer: DualLaneDialer = Arc::new(move |dial_addr, _group, _socket, _key| {
             if dial_addr == addr {
                 Box::pin(std::future::pending())
             } else {
@@ -1530,7 +1606,7 @@ mod tests {
         let dialer: DualLaneDialer = Arc::new({
             let attempts = Arc::clone(&attempts);
             let first_started = Arc::clone(&first_started);
-            move |_addr, _group, _socket| {
+            move |_addr, _group, _socket, _key| {
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     first_started.notify_one();
                     Box::pin(std::future::pending())
@@ -1732,7 +1808,7 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let dialer: DualLaneDialer = Arc::new({
             let attempts = Arc::clone(&attempts);
-            move |addr, _group, _socket| {
+            move |addr, _group, _socket, _key| {
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
                 } else {
@@ -1775,7 +1851,7 @@ mod tests {
         let tokens: Arc<Mutex<Vec<GroupToken>>> = Arc::new(Mutex::new(Vec::new()));
         let dialer: DualLaneDialer = Arc::new({
             let tokens = Arc::clone(&tokens);
-            move |addr, group, _socket| {
+            move |addr, group, _socket, _key| {
                 tokens.lock().unwrap().push(group);
                 Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
             }

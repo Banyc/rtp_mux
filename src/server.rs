@@ -60,6 +60,7 @@ pub struct RtpMuxServer {
     interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     handshake: bool,
+    obfuscation_key: Option<crate::ObfuscationKey>,
 }
 
 enum BirthHeartbeatFailure {
@@ -101,6 +102,7 @@ impl RtpMuxServer {
             interactive_metrics_observer: None,
             bulk_metrics_observer: None,
             handshake: true,
+            obfuscation_key: None,
         }
     }
 
@@ -136,6 +138,15 @@ impl RtpMuxServer {
     ) -> Self {
         self.interactive_fec_tuning = tuning;
         self.interactive_instream_group_fec = instream_group_fec;
+        self
+    }
+
+    /// Enable datagram obfuscation for both lanes: every RTP datagram is
+    /// prefixed with a 24-byte random nonce and chacha20-encrypted with this
+    /// key. The peer connector must use the same key; `None` (the default)
+    /// sends datagrams in the clear.
+    pub fn with_obfuscation_key(mut self, key: Option<crate::ObfuscationKey>) -> Self {
+        self.obfuscation_key = key;
         self
     }
 
@@ -313,10 +324,13 @@ impl RtpMuxServer {
                 result = accept_rtp_frame_delivery(
                     &self.interactive_listener,
                     lane_transport::accept_config(
-                        self.interactive_fec_tuning,
-                        self.interactive_instream_group_fec,
                         LaneClass::Interactive,
-                        self.interactive_metrics_observer.clone(),
+                        lane_transport::AcceptSettings {
+                            interactive_fec_tuning: self.interactive_fec_tuning,
+                            interactive_instream_group_fec: self.interactive_instream_group_fec,
+                            metrics_observer: self.interactive_metrics_observer.clone(),
+                            obfuscation_key: self.obfuscation_key,
+                        },
                     ),
                     self.handshake,
                 ) => {
@@ -325,10 +339,13 @@ impl RtpMuxServer {
                 result = accept_rtp_frame_delivery(
                     &self.bulk_listener,
                     lane_transport::accept_config(
-                        self.interactive_fec_tuning,
-                        self.interactive_instream_group_fec,
                         LaneClass::Bulk,
-                        self.bulk_metrics_observer.clone(),
+                        lane_transport::AcceptSettings {
+                            interactive_fec_tuning: self.interactive_fec_tuning,
+                            interactive_instream_group_fec: self.interactive_instream_group_fec,
+                            metrics_observer: self.bulk_metrics_observer.clone(),
+                            obfuscation_key: self.obfuscation_key,
+                        },
                     ),
                     self.handshake,
                 ) => {

@@ -87,15 +87,9 @@ pub async fn connect_bidirectional_session(
 ) -> io::Result<BidirectionalSession> {
     let birth = connect_dual_lane(
         addr,
-        config.bind,
-        config.bulk_addr,
-        config.interactive_fec_tuning,
-        config.interactive_instream_group_fec,
-        config.interactive_metrics_observer,
-        config.bulk_metrics_observer,
-        config.handshake,
         GroupToken::generate(),
         None,
+        crate::connector::dial::DualLaneSettings::from(config),
     )
     .await?;
     Ok(BidirectionalSession::new(
