@@ -144,9 +144,15 @@ impl RtpMuxServer {
     /// Enable datagram obfuscation for both lanes: every RTP datagram is
     /// prefixed with a 24-byte random nonce and chacha20-encrypted with this
     /// key. The peer connector must use the same key; `None` (the default)
-    /// sends datagrams in the clear.
+    /// sends datagrams in the clear. The same key also arms the path-probe
+    /// side channel on both listeners, so probe packets are obfuscated too
+    /// and a passive observer cannot tell them from data.
     pub fn with_obfuscation_key(mut self, key: Option<crate::ObfuscationKey>) -> Self {
         self.obfuscation_key = key;
+        let probe_key = key.map(crate::ObfuscationKey::into_bytes);
+        self.interactive_listener
+            .set_probe_obfuscation_key(probe_key);
+        self.bulk_listener.set_probe_obfuscation_key(probe_key);
         self
     }
 

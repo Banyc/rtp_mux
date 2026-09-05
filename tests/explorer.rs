@@ -11,7 +11,17 @@ mod support;
 use support::TestScope;
 
 async fn spawn_echo_server(scope: &mut TestScope) -> SocketAddr {
-    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
+    spawn_echo_server_with_key(scope, None).await
+}
+
+async fn spawn_echo_server_with_key(
+    scope: &mut TestScope,
+    key: Option<rtp_mux::ObfuscationKey>,
+) -> SocketAddr {
+    let server = RtpMuxServer::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .with_obfuscation_key(key);
     let addr = server.listener().local_addr();
     // The serve loop and every future it spawns (session supervisors and
     // per-stream echo handlers) are submitted through the bounded reaper, so
@@ -125,4 +135,48 @@ async fn redial_dial_lands_on_the_surrendered_candidate_port() {
     )
     .await
     .expect("explorer handoff test timed out");
+}
+
+/// The explorer's candidate-path probes are obfuscated with the same key
+/// as the data channel: with matching keys on both endpoints, candidate
+/// sockets still receive echoes (so candidates go alive) and the session
+/// carries payload — proving the probe side channel is not left in the
+/// clear when obfuscation is on.
+#[tokio::test(flavor = "multi_thread")]
+async fn obfuscated_explorer_candidates_still_receive_echoes() {
+    let mut scope = TestScope::new();
+    let key = rtp_mux::ObfuscationKey::from_bytes([7; 32]);
+    let addr = spawn_echo_server_with_key(&mut scope, Some(key)).await;
+    let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
+    let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
+        explorer: ExplorerConfig {
+            enabled: true,
+            candidates: 2,
+            probe_mean_interval: Duration::from_millis(200),
+            rotation_period: Duration::from_secs(3600),
+        },
+        ..RtpMuxConnectorConfig::standard(bind).with_obfuscation_key(Some(key))
+    });
+    scope.spawn_required("rtp_mux connector driver", driver);
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        scope.run(async {
+            let mut stream = connector.connect_stream(addr).await.unwrap();
+            stream.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            wait_until(
+                async || {
+                    let report = connector.explorer_report(addr).await.unwrap();
+                    report.candidates.len() == 2 && report.candidates.iter().all(|c| c.alive)
+                },
+                Duration::from_secs(30),
+                "obfuscated explorer candidates alive",
+            )
+            .await;
+        }),
+    )
+    .await
+    .expect("obfuscated explorer test timed out");
 }

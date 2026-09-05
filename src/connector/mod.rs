@@ -162,6 +162,11 @@ struct AddrGroup {
 struct ExplorerContext {
     config: ExplorerConfig,
     bind: BindSelector,
+    /// The datagram-obfuscation key for candidate-path probes: candidate
+    /// sockets send obfuscated probes and decrypt echoes with it, so the
+    /// probe side channel is indistinguishable from the obfuscated data
+    /// channel. `None` keeps the plaintext probe channel.
+    obfuscation_key: Option<crate::ObfuscationKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +278,7 @@ impl RtpMuxConnector {
         let explorer = config.explorer.enabled.then(|| ExplorerContext {
             config: config.explorer.clone(),
             bind: Arc::clone(&config.bind),
+            obfuscation_key: config.obfuscation_key,
         });
         let dial_settings = DualLaneSettings::from(config);
         let dialer: DualLaneDialer = Arc::new(move |addr, group, socket, requested_key| {
@@ -565,10 +571,11 @@ async fn refill_candidates(
     explorer: &mut PathExplorer<SocketCandidate>,
     ctx: &ExplorerContext,
     addr: SocketAddr,
+    key: Option<crate::ObfuscationKey>,
 ) {
     while explorer.deficit() > 0 {
         let bind_ip = (ctx.bind)(addr).ip();
-        match SocketCandidate::bind_new(bind_ip, addr).await {
+        match SocketCandidate::bind_new(bind_ip, addr, key).await {
             Ok((candidate, local_addr)) => {
                 explorer.add_candidate(candidate, local_addr, Instant::now());
             }
@@ -645,7 +652,19 @@ async fn run_connector(
                     for explorer in explorers.values_mut() { explorer.tick(now); }
                     if let Some(ctx) = &explorer_ctx {
                         for (addr, explorer) in explorers.iter_mut() {
-                            if explorer.wants_refill(now) { refill_candidates(explorer, ctx, *addr).await; }
+                            if explorer.wants_refill(now) {
+                                // The per-address key override (recorded on
+                                // the address's first Connect) wins over the
+                                // connector-level key; fall back to the
+                                // connector-level key when the address has
+                                // no override.
+                                let key = addr_keys
+                                    .get(addr)
+                                    .copied()
+                                    .flatten()
+                                    .or(ctx.obfuscation_key);
+                                refill_candidates(explorer, ctx, *addr, key).await;
+                            }
                         }
                     }
                 }
@@ -891,6 +910,7 @@ mod tests {
                 rotation_period: Duration::from_secs(3600),
             },
             bind: Arc::new(|_| SocketAddr::from(([127, 0, 0, 1], 0))),
+            obfuscation_key: None,
         };
         tasks.spawn(run_connector(
             command_rx,

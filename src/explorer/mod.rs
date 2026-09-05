@@ -46,17 +46,23 @@ impl ProbeIo for rtp::path_probe::EchoDemux {
 #[derive(Debug)]
 pub(crate) struct SocketCandidate {
     socket: tokio_udp::UdpSocket,
+    /// The datagram-obfuscation key for the probe side channel: probes are
+    /// sent obfuscated (nonce + chacha20) and echoes are decrypted with it,
+    /// so candidate-path probes are indistinguishable from the obfuscated
+    /// data channel. `None` keeps the plaintext probe channel.
+    key: Option<crate::ObfuscationKey>,
 }
 
 impl SocketCandidate {
     pub(crate) async fn bind_new(
         bind_ip: std::net::IpAddr,
         remote: SocketAddr,
+        key: Option<crate::ObfuscationKey>,
     ) -> io::Result<(Self, SocketAddr)> {
         let socket = tokio_udp::UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?;
         socket.connect(remote).await?;
         let local = socket.local_addr()?;
-        Ok((Self { socket }, local))
+        Ok((Self { socket, key }, local))
     }
     pub(crate) fn into_socket(self) -> tokio_udp::UdpSocket {
         self.socket
@@ -65,15 +71,29 @@ impl SocketCandidate {
 
 impl ProbeIo for SocketCandidate {
     fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()> {
-        self.socket
-            .try_send(&rtp::path_probe::encode_probe(echo))
-            .map(drop)
+        match self.key {
+            Some(key) => self
+                .socket
+                .try_send(&rtp::path_probe::encode_probe_obfuscated(
+                    echo,
+                    key.into_bytes(),
+                ))
+                .map(drop),
+            None => self
+                .socket
+                .try_send(&rtp::path_probe::encode_probe(echo))
+                .map(drop),
+        }
     }
     fn try_recv_echo(&mut self) -> Option<rtp::path_probe::ProbeEcho> {
         let mut buf = [0u8; 64];
         loop {
             let n = self.socket.try_recv(&mut buf).ok()?;
-            if let Some(echo) = rtp::path_probe::decode_echo(&buf[..n]) {
+            let echo = match self.key {
+                Some(key) => rtp::path_probe::decode_echo_obfuscated(&buf[..n], key.into_bytes()),
+                None => rtp::path_probe::decode_echo(&buf[..n]),
+            };
+            if let Some(echo) = echo {
                 return Some(echo);
             }
         }
