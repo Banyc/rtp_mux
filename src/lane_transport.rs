@@ -22,17 +22,18 @@ pub(crate) struct ConnectSettings {
     pub obfuscation_key: Option<crate::ObfuscationKey>,
 }
 
-/// The accept-path transport policy rtp-mux owns: the lane-aware FEC knobs,
-/// the per-lane metrics observer, and the datagram-obfuscation key. The lane
-/// itself is the data argument to [`accept_config`]; everything here is
-/// caller policy. (The opening-handshake toggle is not part of the rtp
-/// accept config; the server passes it separately to the accept call.)
+/// The accept-path transport policy rtp-mux owns: the lane-aware FEC knobs
+/// and the per-lane metrics observer. The lane itself is the data argument
+/// to [`accept_config`]; everything here is caller policy. (The
+/// opening-handshake toggle is not part of the rtp accept config; the
+/// server passes it separately to the accept call. Datagram obfuscation is
+/// not part of the accept policy either: the single-path rtp listener takes
+/// its key at `Listener::bind_with_key`.)
 #[derive(Clone)]
 pub(crate) struct AcceptSettings {
     pub interactive_fec_tuning: rtp::FecTuning,
     pub interactive_instream_group_fec: bool,
     pub metrics_observer: Option<rtp::metrics::MetricsObserver>,
-    pub obfuscation_key: Option<crate::ObfuscationKey>,
 }
 
 fn fec_enabled(lane: LaneClass) -> bool {
@@ -74,9 +75,6 @@ pub(crate) fn accept_config(lane: LaneClass, settings: AcceptSettings) -> rtp::u
         },
         instream_group_fec: fec && settings.interactive_instream_group_fec,
         metrics_observer: settings.metrics_observer,
-        obfuscation_key: settings
-            .obfuscation_key
-            .map(crate::ObfuscationKey::into_bytes),
         ..defaults
     }
 }
@@ -113,7 +111,6 @@ mod tests {
             interactive_fec_tuning: tuning,
             interactive_instream_group_fec: instream_group_fec,
             metrics_observer,
-            obfuscation_key: None,
         }
     }
 
@@ -200,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn obfuscation_key_is_passed_through_to_the_rtp_config() {
+    fn obfuscation_key_is_passed_through_to_the_rtp_connect_config() {
         let tuning = rtp::FecTuning::default();
         let key = crate::ObfuscationKey::from_bytes([7; 32]);
         let connect = connect_config(
@@ -214,18 +211,6 @@ mod tests {
             connect.obfuscation_key,
             Some([7; 32]),
             "the wrapped obfuscation key must reach the rtp connect config"
-        );
-        let accept = accept_config(
-            LaneClass::Interactive,
-            AcceptSettings {
-                obfuscation_key: Some(key),
-                ..accept_settings(tuning, false, None)
-            },
-        );
-        assert_eq!(
-            accept.obfuscation_key,
-            Some([7; 32]),
-            "the wrapped obfuscation key must reach the rtp accept config"
         );
         let plain = connect_config(
             LaneClass::Interactive,

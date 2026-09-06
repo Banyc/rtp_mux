@@ -18,10 +18,9 @@ async fn spawn_echo_server_with_key(
     scope: &mut TestScope,
     key: Option<rtp_mux::ObfuscationKey>,
 ) -> SocketAddr {
-    let server = RtpMuxServer::bind("127.0.0.1:0")
+    let server = RtpMuxServer::bind_with_obfuscation_key("127.0.0.1:0", key)
         .await
-        .unwrap()
-        .with_obfuscation_key(key);
+        .unwrap();
     let addr = server.listener().local_addr();
     // The serve loop and every future it spawns (session supervisors and
     // per-stream echo handlers) are submitted through the bounded reaper, so

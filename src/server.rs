@@ -60,7 +60,6 @@ pub struct RtpMuxServer {
     interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     handshake: bool,
-    obfuscation_key: Option<crate::ObfuscationKey>,
 }
 
 enum BirthHeartbeatFailure {
@@ -84,10 +83,27 @@ pub enum ServeError {
 }
 
 impl RtpMuxServer {
+    /// Bind both lanes without datagram obfuscation: datagrams travel in
+    /// the clear.
     pub async fn bind(addr: impl ToSocketAddrs + Clone + Debug) -> io::Result<Self> {
-        let interactive_listener = rtp::udp::Listener::bind(addr).await?;
+        Self::bind_with_obfuscation_key(addr, None).await
+    }
+
+    /// Bind both lanes with datagram obfuscation: every RTP datagram is
+    /// prefixed with a 24-byte random nonce and chacha20-encrypted with
+    /// `key`. The peer connector must use the same key; `None` (the
+    /// default) sends datagrams in the clear. The key is fixed at bind on
+    /// both listeners, which decrypt each datagram once at the dispatch and
+    /// answer path probes with the same key, so a passive observer cannot
+    /// tell probes from data.
+    pub async fn bind_with_obfuscation_key(
+        addr: impl ToSocketAddrs + Clone + Debug,
+        key: Option<crate::ObfuscationKey>,
+    ) -> io::Result<Self> {
+        let key_bytes = key.map(crate::ObfuscationKey::into_bytes);
+        let interactive_listener = rtp::udp::Listener::bind_with_key(addr, key_bytes).await?;
         let bulk_addr = bulk_lane_addr(interactive_listener.local_addr())?;
-        let bulk_listener = rtp::udp::Listener::bind(bulk_addr).await?;
+        let bulk_listener = rtp::udp::Listener::bind_with_key(bulk_addr, key_bytes).await?;
         Ok(Self::new(interactive_listener, bulk_listener))
     }
 
@@ -102,7 +118,6 @@ impl RtpMuxServer {
             interactive_metrics_observer: None,
             bulk_metrics_observer: None,
             handshake: true,
-            obfuscation_key: None,
         }
     }
 
@@ -138,21 +153,6 @@ impl RtpMuxServer {
     ) -> Self {
         self.interactive_fec_tuning = tuning;
         self.interactive_instream_group_fec = instream_group_fec;
-        self
-    }
-
-    /// Enable datagram obfuscation for both lanes: every RTP datagram is
-    /// prefixed with a 24-byte random nonce and chacha20-encrypted with this
-    /// key. The peer connector must use the same key; `None` (the default)
-    /// sends datagrams in the clear. The same key also arms the path-probe
-    /// side channel on both listeners, so probe packets are obfuscated too
-    /// and a passive observer cannot tell them from data.
-    pub fn with_obfuscation_key(mut self, key: Option<crate::ObfuscationKey>) -> Self {
-        self.obfuscation_key = key;
-        let probe_key = key.map(crate::ObfuscationKey::into_bytes);
-        self.interactive_listener
-            .set_probe_obfuscation_key(probe_key);
-        self.bulk_listener.set_probe_obfuscation_key(probe_key);
         self
     }
 
@@ -335,7 +335,6 @@ impl RtpMuxServer {
                             interactive_fec_tuning: self.interactive_fec_tuning,
                             interactive_instream_group_fec: self.interactive_instream_group_fec,
                             metrics_observer: self.interactive_metrics_observer.clone(),
-                            obfuscation_key: self.obfuscation_key,
                         },
                     ),
                     self.handshake,
@@ -350,7 +349,6 @@ impl RtpMuxServer {
                             interactive_fec_tuning: self.interactive_fec_tuning,
                             interactive_instream_group_fec: self.interactive_instream_group_fec,
                             metrics_observer: self.bulk_metrics_observer.clone(),
-                            obfuscation_key: self.obfuscation_key,
                         },
                     ),
                     self.handshake,
