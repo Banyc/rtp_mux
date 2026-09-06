@@ -9,8 +9,8 @@ metrics = "0.24"
 mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.27" }
 # mux = { path = "../mux" }
 rand = "0.10"
-# rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.86" }
-rtp = { path = "../rtp" }
+rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.87" }
+# rtp = { path = "../rtp" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
