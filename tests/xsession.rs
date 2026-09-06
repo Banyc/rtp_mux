@@ -1,6 +1,6 @@
 #![allow(clippy::disallowed_methods)]
 
-use rtp_mux::{RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer};
+use rtp_mux::{RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer, RtpMuxServerConfig};
 
 use std::{
     net::SocketAddr,
@@ -30,7 +30,9 @@ const CMD_DOWNLOAD: u8 = b'D';
 const CMD_UPLOAD: u8 = b'U';
 
 async fn spawn_cmd_server(scope: &mut TestScope) -> SocketAddr {
-    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
+    let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
+        .await
+        .unwrap();
     let addr = server.listener().local_addr();
     // The serve loop and every future it spawns (session supervisors and
     // per-stream command handlers) are submitted through the bounded reaper,

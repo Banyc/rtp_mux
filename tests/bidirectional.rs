@@ -3,7 +3,9 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use mux::LaneClass;
-use rtp_mux::{RtpMuxConnectorConfig, RtpMuxServer, connect_bidirectional_session};
+use rtp_mux::{
+    RtpMuxConnectorConfig, RtpMuxServer, RtpMuxServerConfig, connect_bidirectional_session,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -98,7 +100,9 @@ async fn run_ping_pong(mut scope: TestScope, server: RtpMuxServer, config: RtpMu
 #[tokio::test(flavor = "multi_thread")]
 async fn listening_side_can_open_a_stream_to_the_dialing_side() {
     let scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
+    let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
+        .await
+        .unwrap();
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
     run_ping_pong(scope, server, RtpMuxConnectorConfig::standard(bind)).await;
 }
@@ -109,7 +113,7 @@ async fn listening_side_can_open_a_stream_to_the_dialing_side() {
 #[tokio::test(flavor = "multi_thread")]
 async fn matching_disabled_handshake_mode_opens_session() {
     let scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0")
+    let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
         .await
         .unwrap()
         .with_handshake(false);
@@ -129,9 +133,14 @@ async fn matching_disabled_handshake_mode_opens_session() {
 async fn matching_obfuscation_keys_open_session() {
     let scope = TestScope::new();
     let key = rtp_mux::ObfuscationKey::from_bytes([7; 32]);
-    let server = RtpMuxServer::bind_with_obfuscation_key("127.0.0.1:0", Some(key))
-        .await
-        .unwrap();
+    let server = RtpMuxServer::bind(
+        "127.0.0.1:0",
+        RtpMuxServerConfig {
+            obfuscation_key: Some(key),
+        },
+    )
+    .await
+    .unwrap();
     let bind: rtp_mux::BindSelector = Arc::new(|addr: SocketAddr| SocketAddr::new(addr.ip(), 0));
     run_ping_pong(
         scope,
@@ -147,9 +156,11 @@ async fn matching_obfuscation_keys_open_session() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mismatched_obfuscation_keys_do_not_open_session() {
     let mut scope = TestScope::new();
-    let server = RtpMuxServer::bind_with_obfuscation_key(
+    let server = RtpMuxServer::bind(
         "127.0.0.1:0",
-        Some(rtp_mux::ObfuscationKey::from_bytes([7; 32])),
+        RtpMuxServerConfig {
+            obfuscation_key: Some(rtp_mux::ObfuscationKey::from_bytes([7; 32])),
+        },
     )
     .await
     .unwrap();
@@ -200,7 +211,7 @@ async fn mismatched_obfuscation_keys_do_not_open_session() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mismatched_handshake_mode_does_not_open_session() {
     let mut scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0")
+    let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
         .await
         .unwrap()
         .with_handshake(false);

@@ -1,6 +1,6 @@
 #![allow(clippy::disallowed_methods)]
 
-use rtp_mux::{RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer};
+use rtp_mux::{RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer, RtpMuxServerConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,7 +14,9 @@ const PAYLOAD: usize = 256 * 1024;
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_counts_its_streams_and_the_bytes_they_carried() {
     let mut scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
+    let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
+        .await
+        .unwrap();
     let addr = server.listener().local_addr();
     // The serve loop and every future it spawns (session supervisors and
     // per-stream echo handlers) are submitted through the bounded reaper, so

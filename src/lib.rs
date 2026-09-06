@@ -57,6 +57,6 @@ impl ObfuscationKey {
         self.0
     }
 }
-pub use server::{RtpMuxServer, ServeError};
+pub use server::{RtpMuxServer, RtpMuxServerConfig, ServeError};
 pub use session::SessionSpawner;
 pub use stream::{ServerStream, SocketAddrPair};

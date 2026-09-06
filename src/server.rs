@@ -82,28 +82,44 @@ pub enum ServeError {
     ExpiryWorkerStopped { addr: SocketAddr },
 }
 
-impl RtpMuxServer {
-    /// Bind both lanes without datagram obfuscation: datagrams travel in
-    /// the clear.
-    pub async fn bind(addr: impl ToSocketAddrs + Clone + Debug) -> io::Result<Self> {
-        Self::bind_with_obfuscation_key(addr, None).await
-    }
+/// Settings for [`RtpMuxServer::bind`]: the datagram-obfuscation key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RtpMuxServerConfig {
+    /// When set, every RTP datagram is prefixed with a 24-byte random nonce
+    /// and chacha20-encrypted with this key on both lanes. The peer
+    /// connector must use the same key; `None` (the default) sends
+    /// datagrams in the clear. The key is fixed at bind on both listeners,
+    /// which decrypt each datagram once at the dispatch and answer path
+    /// probes with the same key, so a passive observer cannot tell probes
+    /// from data.
+    pub obfuscation_key: Option<crate::ObfuscationKey>,
+}
 
-    /// Bind both lanes with datagram obfuscation: every RTP datagram is
-    /// prefixed with a 24-byte random nonce and chacha20-encrypted with
-    /// `key`. The peer connector must use the same key; `None` (the
-    /// default) sends datagrams in the clear. The key is fixed at bind on
-    /// both listeners, which decrypt each datagram once at the dispatch and
-    /// answer path probes with the same key, so a passive observer cannot
-    /// tell probes from data.
-    pub async fn bind_with_obfuscation_key(
+impl RtpMuxServer {
+    /// Bind both lanes with the given settings (see [`RtpMuxServerConfig`]).
+    pub async fn bind(
         addr: impl ToSocketAddrs + Clone + Debug,
-        key: Option<crate::ObfuscationKey>,
+        config: RtpMuxServerConfig,
     ) -> io::Result<Self> {
+        let RtpMuxServerConfig {
+            obfuscation_key: key,
+        } = config;
         let key_bytes = key.map(crate::ObfuscationKey::into_bytes);
-        let interactive_listener = rtp::udp::Listener::bind_with_key(addr, key_bytes).await?;
+        let interactive_listener = rtp::udp::Listener::bind(
+            addr,
+            rtp::udp::ListenerConfig {
+                obfuscation_key: key_bytes,
+            },
+        )
+        .await?;
         let bulk_addr = bulk_lane_addr(interactive_listener.local_addr())?;
-        let bulk_listener = rtp::udp::Listener::bind_with_key(bulk_addr, key_bytes).await?;
+        let bulk_listener = rtp::udp::Listener::bind(
+            bulk_addr,
+            rtp::udp::ListenerConfig {
+                obfuscation_key: key_bytes,
+            },
+        )
+        .await?;
         Ok(Self::new(interactive_listener, bulk_listener))
     }
 

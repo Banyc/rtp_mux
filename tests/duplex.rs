@@ -1,6 +1,8 @@
 #![allow(clippy::disallowed_methods)]
 
-use rtp_mux::{RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer, ServerStream};
+use rtp_mux::{
+    RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer, RtpMuxServerConfig, ServerStream,
+};
 use std::{
     net::SocketAddr,
     sync::{
@@ -20,7 +22,9 @@ const CHUNK: usize = 64 * 1024;
 #[tokio::test(flavor = "multi_thread")]
 async fn response_migration_end_to_end() {
     let mut scope = TestScope::new();
-    let server = RtpMuxServer::bind("127.0.0.1:0").await.unwrap();
+    let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
+        .await
+        .unwrap();
     let addr = server.listener().local_addr();
     let saw_duplex = Arc::new(AtomicBool::new(false));
     let saw_duplex_handler = Arc::clone(&saw_duplex);
