@@ -51,6 +51,8 @@ pub(crate) struct SocketCandidate {
     /// so candidate-path probes are indistinguishable from the obfuscated
     /// data channel. `None` keeps the plaintext probe channel.
     key: Option<crate::ObfuscationKey>,
+    /// Reused scratch for encoding obfuscated probes.
+    scratch: Vec<u8>,
 }
 
 impl SocketCandidate {
@@ -62,7 +64,14 @@ impl SocketCandidate {
         let socket = tokio_udp::UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?;
         socket.connect(remote).await?;
         let local = socket.local_addr()?;
-        Ok((Self { socket, key }, local))
+        Ok((
+            Self {
+                socket,
+                key,
+                scratch: Vec::new(),
+            },
+            local,
+        ))
     }
     pub(crate) fn into_socket(self) -> tokio_udp::UdpSocket {
         self.socket
@@ -72,13 +81,10 @@ impl SocketCandidate {
 impl ProbeIo for SocketCandidate {
     fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()> {
         match self.key {
-            Some(key) => self
-                .socket
-                .try_send(&rtp::path_probe::encode_probe_obfuscated(
-                    echo,
-                    key.into_bytes(),
-                ))
-                .map(drop),
+            Some(key) => {
+                rtp::path_probe::encode_probe_obfuscated(echo, key.into_bytes(), &mut self.scratch);
+                self.socket.try_send(&self.scratch).map(drop)
+            }
             None => self
                 .socket
                 .try_send(&rtp::path_probe::encode_probe(echo))
