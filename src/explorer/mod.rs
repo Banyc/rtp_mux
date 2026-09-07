@@ -51,6 +51,9 @@ pub(crate) struct SocketCandidate {
     /// so candidate-path probes are indistinguishable from the obfuscated
     /// data channel. `None` keeps the plaintext probe channel.
     key: Option<crate::ObfuscationKey>,
+    /// The padding profile for the probe side channel; the explorer does not
+    /// configure one, so probes use the historical format.
+    profile: Option<rtp::udp::TargetProfile>,
     /// Reused scratch for encoding obfuscated probes.
     scratch: Vec<u8>,
 }
@@ -68,6 +71,7 @@ impl SocketCandidate {
             Self {
                 socket,
                 key,
+                profile: None,
                 scratch: Vec::new(),
             },
             local,
@@ -82,7 +86,12 @@ impl ProbeIo for SocketCandidate {
     fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()> {
         match self.key {
             Some(key) => {
-                rtp::path_probe::encode_probe_obfuscated(echo, key.into_bytes(), &mut self.scratch);
+                rtp::path_probe::encode_probe_obfuscated(
+                    echo,
+                    key.into_bytes(),
+                    self.profile,
+                    &mut self.scratch,
+                );
                 self.socket.try_send(&self.scratch).map(drop)
             }
             None => self
@@ -96,7 +105,11 @@ impl ProbeIo for SocketCandidate {
         loop {
             let n = self.socket.try_recv(&mut buf).ok()?;
             let echo = match self.key {
-                Some(key) => rtp::path_probe::decode_echo_obfuscated(&buf[..n], key.into_bytes()),
+                Some(key) => rtp::path_probe::decode_echo_obfuscated(
+                    &buf[..n],
+                    key.into_bytes(),
+                    self.profile,
+                ),
                 None => rtp::path_probe::decode_echo(&buf[..n]),
             };
             if let Some(echo) = echo {

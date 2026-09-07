@@ -109,6 +109,7 @@ impl RtpMuxServer {
             addr,
             rtp::udp::ListenerConfig {
                 obfuscation_key: key_bytes,
+                padding_profile: None,
             },
         )
         .await?;
@@ -117,6 +118,7 @@ impl RtpMuxServer {
             bulk_addr,
             rtp::udp::ListenerConfig {
                 obfuscation_key: key_bytes,
+                padding_profile: None,
             },
         )
         .await?;
