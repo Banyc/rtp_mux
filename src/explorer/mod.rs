@@ -53,7 +53,7 @@ pub(crate) struct SocketCandidate {
     key: Option<crate::ObfuscationKey>,
     /// The padding profile for the probe side channel; the explorer does not
     /// configure one, so probes use the historical format.
-    profile: Option<rtp::udp::TargetProfile>,
+    profile: Option<rtp::udp::PaddingProfile>,
     /// Reused scratch for encoding obfuscated probes.
     scratch: Vec<u8>,
 }
