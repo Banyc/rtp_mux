@@ -45,7 +45,7 @@ pub(crate) struct ConnectedDualLaneBirth {
     pub(crate) local_addr: SocketAddr,
     pub(crate) nonce: PairingNonce,
     pub(crate) supervisor: JoinSet<MuxError>,
-    pub(crate) probe_tap: Option<rtp::path_probe::EchoDemux>,
+    pub(crate) probe_tap: Option<rtp::probe::EchoDemux>,
     pub(crate) traffic: Arc<SessionByteCounters>,
 }
 

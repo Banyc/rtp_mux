@@ -31,15 +31,15 @@ impl Default for ExplorerConfig {
 }
 
 pub(crate) trait ProbeIo: Send {
-    fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()>;
-    fn try_recv_echo(&mut self) -> Option<rtp::path_probe::ProbeEcho>;
+    fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()>;
+    fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho>;
 }
-impl ProbeIo for rtp::path_probe::EchoDemux {
-    fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()> {
-        rtp::path_probe::EchoDemux::send_probe(self, echo)
+impl ProbeIo for rtp::probe::EchoDemux {
+    fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
+        rtp::probe::EchoDemux::send_probe(self, echo)
     }
-    fn try_recv_echo(&mut self) -> Option<rtp::path_probe::ProbeEcho> {
-        rtp::path_probe::EchoDemux::try_recv_echo(self)
+    fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
+        rtp::probe::EchoDemux::try_recv_echo(self)
     }
 }
 
@@ -79,34 +79,34 @@ impl SocketCandidate {
 }
 
 impl ProbeIo for SocketCandidate {
-    fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()> {
+    fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
         match self.key {
             Some(key) => {
-                rtp::path_probe::encode_probe_obfuscated(
+                rtp::probe::encode_probe_obfuscated(
                     echo,
                     key.into_bytes(),
-                    rtp::path_probe::probe_settings(),
+                    rtp::probe::probe_settings(),
                     &mut self.scratch,
                 );
                 self.socket.try_send(&self.scratch).map(drop)
             }
             None => self
                 .socket
-                .try_send(&rtp::path_probe::encode_probe(echo))
+                .try_send(&rtp::probe::encode_probe(echo))
                 .map(drop),
         }
     }
-    fn try_recv_echo(&mut self) -> Option<rtp::path_probe::ProbeEcho> {
+    fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
         let mut buf = [0u8; 64];
         loop {
             let n = self.socket.try_recv(&mut buf).ok()?;
             let echo = match self.key {
-                Some(key) => rtp::path_probe::decode_echo_obfuscated(
+                Some(key) => rtp::probe::decode_echo_obfuscated(
                     &buf[..n],
                     key.into_bytes(),
-                    rtp::path_probe::probe_settings(),
+                    rtp::probe::probe_settings(),
                 ),
-                None => rtp::path_probe::decode_echo(&buf[..n]),
+                None => rtp::probe::decode_echo(&buf[..n]),
             };
             if let Some(echo) = echo {
                 return Some(echo);
@@ -309,7 +309,7 @@ mod tests {
     }
 
     impl ProbeIo for FakeIo {
-        fn send_probe(&mut self, echo: rtp::path_probe::ProbeEcho) -> io::Result<()> {
+        fn send_probe(&mut self, echo: rtp::probe::ProbeEcho) -> io::Result<()> {
             if self.send_fails {
                 return Err(io::Error::from(io::ErrorKind::NetworkUnreachable));
             }
@@ -317,12 +317,12 @@ mod tests {
             Ok(())
         }
 
-        fn try_recv_echo(&mut self) -> Option<rtp::path_probe::ProbeEcho> {
+        fn try_recv_echo(&mut self) -> Option<rtp::probe::ProbeEcho> {
             self.echoes
                 .lock()
                 .unwrap()
                 .pop_front()
-                .map(|nonce| rtp::path_probe::ProbeEcho {
+                .map(|nonce| rtp::probe::ProbeEcho {
                     nonce,
                     timestamp_micros: 0,
                 })

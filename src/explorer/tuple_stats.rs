@@ -88,7 +88,7 @@ impl TupleStats {
         }
         if self.outstanding.is_none() && now >= self.next_probe_at {
             let nonce = rand::random();
-            let echo = rtp::path_probe::ProbeEcho {
+            let echo = rtp::probe::ProbeEcho {
                 nonce,
                 timestamp_micros: now.duration_since(epoch).as_micros() as u64,
             };
