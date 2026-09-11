@@ -112,6 +112,7 @@ impl RtpMuxServer {
                 // The mux lane keeps the historical wire behavior: no DPI
                 // padding (explicit regardless of the rtp default).
                 padding: rtp::udp::HarmfulPaddingPolicy::None,
+                ..rtp::udp::ListenerConfig::default()
             },
         )
         .await?;
@@ -121,6 +122,7 @@ impl RtpMuxServer {
             rtp::udp::ListenerConfig {
                 obfuscation_key: key_bytes,
                 padding: rtp::udp::HarmfulPaddingPolicy::None,
+                ..rtp::udp::ListenerConfig::default()
             },
         )
         .await?;
