@@ -61,7 +61,7 @@ impl RtpMuxConnectorConfig {
         Self {
             bind,
             bulk_addr: Arc::new(crate::shared::bulk_lane_addr),
-            interactive_fec_tuning: transport_defaults.fec_tuning,
+            interactive_fec_tuning: rtp::FecTuning::interactive_prompt(),
             interactive_instream_group_fec: transport_defaults.instream_group_fec,
             interactive_metrics_observer: None,
             bulk_metrics_observer: None,
@@ -1980,5 +1980,35 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
         assert!(error.to_string().contains("attempt=3"), "{error}");
+    }
+
+    #[test]
+    fn standard_defaults_the_interactive_lane_to_prompt_parity() {
+        let config = RtpMuxConnectorConfig::standard(Arc::new(|addr| addr));
+        assert_eq!(
+            config.interactive_fec_tuning,
+            crate::FecTuning::interactive_prompt(),
+            "the interactive lane must force-flush parity by default"
+        );
+        assert!(
+            config.interactive_fec_tuning.instream_flush,
+            "the interactive lane's default tuning must request a prompt burst flush"
+        );
+        let bulk = crate::lane_transport::connect_config(
+            LaneClass::Bulk,
+            crate::lane_transport::ConnectSettings {
+                interactive_fec_tuning: config.interactive_fec_tuning,
+                interactive_instream_group_fec: config.interactive_instream_group_fec,
+                handshake: true,
+                metrics_observer: None,
+                obfuscation_key: None,
+            },
+        );
+        assert_eq!(
+            bulk.fec_tuning,
+            crate::FecTuning::default(),
+            "the interactive default must not leak prompt parity onto the bulk lane"
+        );
+        assert!(!bulk.fec, "the bulk lane must stay FEC-free");
     }
 }

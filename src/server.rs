@@ -135,7 +135,7 @@ impl RtpMuxServer {
             interactive_listener,
             bulk_listener,
             mux: JoinSet::new(),
-            interactive_fec_tuning: transport_defaults.fec_tuning,
+            interactive_fec_tuning: rtp::FecTuning::interactive_prompt(),
             interactive_instream_group_fec: transport_defaults.instream_group_fec,
             interactive_metrics_observer: None,
             bulk_metrics_observer: None,
@@ -1559,5 +1559,35 @@ mod tests {
             1,
             "a fully built lane was dropped without recording a rejection, so the peer sees a bare close and the operator sees nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn interactive_lane_default_uses_prompt_fec_tuning() {
+        let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
+            .await
+            .expect("bind a loopback server");
+        assert_eq!(
+            server.interactive_fec_tuning,
+            crate::FecTuning::interactive_prompt(),
+            "the interactive lane must force-flush parity by default"
+        );
+        assert!(
+            server.interactive_fec_tuning.instream_flush,
+            "the interactive lane's default tuning must request a prompt burst flush"
+        );
+        let bulk = lane_transport::accept_config(
+            mux::LaneClass::Bulk,
+            lane_transport::AcceptSettings {
+                interactive_fec_tuning: server.interactive_fec_tuning,
+                interactive_instream_group_fec: server.interactive_instream_group_fec,
+                metrics_observer: None,
+            },
+        );
+        assert_eq!(
+            bulk.fec_tuning,
+            crate::FecTuning::default(),
+            "the interactive default must not leak prompt parity onto the bulk lane"
+        );
+        assert!(!bulk.fec, "the bulk lane must stay FEC-free");
     }
 }
