@@ -6,6 +6,12 @@
 //! FEC — regardless of any interactive settings. Each lane keeps its own
 //! independent typed metrics observer, and the connect config preserves the
 //! per-connector handshake toggle.
+//!
+//! The lane-aware frame-delivery policy is likewise owned here: the
+//! interactive lane enables the receiver-side fast-forward so a complete frame
+//! past an unrepaired hole is handed up immediately (mux's per-stream reorder
+//! buffer restores ordering), while the bulk lane stays strictly ordered so
+//! its throughput and ordering contract are unchanged.
 
 use mux::LaneClass;
 
@@ -40,6 +46,18 @@ fn fec_enabled(lane: LaneClass) -> bool {
     matches!(lane, LaneClass::Interactive)
 }
 
+/// The lane's receiver-side frame-delivery policy. The interactive lane opts
+/// into the fast-forward (mux reassembles each stream in order); the bulk lane
+/// stays strict. Frame delivery itself is forced on by the frame-delivery
+/// entry points on both lanes; this only selects the ordering policy.
+fn frame_delivery(lane: LaneClass) -> rtp::FrameMode {
+    if matches!(lane, LaneClass::Interactive) {
+        rtp::FrameMode::enabled_reordering()
+    } else {
+        rtp::FrameMode::default()
+    }
+}
+
 pub(crate) fn connect_config(
     lane: LaneClass,
     settings: ConnectSettings,
@@ -59,6 +77,7 @@ pub(crate) fn connect_config(
         obfuscation_key: settings
             .obfuscation_key
             .map(crate::ObfuscationKey::into_bytes),
+        frame_delivery: frame_delivery(lane),
         ..defaults
     }
 }
@@ -75,6 +94,7 @@ pub(crate) fn accept_config(lane: LaneClass, settings: AcceptSettings) -> rtp::u
         },
         instream_group_fec: fec && settings.interactive_instream_group_fec,
         metrics_observer: settings.metrics_observer,
+        frame_delivery: frame_delivery(lane),
         ..defaults
     }
 }
@@ -144,6 +164,46 @@ mod tests {
         assert!(!accept.fec, "bulk accept config must disable FEC");
         assert_eq!(accept.fec_tuning, rtp::FecTuning::default());
         assert!(!accept.instream_group_fec);
+    }
+
+    #[test]
+    fn interactive_lane_enables_frame_delivery_fast_forward() {
+        let connect = connect_config(
+            LaneClass::Interactive,
+            connect_settings(rtp::FecTuning::default(), false, true, None),
+        );
+        assert!(
+            connect.frame_delivery.enabled && connect.frame_delivery.allow_reorder,
+            "interactive lane must opt into receiver-side frame fast-forward"
+        );
+        let accept = accept_config(
+            LaneClass::Interactive,
+            accept_settings(rtp::FecTuning::default(), false, None),
+        );
+        assert!(
+            accept.frame_delivery.enabled && accept.frame_delivery.allow_reorder,
+            "interactive lane must opt into receiver-side frame fast-forward"
+        );
+    }
+
+    #[test]
+    fn bulk_lane_stays_strictly_ordered() {
+        let connect = connect_config(
+            LaneClass::Bulk,
+            connect_settings(rtp::FecTuning::default(), false, true, None),
+        );
+        assert!(
+            !connect.frame_delivery.allow_reorder,
+            "bulk lane must keep strict frame ordering"
+        );
+        let accept = accept_config(
+            LaneClass::Bulk,
+            accept_settings(rtp::FecTuning::default(), false, None),
+        );
+        assert!(
+            !accept.frame_delivery.allow_reorder,
+            "bulk lane must keep strict frame ordering"
+        );
     }
 
     #[test]
