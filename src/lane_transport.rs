@@ -13,7 +13,15 @@
 //! buffer restores ordering), while the bulk lane stays strictly ordered so
 //! its throughput and ordering contract are unchanged.
 
+//! The lane-aware congestion intent is owned here too: the bulk lane runs over
+//! its own dedicated RTP connection with no competing traffic, so it declares
+//! [`CongestionLane::Dedicated`] (the shallower drain / gentler probe tuning);
+//! the interactive lane shares the host's bottleneck with whatever else is on
+//! the wire, so it declares [`CongestionLane::Shared`] and keeps the
+//! conservative cross-traffic-protecting tuning.
+
 use mux::LaneClass;
+use rtp::CongestionLane;
 
 /// The connect-path transport policy rtp-mux owns: the lane-aware FEC knobs,
 /// the per-lane metrics observer, the RTP opening-handshake toggle, and the
@@ -58,6 +66,18 @@ fn frame_delivery(lane: LaneClass) -> rtp::FrameMode {
     }
 }
 
+/// The lane's congestion-controller intent.  The bulk lane is the dedicated
+/// pipe (no competing traffic over its connection's queue); the interactive
+/// lane shares the host's bottleneck and keeps the conservative tuning.  This
+/// is deliberately independent of [`frame_delivery`]: the bulk lane keeps
+/// frame delivery while still declaring a dedicated congestion lane.
+fn congestion_lane(lane: LaneClass) -> CongestionLane {
+    match lane {
+        LaneClass::Bulk => CongestionLane::Dedicated,
+        LaneClass::Interactive => CongestionLane::Shared,
+    }
+}
+
 pub(crate) fn connect_config(
     lane: LaneClass,
     settings: ConnectSettings,
@@ -78,6 +98,7 @@ pub(crate) fn connect_config(
             .obfuscation_key
             .map(crate::ObfuscationKey::into_bytes),
         frame_delivery: frame_delivery(lane),
+        congestion_lane: congestion_lane(lane),
         ..defaults
     }
 }
@@ -95,6 +116,7 @@ pub(crate) fn accept_config(lane: LaneClass, settings: AcceptSettings) -> rtp::u
         instream_group_fec: fec && settings.interactive_instream_group_fec,
         metrics_observer: settings.metrics_observer,
         frame_delivery: frame_delivery(lane),
+        congestion_lane: congestion_lane(lane),
         ..defaults
     }
 }
@@ -204,6 +226,50 @@ mod tests {
             !accept.frame_delivery.allow_reorder,
             "bulk lane must keep strict frame ordering"
         );
+    }
+
+    /// The bulk lane is the dedicated pipe: it declares a `Dedicated`
+    /// congestion lane even though it keeps frame delivery.  The interactive
+    /// lane shares the host bottleneck and stays `Shared`.
+    #[test]
+    fn bulk_lane_declares_a_dedicated_congestion_lane() {
+        let connect = connect_config(
+            LaneClass::Bulk,
+            connect_settings(rtp::FecTuning::default(), false, true, None),
+        );
+        assert_eq!(
+            connect.congestion_lane,
+            CongestionLane::Dedicated,
+            "bulk lane must declare a dedicated congestion lane"
+        );
+        assert_eq!(
+            connect.frame_delivery,
+            rtp::FrameMode::default(),
+            "the bulk config's congestion intent is independent of its frame-delivery bit"
+        );
+        let accept = accept_config(
+            LaneClass::Bulk,
+            accept_settings(rtp::FecTuning::default(), false, None),
+        );
+        assert_eq!(accept.congestion_lane, CongestionLane::Dedicated);
+    }
+
+    #[test]
+    fn interactive_lane_declares_a_shared_congestion_lane() {
+        let connect = connect_config(
+            LaneClass::Interactive,
+            connect_settings(rtp::FecTuning::default(), false, true, None),
+        );
+        assert_eq!(
+            connect.congestion_lane,
+            CongestionLane::Shared,
+            "the interactive lane must keep the conservative shared tuning"
+        );
+        let accept = accept_config(
+            LaneClass::Interactive,
+            accept_settings(rtp::FecTuning::default(), false, None),
+        );
+        assert_eq!(accept.congestion_lane, CongestionLane::Shared);
     }
 
     #[test]
