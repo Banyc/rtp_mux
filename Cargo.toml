@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 futures = "0.3"
 metrics = "0.24"
-mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.28" }
-# mux = { path = "../mux" }
+# mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.28" }
+mux = { path = "../mux" }
 rand = "0.10"
 rtp = { path = "../rtp" }
 # rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.89" }
