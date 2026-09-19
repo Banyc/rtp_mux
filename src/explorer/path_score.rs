@@ -93,3 +93,26 @@ impl MigrationVerdict {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cost_penalizes_loss_instead_of_ranking_by_rtt_alone() {
+        let fast_but_lossy = PathScore {
+            rtt: Duration::from_millis(100),
+            loss: 0.8,
+        };
+        let slow_but_clean = PathScore {
+            rtt: Duration::from_millis(200),
+            loss: 0.0,
+        };
+        assert!(
+            fast_but_lossy.cost() > slow_but_clean.cost(),
+            "a heavily lossy fast path outranked a clean slower one: {:?} vs {:?}",
+            fast_but_lossy,
+            slow_but_clean,
+        );
+    }
+}

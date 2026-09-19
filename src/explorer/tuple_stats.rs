@@ -134,3 +134,83 @@ pub struct TupleReport {
     pub loss: Option<f64>,
     pub alive: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::explorer::ProbeIo;
+    use rtp::probe::ProbeEcho;
+    use std::{collections::VecDeque, io, net::SocketAddr};
+
+    fn local() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 1))
+    }
+
+    #[derive(Debug, Default)]
+    struct ScriptedIo {
+        sent: Vec<u64>,
+        echoes: VecDeque<u64>,
+    }
+
+    impl ProbeIo for ScriptedIo {
+        fn send_probe(&mut self, echo: ProbeEcho) -> io::Result<()> {
+            self.sent.push(echo.nonce);
+            Ok(())
+        }
+
+        fn try_recv_echo(&mut self) -> Option<ProbeEcho> {
+            self.echoes.pop_front().map(|nonce| ProbeEcho {
+                nonce,
+                timestamp_micros: 0,
+            })
+        }
+    }
+
+    #[test]
+    fn an_echo_for_a_stale_probe_is_not_counted_as_the_outstanding_sample() {
+        let epoch = Instant::now();
+        let mean = Duration::from_secs(8);
+        let mut stats = TupleStats::new(epoch, mean);
+        let mut io = ScriptedIo::default();
+        // The first probe is staggered within [mean/2, mean], so ticking a
+        // full mean later guarantees it has been sent.
+        stats.tick(&mut io, epoch + mean, mean, epoch);
+        assert_eq!(io.sent.len(), 1, "no probe is outstanding to sample");
+        // Deliver an echo whose nonce belongs to some other probe.
+        io.echoes.push_back(io.sent[0].wrapping_add(1));
+        stats.tick(
+            &mut io,
+            epoch + mean + Duration::from_millis(1),
+            mean,
+            epoch,
+        );
+        assert!(
+            stats.report(local()).rtt.is_none(),
+            "an echo for a different probe was counted as this probe's round trip",
+        );
+    }
+
+    #[test]
+    fn the_rtt_ewma_weights_a_new_sample_less_than_the_history() {
+        let mut stats = TupleStats::new(Instant::now(), Duration::from_secs(8));
+        stats.record(Some(Duration::from_millis(10)));
+        stats.record(Some(Duration::from_millis(20)));
+        assert_eq!(
+            stats.report(local()).rtt,
+            Some(Duration::from_millis(13)),
+            "the rtt EWMA inverted the weight of the newest sample",
+        );
+    }
+
+    #[test]
+    fn the_loss_ewma_weights_a_new_sample_less_than_the_history() {
+        let mut stats = TupleStats::new(Instant::now(), Duration::from_secs(8));
+        stats.record(None);
+        stats.record(Some(Duration::from_millis(10)));
+        let loss = stats.report(local()).loss.unwrap();
+        assert!(
+            (loss - 0.7).abs() < 1e-9,
+            "the loss EWMA inverted the weight of the newest sample: {loss}",
+        );
+    }
+}

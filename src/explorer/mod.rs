@@ -636,4 +636,28 @@ mod tests {
             sending + PROBE_POLL_TICK
         );
     }
+
+    #[test]
+    fn defer_refill_suppresses_and_then_resumes_refilling() {
+        let now = Instant::now();
+        let mut explorer: PathExplorer<FakeIo> = PathExplorer::new(config(), now);
+        assert!(
+            explorer.wants_refill(now),
+            "an explorer with no candidates must want a refill"
+        );
+        let until = now + Duration::from_secs(5);
+        explorer.defer_refill(until);
+        assert!(
+            !explorer.wants_refill(now),
+            "a deferred refill still fired immediately"
+        );
+        assert!(
+            !explorer.wants_refill(until - Duration::from_millis(1)),
+            "a deferred refill fired before its deadline"
+        );
+        assert!(
+            explorer.wants_refill(until),
+            "the refill never resumed after the deferral"
+        );
+    }
 }
