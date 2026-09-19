@@ -45,10 +45,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dual_lane_configs_enable_frame_reassembly() {
-        assert!(client_mux_config().frame_reassembly);
-        assert!(server_mux_config().frame_reassembly);
-        assert!(client_mux_config().frame_reassembly);
-        assert!(server_mux_config().frame_reassembly);
+    fn the_two_lane_configs_declare_complementary_mux_roles() {
+        let client = client_mux_config();
+        let server = server_mux_config();
+        assert_eq!(
+            client.initiation,
+            Initiation::Client,
+            "the dialing lane config must initiate as the mux client",
+        );
+        assert_eq!(
+            server.initiation,
+            Initiation::Server,
+            "the accepting lane config must initiate as the mux server",
+        );
+        assert!(
+            client.frame_reassembly && server.frame_reassembly,
+            "both lane configs must enable frame reassembly",
+        );
+        assert_eq!(client.heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(server.heartbeat_interval, Duration::from_secs(5));
     }
 }
