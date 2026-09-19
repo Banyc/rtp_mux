@@ -142,6 +142,20 @@ mod tests {
     }
 
     #[test]
+    fn a_fatal_accept_error_is_returned_to_the_caller() {
+        let mut backoff = AcceptErrorBackoff::default();
+        let outcome =
+            backoff.failed_dispatching("t", addr(), io::Error::from(io::ErrorKind::InvalidInput));
+        let error = outcome
+            .expect_err("a permanently fatal accept error was swallowed as if it were retryable");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidInput,
+            "the fatal error's kind was lost on the way out",
+        );
+    }
+
+    #[test]
     fn a_persistent_error_streak_stops_spinning() {
         let mut backoff = AcceptErrorBackoff::default();
         transient(&mut backoff);
@@ -150,9 +164,13 @@ mod tests {
             Duration::ZERO,
             "one bad peer delayed the next good one"
         );
-        for _ in 1..WARN_AFTER_CONSECUTIVE {
-            transient(&mut backoff);
-        }
+        transient(&mut backoff);
+        assert_eq!(
+            backoff.retry_delay(),
+            Duration::ZERO,
+            "backoff began before the warn threshold was reached"
+        );
+        transient(&mut backoff);
         let first = backoff.retry_delay();
         assert!(
             first > Duration::ZERO,
