@@ -156,6 +156,40 @@ mod tests {
     }
 
     #[test]
+    fn every_fatal_kind_is_returned_and_a_retryable_kind_is_not() {
+        let fatal_kinds = [
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AddrNotAvailable,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::Unsupported,
+        ];
+        for kind in fatal_kinds {
+            let mut backoff = AcceptErrorBackoff::default();
+            let error = backoff
+                .failed_dispatching("t", addr(), io::Error::from(kind))
+                .expect_err("a fatal accept-error kind was treated as retryable");
+            assert_eq!(
+                error.kind(),
+                kind,
+                "{kind:?} must be classified fatal and returned unchanged",
+            );
+        }
+        let mut backoff = AcceptErrorBackoff::default();
+        assert!(
+            backoff
+                .failed_dispatching(
+                    "t",
+                    addr(),
+                    io::Error::from(io::ErrorKind::ConnectionAborted),
+                )
+                .is_ok(),
+            "a retryable accept-error kind was classified fatal, so one flaky peer stops the listener",
+        );
+    }
+
+    #[test]
     fn a_persistent_error_streak_stops_spinning() {
         let mut backoff = AcceptErrorBackoff::default();
         transient(&mut backoff);
