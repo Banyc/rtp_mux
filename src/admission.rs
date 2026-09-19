@@ -471,6 +471,35 @@ mod tests {
             supervisor: SessionHandle::idle(),
         }
     }
+    fn test_prepared_lane(
+        nonce: PairingNonce,
+        class: LaneClass,
+        peer: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> PreparedLane {
+        let (io, _peer_io) = tokio::io::duplex(64);
+        let (read, write) = tokio::io::split(io);
+        let mut tasks = tokio::task::JoinSet::new();
+        let (opener, accepter) = mux::spawn_mux_no_reconnection(
+            read,
+            write,
+            mux::MuxConfig::new(mux::Initiation::Server, Duration::from_secs(5)),
+            &mut tasks,
+        );
+        PreparedLane {
+            pending: mux::UnpairedLane::new(
+                class,
+                nonce,
+                GroupToken::generate(),
+                opener,
+                accepter,
+                tasks,
+            ),
+            peer,
+            local_addr,
+            supervisor: SessionHandle::idle(),
+        }
+    }
     #[tokio::test]
     async fn reinsert_ready_lane_hands_back_the_lane_it_cannot_restore() {
         let registry = PendingLaneRegistry::new();
@@ -1001,5 +1030,128 @@ mod tests {
             PendingLaneAdmission::Reject("group token mismatch between lanes")
         ));
         assert!(second.is_some());
+    }
+    #[test]
+    fn pending_lane_registry_enforces_global_limit() {
+        let registry = PendingLaneRegistry::new();
+        let mut permits = Vec::new();
+        for index in 0..MAX_PENDING_LANES {
+            let ip = IpAddr::V4(Ipv4Addr::from(index as u32 + 1));
+            permits.push(registry.try_admit(ip).expect("below the global cap"));
+        }
+        let extra = registry.try_admit(IpAddr::V4(Ipv4Addr::from(MAX_PENDING_LANES as u32 + 1)));
+        assert!(
+            extra.is_err(),
+            "the global pending-lane cap admitted a lane past its limit, so one peer address flood exhausts every slot",
+        );
+    }
+    #[test]
+    fn pending_lane_expiry_is_inclusive_of_its_deadline() {
+        let build = || {
+            let registry = PendingLaneRegistry::new();
+            let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+            let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+            let nonce = PairingNonce::generate();
+            let mut permit = Some(registry.try_admit(peer.ip()).unwrap());
+            registry.register_admitted(
+                nonce,
+                LaneClass::Interactive,
+                peer,
+                local,
+                GroupToken::generate(),
+                &mut permit,
+            );
+            let deadline = registry
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .get(&nonce)
+                .unwrap()
+                .expires_at();
+            (registry, deadline)
+        };
+        let (registry, deadline) = build();
+        assert!(
+            registry
+                .expire(deadline - Duration::from_nanos(1))
+                .is_empty(),
+            "a lane expired strictly before its pairing deadline",
+        );
+        let (registry, deadline) = build();
+        assert_eq!(
+            registry.expire(deadline).len(),
+            1,
+            "a lane stayed reserved at the exact instant of its pairing deadline",
+        );
+    }
+    #[tokio::test]
+    async fn confirm_reservation_makes_the_lane_pairable() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let group = GroupToken::generate();
+        let mut permit = Some(registry.try_admit(peer.ip()).unwrap());
+        assert!(matches!(
+            registry.register_admitted(
+                nonce,
+                LaneClass::Interactive,
+                peer,
+                local,
+                group,
+                &mut permit
+            ),
+            PendingLaneAdmission::Reserved
+        ));
+        assert!(
+            registry
+                .confirm_reservation(
+                    nonce,
+                    test_prepared_lane(nonce, LaneClass::Interactive, peer, local),
+                )
+                .is_ok(),
+            "a matching prepared lane must claim its reservation",
+        );
+        let mut second = Some(registry.try_admit(peer.ip()).unwrap());
+        let admission =
+            registry.register_admitted(nonce, LaneClass::Bulk, peer, local, group, &mut second);
+        assert!(
+            matches!(admission, PendingLaneAdmission::Pair { .. }),
+            "a confirmed reservation did not hand its lane to the opposite-class arrival",
+        );
+    }
+    #[tokio::test]
+    async fn confirm_reservation_rejects_a_lane_that_does_not_match_its_reservation() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let mut permit = Some(registry.try_admit(peer.ip()).unwrap());
+        registry.register_admitted(
+            nonce,
+            LaneClass::Interactive,
+            peer,
+            local,
+            GroupToken::generate(),
+            &mut permit,
+        );
+        let wrong_class = registry.confirm_reservation(
+            nonce,
+            test_prepared_lane(nonce, LaneClass::Bulk, peer, local),
+        );
+        assert!(
+            wrong_class.is_err(),
+            "a prepared lane of the wrong class claimed another lane's reservation",
+        );
+        let foreign_peer: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let wrong_peer = registry.confirm_reservation(
+            nonce,
+            test_prepared_lane(nonce, LaneClass::Interactive, foreign_peer, local),
+        );
+        assert!(
+            wrong_peer.is_err(),
+            "a prepared lane from a different peer claimed another peer's reservation",
+        );
     }
 }
