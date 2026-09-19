@@ -122,6 +122,52 @@ mod tests {
         }
     }
     #[test]
+    fn each_lane_rejection_class_reports_its_documented_metric_name() {
+        let documented = [
+            (
+                LaneRejectionClass::Capacity,
+                "stream.rtp_mux.capacity_rejected",
+            ),
+            (
+                LaneRejectionClass::HelloTimeout,
+                "stream.rtp_mux.hello_timeout",
+            ),
+            (
+                LaneRejectionClass::HelloParse,
+                "stream.rtp_mux.hello_parse_error",
+            ),
+            (
+                LaneRejectionClass::ClassMismatch,
+                "stream.rtp_mux.class_mismatch",
+            ),
+            (
+                LaneRejectionClass::Admission,
+                "stream.rtp_mux.admission_rejected",
+            ),
+            (LaneRejectionClass::GroupFull, "stream.rtp_mux.group_full"),
+            (
+                LaneRejectionClass::PairingTimeout,
+                "stream.rtp_mux.pairing_timeout",
+            ),
+            (
+                LaneRejectionClass::BirthHeartbeat,
+                "stream.rtp_mux.birth_heartbeat_error",
+            ),
+            (
+                LaneRejectionClass::ReservationLost,
+                "stream.rtp_mux.reservation_lost",
+            ),
+        ];
+        for (class, name) in documented {
+            assert_eq!(
+                class.metric_name(),
+                name,
+                "{class:?} reports the wrong metric, so its counter cannot be trusted",
+            );
+        }
+    }
+
+    #[test]
     fn lane_rejection_log_aggregates_across_classes_peers_and_lanes() {
         let log = LaneRejectionLog::default();
         let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
@@ -156,6 +202,16 @@ mod tests {
         assert_eq!(
             summary.by_class.get(&LaneRejectionClass::HelloParse),
             Some(&1)
+        );
+        assert_eq!(
+            summary.first.as_ref().map(|context| context.class),
+            Some(LaneRejectionClass::HelloTimeout),
+            "the first rejected-lane context was overwritten by a later one",
+        );
+        assert_eq!(
+            summary.last.as_ref().map(|context| context.class),
+            Some(LaneRejectionClass::HelloParse),
+            "the last rejected-lane context does not name the most recent rejection",
         );
     }
 }
