@@ -115,4 +115,108 @@ mod tests {
             slow_but_clean,
         );
     }
+
+    #[test]
+    fn every_migration_rule_reports_its_documented_label() {
+        let documented = [
+            (MigrationRule::Rtt, "rtt_margin"),
+            (MigrationRule::Loss, "loss_margin"),
+        ];
+        for (rule, label) in documented {
+            assert_eq!(
+                rule.as_str(),
+                label,
+                "{rule:?} reports {label:?} as its migration label",
+            );
+        }
+    }
+
+    #[test]
+    fn every_migration_verdict_reports_its_documented_label_and_accessors() {
+        let active = PathScore {
+            rtt: Duration::from_millis(100),
+            loss: 0.01,
+        };
+        let best = PathScore {
+            rtt: Duration::from_millis(50),
+            loss: 0.0,
+        };
+        let cases = [
+            (
+                MigrationVerdict::Migrate {
+                    rule: MigrationRule::Rtt,
+                    active,
+                    best,
+                },
+                "margin_win",
+                true,
+                Some(active),
+                Some(best),
+                Some(MigrationRule::Rtt),
+            ),
+            (
+                MigrationVerdict::Migrate {
+                    rule: MigrationRule::Loss,
+                    active,
+                    best,
+                },
+                "margin_win",
+                true,
+                Some(active),
+                Some(best),
+                Some(MigrationRule::Loss),
+            ),
+            (
+                MigrationVerdict::ActiveUnmeasured,
+                "active_unmeasured",
+                false,
+                None,
+                None,
+                None,
+            ),
+            (
+                MigrationVerdict::NoLiveCandidate { active },
+                "no_live_candidate",
+                false,
+                Some(active),
+                None,
+                None,
+            ),
+            (
+                MigrationVerdict::WithinMargin { active, best },
+                "within_margin",
+                false,
+                Some(active),
+                Some(best),
+                None,
+            ),
+        ];
+        for (verdict, label, wants_migration, active, best, rule) in cases {
+            assert_eq!(
+                verdict.as_str(),
+                label,
+                "{verdict:?} reports the wrong migration label",
+            );
+            assert_eq!(
+                verdict.wants_migration(),
+                wants_migration,
+                "{verdict:?} disagrees on whether it wants a migration",
+            );
+            assert_eq!(
+                verdict.active(),
+                active,
+                "{verdict:?} reports the wrong active path",
+            );
+            assert_eq!(
+                verdict.best(),
+                best,
+                "{verdict:?} reports the wrong best path",
+            );
+            assert_eq!(
+                verdict.rule(),
+                rule,
+                "{verdict:?} reports the wrong migration rule",
+            );
+        }
+    }
 }

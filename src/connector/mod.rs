@@ -870,6 +870,21 @@ mod tests {
     use crate::shared::{client_mux_config, server_mux_config};
     use mux::{PairingNonce, spawn_mux_no_reconnection};
 
+    #[test]
+    fn every_redial_trigger_reports_its_documented_label() {
+        let documented = [
+            (RedialTrigger::Forced, "forced"),
+            (RedialTrigger::BetterPath, "better_path"),
+        ];
+        for (trigger, label) in documented {
+            assert_eq!(
+                trigger.as_str(),
+                label,
+                "{trigger:?} reports {label:?} as its redial trigger label",
+            );
+        }
+    }
+
     fn spawn_test_connector(
         dialer: DualLaneDialer,
         tasks: &mut JoinSet<()>,
