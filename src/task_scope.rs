@@ -68,6 +68,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_selected_result_beats_a_sibling_that_completed_racing_it() {
+        let mut tasks: JoinSet<u32> = JoinSet::new();
+        // A sibling that completed before the owner's result was selected must
+        // not displace that selected result: the owner won, so its value is
+        // the outcome, not whatever else happened to finish concurrently.
+        let handle = tasks.spawn(async { 3 });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let selected = Some(Ok(7));
+        let outcome = finish_with_first(&mut tasks, selected).await;
+        assert_eq!(
+            outcome,
+            Some(7),
+            "a racing completed sibling overwrote the selected result",
+        );
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
     #[should_panic(expected = "sibling panic")]
     async fn racing_completed_panic_cascades_after_an_ordinary_result() {
         let mut tasks: JoinSet<u32> = JoinSet::new();
