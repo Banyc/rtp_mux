@@ -183,6 +183,34 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[test]
+    fn session_stats_renders_both_byte_scales_and_both_rate_arms() {
+        let scaled = SessionStats {
+            live_streams: 1,
+            opened_streams: 2,
+            tx_bytes: 1536,
+            rx_bytes: 512,
+            uptime: Duration::from_secs(1),
+        };
+        assert_eq!(
+            scaled.to_string(),
+            "streams=1 live/2 opened, tx=1.5KiB (1.5KiB/s), rx=512B (512B/s), up=1.0s",
+            "the byte scale or the per-second rate changed shape",
+        );
+        let idle = SessionStats {
+            live_streams: 0,
+            opened_streams: 0,
+            tx_bytes: 2048,
+            rx_bytes: 0,
+            uptime: Duration::ZERO,
+        };
+        assert_eq!(
+            idle.to_string(),
+            "streams=0 live/0 opened, tx=2.0KiB (0B/s), rx=0B (0B/s), up=0.0s",
+            "a zero-duration window must report 0B/s rather than dividing by zero",
+        );
+    }
+
     #[tokio::test]
     async fn a_counted_half_tallies_only_the_bytes_it_moved() {
         let traffic = Arc::new(SessionByteCounters::default());
