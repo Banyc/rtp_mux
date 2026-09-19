@@ -619,4 +619,52 @@ mod tests {
         .expect("the background writer must drain after a normal shutdown");
         assert!(half.background_writer.is_empty());
     }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent() {
+        use tokio::io::AsyncWriteExt;
+        let (opener, _accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (writer, _gen0) = opener.open_migrating_with_reader(52, mux::LaneClass::Interactive);
+        let (mut half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        tokio::time::timeout(Duration::from_secs(2), half.shutdown())
+            .await
+            .expect("the first shutdown must complete")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), half.shutdown())
+            .await
+            .expect("the second shutdown must complete")
+            .expect("a second shutdown of an already-closed half must succeed");
+    }
+
+    #[tokio::test]
+    async fn a_flush_does_not_close_the_write_half() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (opener, accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (writer, _gen0) = opener.open_migrating_with_reader(53, mux::LaneClass::Interactive);
+        let (mut half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        half.write_all(b"first").await.unwrap();
+        half.flush().await.unwrap();
+        // A flush must not finalize the stream: data written afterwards still
+        // reaches the peer.
+        half.write_all(b"second").await.unwrap();
+        half.shutdown().await.unwrap();
+        let mut accepter = accepter.into_migrating_only();
+        let accepted = tokio::time::timeout(Duration::from_secs(2), accepter.accept())
+            .await
+            .expect("the stream must be accepted")
+            .unwrap();
+        let mut reader = match accepted {
+            mux::AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected a migrating stream"),
+        };
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut bytes))
+            .await
+            .expect("the peer must see the stream end")
+            .unwrap();
+        assert_eq!(
+            bytes, b"firstsecond",
+            "a flush ended the stream, so the write after it was lost",
+        );
+    }
 }
