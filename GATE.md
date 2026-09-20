@@ -331,10 +331,12 @@ reachable.
 Every entry is a report-only harness guard, not a gate: finalize/setup
 helpers that abort on harness malfunction (`with_timeout`, `submit_test_task`,
 `TestScope::run`/`spawn_required`, the `spawn_*_server_core` mux/rtp server
-helpers, `try_send_observation`), argument validation (`percentile`,
-`gilbert_elliott_loss`), and the `rtp_mux_jitter` report-only
-`assert_sane`/`assert_reportable` liveness floors. The constitution outcomes
-they sanity-guard are asserted by the `full`-tier gates that run them.
+helpers, the dual-lane client-connect core
+(`dual_mux_client_connect_lane_rtp_via`), `try_send_observation`), argument
+validation (`percentile`, `gilbert_elliott_loss`), and the `rtp_mux_jitter`
+report-only `assert_sane`/`assert_reportable` liveness floors. The
+constitution outcomes they sanity-guard are asserted by the `full`-tier gates
+that run them.
 
 ```gate-perf-guard-helpers
 mux/src/testkit/mux.rs::mux_client_connect_core = 1
@@ -351,6 +353,7 @@ netem_test/netem-test/src/kit/task_scope.rs::spawn_required = 1
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
 rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
+rtp_mux/src/testkit/dual.rs::dual_mux_client_connect_lane_rtp_via = 1
 tests/rtp_mux_jitter.rs::assert_reportable = 2
 tests/rtp_mux_jitter.rs::assert_sane = 2
 ```
