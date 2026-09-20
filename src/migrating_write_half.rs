@@ -667,4 +667,48 @@ mod tests {
             "a flush ended the stream, so the write after it was lost",
         );
     }
+
+    /// A single `poll_write` builds the background-writer command from exactly
+    /// one capped chunk buffer: `Vec::with_capacity(chunk)` is the only
+    /// allocation the call may make. Regression guard for the per-write
+    /// staging cost — adding any second allocation (a scratch buffer, a
+    /// per-slice copy, a formatted string) fails the count. Runs on the
+    /// current thread so the thread-local allocation counter measures this
+    /// test's poll only; the background writer's consumption happens on a
+    /// later yield, outside the measured window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_builds_exactly_one_capped_chunk_buffer() {
+        use std::task::Waker;
+        use tokio::io::AsyncWrite;
+        let (opener, _accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (writer, _gen0) = opener.open_migrating_with_reader(77, mux::LaneClass::Interactive);
+        let (mut half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        let chunk = vec![0xABu8; 4096];
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // Warm one write and yield so the background writer consumes it and
+        // the command channel stays writable for the measured writes.
+        let n = match std::pin::Pin::new(&mut half).poll_write(&mut cx, &chunk) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("first poll_write should be Ready(Ok): {other:?}"),
+        };
+        assert_eq!(n, 4096);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let before = crate::test_alloc::thread_alloc_count();
+        let n = match std::pin::Pin::new(&mut half).poll_write(&mut cx, &chunk) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("a warm poll_write should be Ready(Ok): {other:?}"),
+        };
+        let allocated = crate::test_alloc::thread_alloc_count() - before;
+        assert_eq!(n, 4096);
+        assert_eq!(
+            allocated, 1,
+            "a single poll_write allocated {allocated} times; expected exactly one \
+             (the capped chunk command buffer). The write path must stage the \
+             caller's bytes into one buffer per call, with no extra scratch \
+             allocations",
+        );
+    }
 }

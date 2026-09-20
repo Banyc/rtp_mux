@@ -17,6 +17,9 @@ mod shared;
 mod stream;
 mod task_scope;
 
+#[cfg(test)]
+mod test_alloc;
+
 pub use bidirectional::{
     BidirectionalSession, BidirectionalSessionDriver, connect_bidirectional_session,
 };
