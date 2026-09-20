@@ -8,6 +8,12 @@ futures = "0.3"
 metrics = "0.24"
 # mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.28" }
 mux = { path = "../mux" }
+# The layer-testing kit (`rtp_mux::testkit`, behind `testing`) consumes the
+# generic helpers and the impairment instrument from the local harness
+# checkout; the optional dependency is activated by the same feature so the
+# kit compiles both in-crate (`cargo test --features testing`) and when
+# rtp_mux is itself a dependency with `testing` enabled.
+netem-test = { path = "../netem_test/netem-test", features = ["test-kit"], optional = true }
 rand = "0.10"
 rtp = { path = "../rtp" }
 # rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.89" }
@@ -19,7 +25,23 @@ tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.3" }
 # tokio_udp = { path = "../tokio_udp" }
 
 [dev-dependencies]
+# The rtp_mux layer kit (`rtp_mux::testkit`, behind `testing`) consumes the
+# mux layer kit (`mux::testkit`, behind mux's `testing`) and the rtp layer
+# kit (`rtp::testkit`, behind rtp's `testing`) from the sibling checkouts,
+# plus the generic helpers/impairment instrument from the local harness
+# checkout behind its `test-kit` feature. The dev-dependencies below make
+# those kits compile in rtp_mux's default test invocation (`cargo test -p
+# rtp_mux`); a plain `cargo build` of the library, and every consumer that
+# does not request the feature itself, still compiles without `testing`, so
+# rtp_mux's production dependency graph stays lean.
+mux = { path = "../mux", features = ["testing"] }
+netem-test = { path = "../netem_test/netem-test", features = ["test-kit"] }
+rtp = { path = "../rtp", features = ["testing"] }
+rtp_mux = { path = ".", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[features]
+testing = ["dep:netem-test", "rtp/testing", "mux/testing"]
 
 [lints.clippy]
 disallowed_methods = "deny"

@@ -16,6 +16,8 @@ mod session;
 mod shared;
 mod stream;
 mod task_scope;
+#[cfg(feature = "testing")]
+pub mod testkit;
 
 #[cfg(test)]
 mod test_alloc;
