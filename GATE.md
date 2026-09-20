@@ -341,7 +341,6 @@ that run them.
 ```gate-perf-guard-helpers
 mux/src/testkit/mux.rs::mux_client_connect_core = 1
 mux/src/testkit/mux.rs::mux_client_connect_frame_delivery_via = 1
-mux/src/testkit/mux.rs::send_timestamped_messages = 1
 mux/src/testkit/mux.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
 mux/src/testkit/mux.rs::spawn_mux_over_rtp_server_core = 1
 netem_test/netem-test/src/kit/mod.rs::try_send_observation = 1
@@ -352,6 +351,7 @@ netem_test/netem-test/src/kit/task_scope.rs::run = 1
 netem_test/netem-test/src/kit/task_scope.rs::spawn_required = 1
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
+rtp/src/testkit/rtp.rs::send_timestamped_messages = 1
 rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
 rtp_mux/src/testkit/dual.rs::dual_mux_client_connect_lane_rtp_via = 1
 tests/rtp_mux_jitter.rs::assert_reportable = 2
