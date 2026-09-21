@@ -28,6 +28,17 @@ dual-lane server/connector plumbing and the tagged-stream sink machinery;
 imports go only downward (rtp_mux kit → mux kit / rtp kit / harness kit), so
 `netem-test` stays a leaf.
 
+rtp_mux is also where the `rtp`+`mux` cooperation is measured: the layer
+invariant keeps `mux` from knowing `rtp` and `rtp` from knowing `mux`, so any
+scenario that needs both belongs here. Two moved targets are that case —
+`contested_latency` (a sparse interactive ping stream and a bulk upload sharing
+one `mux`-over-`rtp` connection through a `NetemPair`) and `perf_probe` (the
+`tools/perf-loop` battery: time-boxed `mux`-over-`rtp` goodput on impaired
+links, sparse-message latency, raw `rtp` 4 MiB echo ceilings, and the two
+link-preset seeding tests). `tools/perf-loop` compiles `perf_probe` from the
+frozen suite's exported **rtp_mux** component, so a
+`--component-revision rtp_mux=<commit>` pin selects the probe that runs.
+
 ## Performance
 
 The operator's product constitution is **three mandates**, jointly the
@@ -111,7 +122,7 @@ constitution.
 - **full** — `#[ignore]`d, minutes per target; still asserts a property, but
   too slow for the default gate. Run the target explicitly.
 - **perf** — `#[ignore]`d, report-only measurement or long-run tooling; these
-  produce numbers (or feed the harness perf-loop), they do not assert a gate
+  produce numbers (or feed `tools/perf-loop`), they do not assert a gate
   floor. A `perf` scenario must not contain an assertion in its own body;
   `check-gate.py` fails with the scenario name, its file, and the token if
   one does. It must also not reach an assertion through a helper: the checker
@@ -137,6 +148,8 @@ in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed.
 ```gate-default-required
 hol_probe::fec_gaming_treatment_has_bad_path_and_large_capacity_headroom
 hol_probe::fec_saturated_pair_keys_loss_to_the_same_rtp_sequence
+perf_probe::controller_fat_pipe_has_only_fixed_shaping
+perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss
 rtp_mux_jitter::jitter_duallane_constitution_gate
 ```
 
@@ -147,6 +160,9 @@ non-`support` tests reported by `cargo test -p rtp_mux --test <target> --
 --list --ignored`.
 
 ```gate-manifest
+contested_latency::contested_capped_clean = full
+contested_latency::contested_capped_jitter_loss = perf
+contested_latency::contested_hostile = perf
 dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction = full
 dynamic_contested::dyn_dual_auto_big_first = full
 dynamic_contested::dyn_dual_auto_big_first_migrating = full
@@ -230,6 +246,10 @@ rtp_mux_jitter::jitter_nonloss_impairments = perf
 rtp_mux_jitter::jitter_reorder_direction = perf
 rtp_mux_jitter::jitter_reorder_rate_curve = perf
 rtp_mux_jitter::jitter_shared_bottleneck_arms = perf
+perf_probe::probe_hostile_goodput_30s = full
+perf_probe::probe_hostile_message_latency = full
+perf_probe::probe_rtp_echo_4mib_direct = standard
+perf_probe::probe_rtp_echo_4mib_mss8k = standard
 ```
 
 The `gate-asserting` block below records the report-only/asserting split. It
@@ -244,6 +264,7 @@ own body: a `perf` scenario containing `assert!`/`assert_eq!`/`assert_ne!`/
 (an asserting check filed under the report-only tier would never run).
 
 ```gate-asserting
+contested_latency::contested_capped_clean
 dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction
 dynamic_contested::dyn_dual_auto_big_first
 dynamic_contested::dyn_dual_auto_big_first_migrating
@@ -307,6 +328,12 @@ rtp_mux::rtp_mux_explorer_relays_onto_better_path
 rtp_mux::rtp_mux_recycle_migrates_live_streams
 rtp_mux::rtp_mux_response_migration_offloads_download
 rtp_mux::rtp_mux_survives_independent_impaired_lanes
+perf_probe::controller_fat_pipe_has_only_fixed_shaping
+perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss
+perf_probe::probe_hostile_goodput_30s
+perf_probe::probe_hostile_message_latency
+perf_probe::probe_rtp_echo_4mib_direct
+perf_probe::probe_rtp_echo_4mib_mss8k
 rtp_mux_jitter::jitter_duallane_constitution_gate
 rtp_mux_jitter::jitter_duallane_constitution_gate_p99
 ```
