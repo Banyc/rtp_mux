@@ -20,11 +20,7 @@
 
 use std::time::{Duration, Instant};
 
-use mux::testkit::mux::{
-    BULK, HOSTILE_GOODPUT_FLOOR_MIB_S, HOSTILE_GUARD_SUBWINDOWS, LOOPBACK_MSS, PROBE_ITERS,
-    mux_client_connect_transient, rtp_connect_transient, rtp_connect_transient_observed,
-    send_timestamped_messages, spawn_mux_over_rtp_counting_sink_server_observed_via,
-};
+use mux::testkit::mux::mux_client_connect_transient;
 use netem_test::kit::payload::{cyclic_payload, payload, with_timeout};
 use netem_test::kit::presets::clean;
 use netem_test::kit::stats::{combined_stats, print_median_worst, print_perf};
@@ -32,6 +28,11 @@ use netem_test::{CountersSnapshot, NetemPair};
 use rtp::testkit::perf_trace::PerfTrace;
 use rtp::testkit::rtp::{
     rtp_echo_payload, spawn_rtp_echo_server_via, spawn_rtp_echo_server_with_mss_via,
+};
+use rtp_mux::testkit::mux_over_rtp::{
+    BULK, HOSTILE_GOODPUT_FLOOR_MIB_S, HOSTILE_GUARD_SUBWINDOWS, LOOPBACK_MSS, PROBE_ITERS,
+    rtp_connect_transient, rtp_connect_transient_observed, send_timestamped_messages,
+    spawn_mux_over_rtp_counting_sink_server_observed_via,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

@@ -19,10 +19,7 @@
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use mux::testkit::mux::{
-    mux_client_connect_via, spawn_mux_gaming_latency_bulk_server_via,
-    spawn_mux_latency_bulk_server_via,
-};
+use mux::testkit::mux::mux_client_connect_via;
 use mux::{DeliveryMode, DualMessageSender, LaneClass, MigratingStreamWriter};
 use netem_test::kit::contested::{DynTrafficResult, dyn_run_secs, summarize};
 use netem_test::kit::payload::{cyclic_payload, with_timeout};
@@ -35,6 +32,9 @@ use rtp_mux::testkit::dual::{
     dual_mux_client_connect_via, spawn_dual_msg_channel_server_via,
     spawn_dual_mux_gaming_latency_bulk_server_via, spawn_dual_mux_latency_bulk_server_via,
     spawn_dual_mux_migrating_latency_bulk_server_via,
+};
+use rtp_mux::testkit::mux_over_rtp::{
+    spawn_mux_gaming_latency_bulk_server_via, spawn_mux_latency_bulk_server_via,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

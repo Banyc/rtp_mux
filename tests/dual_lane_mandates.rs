@@ -72,7 +72,6 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use mux::LaneClass;
-use mux::testkit::mux::send_timestamped_messages;
 use netem_test::kit::payload::{cyclic_payload, with_timeout};
 use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
 use netem_test::{NetemConfig, NetemPair};
@@ -80,6 +79,7 @@ use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
+use rtp_mux::testkit::mux_over_rtp::send_timestamped_messages;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// One-way delay applied to every packet on both lanes (the deployment link

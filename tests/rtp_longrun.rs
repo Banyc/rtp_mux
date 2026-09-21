@@ -66,7 +66,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mux::testkit::mux::send_timestamped_messages;
 use netem_test::kit::payload::{cyclic_payload, with_timeout};
 use netem_test::kit::stats::percentile;
 use netem_test::kit::{TestScope, submit_test_task};
@@ -75,6 +74,7 @@ use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
+use rtp_mux::testkit::mux_over_rtp::send_timestamped_messages;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::MissedTickBehavior;
 

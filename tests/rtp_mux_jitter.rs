@@ -103,12 +103,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mux::testkit::mux::{
-    mux_client_connect_frame_delivery_via, mux_client_connect_via, send_timestamped_messages,
-    spawn_mux_frame_delivery_latency_bulk_server_reorder_with_fec_tuning_via,
-    spawn_mux_frame_delivery_latency_bulk_server_with_fec_tuning_via,
-    spawn_mux_latency_bulk_server_with_fec_tuning_via,
-};
+use mux::testkit::mux::{mux_client_connect_frame_delivery_via, mux_client_connect_via};
 use netem_test::kit::payload::{cyclic_payload, with_timeout};
 use netem_test::kit::presets::gilbert_elliott_loss;
 use netem_test::kit::stats::{HolSummary, combined_stats, summarize};
@@ -124,6 +119,12 @@ use rtp::testkit::rtp::{
 use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
+};
+use rtp_mux::testkit::mux_over_rtp::{
+    send_timestamped_messages,
+    spawn_mux_frame_delivery_latency_bulk_server_reorder_with_fec_tuning_via,
+    spawn_mux_frame_delivery_latency_bulk_server_with_fec_tuning_via,
+    spawn_mux_latency_bulk_server_with_fec_tuning_via,
 };
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::MissedTickBehavior;

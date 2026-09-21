@@ -24,20 +24,29 @@ particular the tri-mandate constitution below — is asserted by rtp_mux's own
 test invocation; the harness keeps only the impairment instrument and points
 at the owning crates (`netem_test/tests/README.md` is now a pointer table).
 The layer kit (`rtp_mux::testkit`, behind the `testing` feature) holds the
-dual-lane server/connector plumbing and the tagged-stream sink machinery;
-imports go only downward (rtp_mux kit → mux kit / rtp kit / harness kit), so
-`netem-test` stays a leaf.
+dual-lane server/connector plumbing, the tagged-stream sink machinery, and the
+transport-mediated `mux`-over-`rtp` scaffolding (`testkit::mux_over_rtp`: the
+rtp listener/accept plumbing, the echo/connect/sink servers, the
+timestamped-message latency sinks, the transient connects, and the loopback
+bulk-goodput probe constants and floors); imports go only downward (rtp_mux
+kit → mux kit / rtp kit / harness kit), so `netem-test` stays a leaf.
 
 rtp_mux is also where the `rtp`+`mux` cooperation is measured: the layer
 invariant keeps `mux` from knowing `rtp` and `rtp` from knowing `mux`, so any
-scenario that needs both belongs here. Two moved targets are that case —
-`contested_latency` (a sparse interactive ping stream and a bulk upload sharing
-one `mux`-over-`rtp` connection through a `NetemPair`) and `perf_probe` (the
-`tools/perf-loop` battery: time-boxed `mux`-over-`rtp` goodput on impaired
-links, sparse-message latency, raw `rtp` 4 MiB echo ceilings, and the two
-link-preset seeding tests). `tools/perf-loop` compiles `perf_probe` from the
-frozen suite's exported **rtp_mux** component, so a
-`--component-revision rtp_mux=<commit>` pin selects the probe that runs.
+scenario that needs both belongs here. That is why the whole `mux`-over-`rtp`
+scenario set — `mux_over_rtp`, `mux_over_rtp_perf`, `rtp_and_mux`,
+`mux_stream_fairness`, `mux_bulk_clean_stall`, `mux_ceiling_probe` (the
+loopback bulk ceiling), and `hol_verify4` (the DualMux-v4 A/B report-only
+probes) — lives here rather than in `mux`, alongside the two targets moved
+here earlier: `contested_latency` (a sparse interactive ping stream and a bulk
+upload sharing one `mux`-over-`rtp` connection through a `NetemPair`) and
+`perf_probe` (the `tools/perf-loop` battery: time-boxed `mux`-over-`rtp`
+goodput on impaired links, sparse-message latency, raw `rtp` 4 MiB echo
+ceilings, and the two link-preset seeding tests). `tools/perf-loop` compiles
+`perf_probe` from the frozen suite's exported **rtp_mux** component, so a
+`--component-revision rtp_mux=<commit>` pin selects the probe that runs; the
+`mux_ceiling_probe` target is the distinct loopback-ceiling instrument, so the
+two do not compete for one Cargo target name.
 
 ## Performance
 
@@ -137,10 +146,15 @@ The mandate-2 interactive constitution gate
 and the own-wire budget, both deterministic counts over the seeded dual-lane
 link), the two hol_probe FEC-wiring property tests
 (`fec_gaming_treatment_has_bad_path_and_large_capacity_headroom` and
-`fec_saturated_pair_keys_loss_to_the_same_rtp_sequence`) plus the crate's own
-non-scenario targets (`bidirectional`, `duplex`, `explorer`,
-`lane_rejection`, `session_stats`, `xsession`), which assert the offer-payload
-integrity the constitution's mandate 2 depends on at the byte level.
+`fec_saturated_pair_keys_loss_to_the_same_rtp_sequence`), the moved
+`mux`-over-`rtp` default scenarios (the clean and latency-only echo integrity
+of `mux_over_rtp`, the reassigned `rtp`/`mux` smoke trio of `rtp_and_mux`, the
+lossy smoke, the contended-delivery and the small-stream-while-bulk ordering
+of `mux_over_rtp_perf`, and `mux_bulk_clean_stall`'s clean-link bulk progress
+gate plus its teardown vacuity check), plus the crate's own non-scenario
+targets (`bidirectional`, `duplex`, `explorer`, `lane_rejection`,
+`session_stats`, `xsession`), which assert the offer-payload integrity the
+constitution's mandate 2 depends on at the byte level.
 
 The `gate-default-required` block names the asserting scenarios that must stay
 in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed.
@@ -151,6 +165,16 @@ hol_probe::fec_saturated_pair_keys_loss_to_the_same_rtp_sequence
 perf_probe::controller_fat_pipe_has_only_fixed_shaping
 perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss
 rtp_mux_jitter::jitter_duallane_constitution_gate
+mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
+mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
+mux_over_rtp::mux_over_rtp_over_netem_clean_link_echoes
+mux_over_rtp::mux_over_rtp_survives_netem_latency
+mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf
+mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
+mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf
+rtp_and_mux::mux_over_rtp_over_netem_clean_link_echoes
+rtp_and_mux::rtp_over_netem_clean_link_delivers_data
+rtp_and_mux::rtp_over_netem_reliability_survives_mild_loss
 ```
 
 ## Opt-in manifest
@@ -220,6 +244,17 @@ hol_probe::hol_rtt40_ge1_solo = full
 hol_probe::hol_rtt40_ge1_split = full
 rtp_longrun::longrun_duallane = full
 rtp_longrun::multiflow_duallane = full
+hol_verify4::v4_clean_muxbulk = perf
+hol_verify4::v4_ge5_muxbulk = perf
+mux_bulk_clean_stall::induced_stall_fires_the_watchdog = full
+mux_bulk_clean_stall::slow_live_link_is_backpressure_not_a_stall = full
+mux_ceiling_probe::probe_mux_echo_1mib_direct = standard
+mux_ceiling_probe::probe_mux_echo_1mib_mss8k = standard
+mux_ceiling_probe::probe_mux_sink_4mib_direct = standard
+mux_ceiling_probe::probe_mux_sink_4mib_mss8k = standard
+mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = full
+mux_stream_fairness::mux_stream_fairness_longrun = full
+mux_stream_fairness::mux_stream_fairness_sweep = full
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
 rtp_mux::rtp_mux_explorer_relays_onto_better_path = full
@@ -322,6 +357,25 @@ hol_probe::hol_rtt40_ge1_solo
 hol_probe::hol_rtt40_ge1_split
 rtp_longrun::longrun_duallane
 rtp_longrun::multiflow_duallane
+mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
+mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
+mux_bulk_clean_stall::induced_stall_fires_the_watchdog
+mux_bulk_clean_stall::slow_live_link_is_backpressure_not_a_stall
+mux_ceiling_probe::probe_mux_echo_1mib_direct
+mux_ceiling_probe::probe_mux_echo_1mib_mss8k
+mux_ceiling_probe::probe_mux_sink_4mib_direct
+mux_ceiling_probe::probe_mux_sink_4mib_mss8k
+mux_over_rtp::mux_over_rtp_over_netem_clean_link_echoes
+mux_over_rtp::mux_over_rtp_survives_netem_latency
+mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf
+mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf
+mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
+mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf
+mux_stream_fairness::mux_stream_fairness_longrun
+mux_stream_fairness::mux_stream_fairness_sweep
+rtp_and_mux::mux_over_rtp_over_netem_clean_link_echoes
+rtp_and_mux::rtp_over_netem_clean_link_delivers_data
+rtp_and_mux::rtp_over_netem_reliability_survives_mild_loss
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams
 rtp_mux::rtp_mux_explorer_relays_onto_better_path
@@ -345,8 +399,9 @@ it would miss an assertion moved one call away into a helper. The
 `gate-perf-guard-helpers` block below closes that hole as far as a regex-level
 tool can. For every `perf` scenario the checker builds a crate-local call
 graph (functions in `rtp_mux/tests/<target>.rs` and the kit sources it
-reaches — the rtp_mux kit `rtp_mux/src/testkit/**`, the mux kit
-`mux/src/testkit/**`, the rtp kit `rtp/src/testkit/**` and the harness kit
+reaches — the rtp_mux kit `rtp_mux/src/testkit/**` (including the
+transport-mediated `mux_over_rtp` module), the mux kit `mux/src/testkit/**`,
+the rtp kit `rtp/src/testkit/**` and the harness kit
 `netem-test/src/kit/**`; a call is resolved against the caller file's `use`
 declarations first, then the caller's own module, then a bare-name fallback)
 and takes the transitive closure. Every asserting function the closure
@@ -368,8 +423,6 @@ that run them.
 ```gate-perf-guard-helpers
 mux/src/testkit/mux.rs::mux_client_connect_core = 1
 mux/src/testkit/mux.rs::mux_client_connect_frame_delivery_via = 1
-mux/src/testkit/mux.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
-mux/src/testkit/mux.rs::spawn_mux_over_rtp_server_core = 1
 netem_test/netem-test/src/kit/mod.rs::try_send_observation = 1
 netem_test/netem-test/src/kit/payload.rs::with_timeout = 1
 netem_test/netem-test/src/kit/presets.rs::gilbert_elliott_loss = 2
@@ -381,6 +434,8 @@ netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
 rtp/src/testkit/rtp.rs::send_timestamped_messages = 1
 rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
 rtp_mux/src/testkit/dual.rs::dual_mux_client_connect_lane_rtp_via = 1
+rtp_mux/src/testkit/mux_over_rtp.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
+rtp_mux/src/testkit/mux_over_rtp.rs::spawn_mux_over_rtp_server_core = 1
 tests/rtp_mux_jitter.rs::assert_reportable = 2
 tests/rtp_mux_jitter.rs::assert_sane = 2
 ```

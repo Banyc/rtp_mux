@@ -46,10 +46,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use mux::testkit::mux::{
-    mux_client_connect_via, send_timestamped_messages,
-    spawn_mux_frame_delivery_latency_bulk_server_via, spawn_mux_latency_bulk_server_via,
-};
+use mux::testkit::mux::mux_client_connect_via;
 use netem_test::kit::payload::{cyclic_payload, run_bounded, with_timeout};
 use netem_test::kit::presets::gilbert_elliott_loss;
 use netem_test::kit::stats::{HolSummary, combined_stats, summarize};
@@ -62,6 +59,10 @@ use rtp::testkit::rtp::{
 use rtp_mux::testkit::dual::{
     dual_mux_client_connect_with_lane_modes_via,
     spawn_dual_mux_latency_bulk_server_two_listeners_via,
+};
+use rtp_mux::testkit::mux_over_rtp::{
+    send_timestamped_messages, spawn_mux_frame_delivery_latency_bulk_server_via,
+    spawn_mux_latency_bulk_server_via,
 };
 use rtp_mux::testkit::rtp_mux::{
     LaneFecEvidence, RtpMuxFecCapture, rtp_mux_connector_observed_via,

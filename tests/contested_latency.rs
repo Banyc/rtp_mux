@@ -41,13 +41,14 @@
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use mux::testkit::mux::{mux_client_connect_via, spawn_mux_latency_bulk_server_via};
+use mux::testkit::mux::mux_client_connect_via;
 use netem_test::kit::payload::with_timeout;
 use netem_test::kit::presets::hostile_real_link;
 use netem_test::kit::stats::percentile;
 use netem_test::kit::submit_test_task;
 use netem_test::{NetemConfig, NetemPair};
 use rtp::testkit::rtp::rtp_connect_with_mss_via;
+use rtp_mux::testkit::mux_over_rtp::spawn_mux_latency_bulk_server_via;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Ping message size.
@@ -197,7 +198,10 @@ async fn send_tagged_pings(
     if write.write_all(b"L").await.is_err() {
         return 0;
     }
-    mux::testkit::mux::send_timestamped_messages(write, base, msg_bytes, cadence, run_for).await
+    rtp_mux::testkit::mux_over_rtp::send_timestamped_messages(
+        write, base, msg_bytes, cadence, run_for,
+    )
+    .await
 }
 
 /// Send a deterministic `b'B'` bulk stream through a mux stream write half.
