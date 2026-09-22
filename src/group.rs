@@ -533,4 +533,73 @@ mod tests {
         // `reap_driver`.
         scope.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn the_registry_prunes_a_dead_group_on_the_next_join() {
+        let mut tasks = JoinSet::new();
+        let (registry, _driver_scope) = registry_with_scope(8);
+        let dead_token = GroupToken::generate();
+        let member = registry.join(dead_token, test_opener(&mut tasks)).unwrap();
+        drop(member);
+        let live_token = GroupToken::generate();
+        let _live = registry.join(live_token, test_opener(&mut tasks)).unwrap();
+        assert_eq!(
+            registry.groups.lock().unwrap().len(),
+            1,
+            "the registry kept the dead group's map entry, so every address that ever \
+             connected leaks one entry (and its group token) for the process lifetime",
+        );
+    }
+
+    #[tokio::test]
+    async fn join_prunes_dead_rebind_handles() {
+        let mut tasks = JoinSet::new();
+        let (registry, _driver_scope) = registry_with_scope(8);
+        let token = GroupToken::generate();
+        let old = registry.join(token, test_opener(&mut tasks)).unwrap();
+        let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
+        old.register_writer(slot.handle());
+        assert_eq!(old.group.state.lock().unwrap().writers.len(), 1);
+        drop(slot);
+        let _new = registry.join(token, test_opener(&mut tasks)).unwrap();
+        let remaining = old.group.state.lock().unwrap().writers.len();
+        assert_eq!(
+            remaining, 0,
+            "joining kept the dead rebind handle, so a long-lived group accumulates one \
+             dead handle per finished stream",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_writer_purge_fires_at_its_watermark_and_resets_to_the_floor() {
+        let mut tasks = JoinSet::new();
+        let (registry, _driver_scope) = registry_with_scope(8);
+        let token = GroupToken::generate();
+        let member = registry.join(token, test_opener(&mut tasks)).unwrap();
+        // Every handle is dead: the purge at the 64-handle watermark must drop
+        // all of them, then reset the watermark to its documented floor.
+        let mut handles = Vec::new();
+        for _ in 0..65 {
+            let (slot, _wake_rx) = crate::migrating_write_half::RebindSlot::detached();
+            handles.push(slot.handle());
+            drop(slot);
+        }
+        for handle in handles {
+            member.register_writer(handle);
+        }
+        let (writers, next_purge) = {
+            let state = member.group.state.lock().unwrap();
+            (state.writers.len(), state.next_purge)
+        };
+        assert_eq!(
+            writers, 1,
+            "the purge did not fire at its watermark, so the group's rebind-handle list \
+             grows without bound",
+        );
+        assert_eq!(
+            next_purge, 64,
+            "the purge watermark did not reset to its floor after a full purge, so every \
+             later registration re-scans the whole handle list",
+        );
+    }
 }

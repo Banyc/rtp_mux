@@ -1154,4 +1154,43 @@ mod tests {
             "a prepared lane from a different peer claimed another peer's reservation",
         );
     }
+
+    #[test]
+    fn the_expiry_worker_wakes_at_the_earliest_pending_deadline() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let earlier = PairingNonce::generate();
+        let later = PairingNonce::generate();
+        for nonce in [earlier, later] {
+            let mut permit = Some(registry.try_admit(peer.ip()).unwrap());
+            registry.register_admitted(
+                nonce,
+                LaneClass::Interactive,
+                peer,
+                local,
+                GroupToken::generate(),
+                &mut permit,
+            );
+        }
+        let base = Instant::now();
+        {
+            let mut state = registry.state.lock().unwrap();
+            for (nonce, offset) in [(earlier, 1u64), (later, 2u64)] {
+                let Some(PendingLaneEntry::Building { expires_at, .. }) =
+                    state.entries.get_mut(&nonce)
+                else {
+                    panic!("a registered reservation must be Building");
+                };
+                *expires_at = base + Duration::from_secs(offset);
+            }
+        }
+        assert_eq!(
+            registry.next_expiry(),
+            Some(base + Duration::from_secs(1)),
+            "the expiry worker wakes on the latest pending deadline instead of the earliest, \
+             so a lane whose partner never arrives holds its admission capacity for a whole \
+             extra pairing deadline after the newest reservation instead of its own",
+        );
+    }
 }

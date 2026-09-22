@@ -910,6 +910,27 @@ mod tests {
         (commands, sessions)
     }
 
+    fn spawn_test_connector_with_state(
+        dialer: DualLaneDialer,
+        tasks: &mut JoinSet<()>,
+    ) -> (
+        tokio::sync::mpsc::Sender<ConnectorCommand>,
+        SharedSessions,
+        SharedDraining,
+    ) {
+        let (commands, command_rx) = tokio::sync::mpsc::channel(1);
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let draining: SharedDraining = Arc::new(Mutex::new(HashMap::new()));
+        tasks.spawn(run_connector(
+            command_rx,
+            dialer,
+            None,
+            Arc::clone(&sessions),
+            Arc::clone(&draining),
+        ));
+        (commands, sessions, draining)
+    }
+
     fn spawn_test_connector_with_explorer(
         dialer: DualLaneDialer,
         tasks: &mut JoinSet<()>,
@@ -1995,6 +2016,229 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
         assert!(error.to_string().contains("attempt=3"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_reset_mints_a_fresh_group_for_the_next_dial() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let tokens: Arc<Mutex<Vec<GroupToken>>> = Arc::new(Mutex::new(Vec::new()));
+        let dialer: DualLaneDialer = Arc::new({
+            let attempts = Arc::clone(&attempts);
+            let tokens = Arc::clone(&tokens);
+            move |addr, group, _socket, _key| {
+                tokens.lock().unwrap().push(group);
+                // The first dial never completes, so no session is ever
+                // installed: nothing but `reset` itself can prune the group.
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Box::pin(std::future::pending());
+                }
+                Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
+            }
+        });
+        let mut connector_tasks = JoinSet::new();
+        let (commands, _sessions) =
+            spawn_test_connector_with_sessions(dialer, &mut connector_tasks);
+        let first = enqueue(&commands, addr).await;
+        wait_for(
+            || tokens.lock().unwrap().len() == 1,
+            "the first dial to inherit an address group",
+        )
+        .await;
+        reset(&commands).await;
+        drop(first.await.unwrap().unwrap_err());
+        drop(enqueue(&commands, addr).await.await.unwrap().unwrap());
+        let tokens = tokens.lock().unwrap().clone();
+        assert_eq!(tokens.len(), 2, "reset did not admit a fresh dial");
+        assert_ne!(
+            tokens[0], tokens[1],
+            "reset kept the address group of the generation it killed, so the session born \
+             after a reset joins the previous generation's group and routes its responses \
+             through that group's dead router",
+        );
+        stop(commands, &mut connector_tasks).await;
+    }
+
+    #[tokio::test]
+    async fn a_reset_releases_the_explorers_it_cleared() {
+        let addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        // The dial never completes, so no session is ever installed and the
+        // session-reap prune of dead addresses never runs: only `reset` can
+        // release this explorer.
+        let dialer: DualLaneDialer =
+            Arc::new(|_addr, _group, _socket, _key| Box::pin(std::future::pending()));
+        let mut connector_tasks = JoinSet::new();
+        let (commands, _sessions) =
+            spawn_test_connector_with_explorer(dialer, &mut connector_tasks);
+        let pending = enqueue(&commands, addr).await;
+        wait_for_candidates(
+            &commands,
+            addr,
+            1,
+            "the explorer to mint its candidate tuple",
+        )
+        .await;
+        reset(&commands).await;
+        drop(pending.await.unwrap().unwrap_err());
+        assert_eq!(
+            explorer_candidates(&commands, addr).await,
+            0,
+            "reset kept the address's path explorer, so it keeps minting probe sockets and \
+             probing an address whose sessions were killed",
+        );
+        stop(commands, &mut connector_tasks).await;
+    }
+
+    #[tokio::test]
+    async fn a_reset_forgets_an_in_flight_redial_record() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let redial_started = Arc::new(tokio::sync::Notify::new());
+        let dialer: DualLaneDialer = Arc::new({
+            let attempts = Arc::clone(&attempts);
+            let redial_started = Arc::clone(&redial_started);
+            move |addr, _group, _socket, _key| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+                    redial_started.notify_one();
+                    return Box::pin(std::future::pending());
+                }
+                Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
+            }
+        });
+        let mut connector_tasks = JoinSet::new();
+        let (commands, _sessions, draining) =
+            spawn_test_connector_with_state(dialer, &mut connector_tasks);
+        drop(enqueue(&commands, addr).await.await.unwrap().unwrap());
+        commands
+            .send(ConnectorCommand::Redial {
+                addr,
+                trigger: RedialTrigger::Forced,
+            })
+            .await
+            .unwrap();
+        redial_started.notified().await;
+        reset(&commands).await;
+        drop(enqueue(&commands, addr).await.await.unwrap().unwrap());
+        assert!(
+            draining.lock().unwrap().is_empty(),
+            "reset kept the in-flight redial record, so the next dial for the address is \
+             treated as a redial of the generation reset killed: its streams are rebound \
+             onto the new session and the killed session is re-published as draining",
+        );
+        stop(commands, &mut connector_tasks).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_redial_command_is_refused_while_the_previous_generation_drains() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (connector, driver) =
+            RtpMuxConnector::with_dialer(counting_fake_dialer(Arc::clone(&attempts)));
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
+        let held = connector.connect(addr).await.unwrap();
+        let old_id = connector.probe_session(addr).unwrap().id();
+        connector.force_redial(addr);
+        wait_for(
+            || {
+                connector
+                    .probe_session(addr)
+                    .is_some_and(|p| p.id() != old_id)
+            },
+            "replacement session after redial",
+        )
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        // Bypass the handle-level draining guard and send the command directly:
+        // a Redial queued before the drain began reaches the loop exactly here.
+        connector
+            .commands
+            .send(ConnectorCommand::Redial {
+                addr,
+                trigger: RedialTrigger::Forced,
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the connector admitted a redial while the previous generation was still \
+             draining, so two generations race the drain and a live stream can be rebound \
+             twice",
+        );
+        drop(held);
+        drop(connector);
+        while let Some(result) = driver_tasks.join_next().await {
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_per_address_key_override_survives_a_redial() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let keys: Arc<Mutex<Vec<Option<crate::ObfuscationKey>>>> = Arc::new(Mutex::new(Vec::new()));
+        let dialer: DualLaneDialer = Arc::new({
+            let keys = Arc::clone(&keys);
+            move |addr, _group, _socket, key| {
+                keys.lock().unwrap().push(key);
+                Box::pin(async move { Ok(fake_connected_birth(addr, None)) })
+            }
+        });
+        let (connector, driver) = RtpMuxConnector::with_dialer(dialer);
+        let mut driver_tasks = JoinSet::new();
+        driver_tasks.spawn(driver);
+        let key = crate::ObfuscationKey::from_bytes([7; 32]);
+        drop(
+            connector
+                .connect_with_lane_and_key(addr, LaneClass::Interactive, Some(key))
+                .await
+                .unwrap(),
+        );
+        let old_id = connector.probe_session(addr).unwrap().id();
+        connector.force_redial(addr);
+        wait_for(
+            || {
+                connector
+                    .probe_session(addr)
+                    .is_some_and(|p| p.id() != old_id)
+            },
+            "replacement session after redial",
+        )
+        .await;
+        assert_eq!(
+            keys.lock().unwrap().clone(),
+            vec![Some(key), Some(key)],
+            "the redial rebuilt the session without the per-address obfuscation key it was \
+             born with, so the replacement generation cannot talk to the peer",
+        );
+        drop(connector);
+        while let Some(result) = driver_tasks.join_next().await {
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_dial_pays_the_documented_retry_schedule() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let started = tokio::time::Instant::now();
+        let result = retry_dual_connect(addr, || async {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "synthetic dial failure",
+            ))
+        })
+        .await;
+        assert!(result.is_err(), "an always-failing dial must fail");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(25 + 50),
+            "the retry schedule pays 25 ms then 50 ms after the first and second failures; a \
+             different total means a retry is too eager, a final retry is paid for nothing, or \
+             the backoff no longer grows with the attempt number",
+        );
     }
 
     #[test]
