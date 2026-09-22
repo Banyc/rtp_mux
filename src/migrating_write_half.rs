@@ -1,6 +1,8 @@
 use mux::MigratingStreamWriter;
 use std::{
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -9,6 +11,27 @@ use std::{
 pub(crate) const WRITE_QUEUE_CAPACITY: usize = 8;
 pub(crate) const WRITE_MAX_CHUNK: usize = 64 * 1024;
 const FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The finalize step the background writer runs at shutdown.
+///
+/// Production uses [`RealFinalize`], which finalizes the migrating stream;
+/// the shutdown-timeout arm is only reachable when a finalize outlives
+/// [`FINALIZE_TIMEOUT`], so the shutdown tests substitute a finalize that can
+/// stall or overrun a shrunken budget.
+pub(crate) trait ShutdownFinalize: Send + 'static {
+    fn finalize(
+        &mut self,
+        writer: &mut MigratingStreamWriter,
+    ) -> impl Future<Output = Result<(), mux::MigratingStreamError>> + Send;
+}
+pub(crate) struct RealFinalize;
+impl ShutdownFinalize for RealFinalize {
+    fn finalize(
+        &mut self,
+        writer: &mut MigratingStreamWriter,
+    ) -> impl Future<Output = Result<(), mux::MigratingStreamError>> + Send {
+        writer.finalize()
+    }
+}
 pub(crate) struct RebindSlot {
     latest: Arc<Mutex<Option<mux::DualStreamOpener>>>,
     wake: tokio::sync::mpsc::Sender<()>,
@@ -113,7 +136,15 @@ impl Drop for MigratingWriteHalf {
     }
 }
 impl MigratingWriteHalf {
-    pub(crate) fn new_with_rebind(mut writer: MigratingStreamWriter) -> (Self, RebindHandle) {
+    pub(crate) fn new_with_rebind(writer: MigratingStreamWriter) -> (Self, RebindHandle) {
+        Self::new_with_finalize(writer, RealFinalize)
+    }
+    /// [`Self::new_with_rebind`] with the finalize step supplied by the
+    /// caller: production passes [`RealFinalize`].
+    pub(crate) fn new_with_finalize(
+        mut writer: MigratingStreamWriter,
+        mut finalize: impl ShutdownFinalize,
+    ) -> (Self, RebindHandle) {
         let name = writer.name();
         let (write_tx, mut write_rx) =
             tokio::sync::mpsc::channel::<WriteCommand>(WRITE_QUEUE_CAPACITY);
@@ -175,13 +206,17 @@ impl MigratingWriteHalf {
                         }
                     }
                     WriteCommand::Shutdown(reply) => {
-                        let result =
-                            match tokio::time::timeout(FINALIZE_TIMEOUT, writer.finalize()).await {
-                                Ok(result) => result.map_err(BackgroundWriteError::from_debug),
-                                Err(_) => Err(BackgroundWriteError::from_debug(
-                                    "shutdown finalize timed out",
-                                )),
-                            };
+                        let result = match tokio::time::timeout(
+                            FINALIZE_TIMEOUT,
+                            finalize.finalize(&mut writer),
+                        )
+                        .await
+                        {
+                            Ok(result) => result.map_err(BackgroundWriteError::from_debug),
+                            Err(_) => Err(BackgroundWriteError::from_debug(
+                                "shutdown finalize timed out",
+                            )),
+                        };
                         if let Err(error) = &result {
                             *background_error_clone.lock().unwrap() = Some(error.clone());
                         }
@@ -190,7 +225,7 @@ impl MigratingWriteHalf {
                     }
                 }
             }
-            let _ = tokio::time::timeout(FINALIZE_TIMEOUT, writer.finalize()).await;
+            let _ = tokio::time::timeout(FINALIZE_TIMEOUT, finalize.finalize(&mut writer)).await;
         });
         let half = Self {
             write_tx: tokio_util::sync::PollSender::new(write_tx),
@@ -831,6 +866,143 @@ mod tests {
              (the capped chunk command buffer). The write path must stage the \
              caller's bytes into one buffer per call, with no extra scratch \
              allocations",
+        );
+    }
+
+    /// A substitute finalize for the shutdown path: records that it ran, then
+    /// either stalls forever, sleeps for `delay`, or returns `LaneDead`.
+    struct SubstitutedFinalize {
+        delay: Duration,
+        stall: bool,
+        fail: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ShutdownFinalize for SubstitutedFinalize {
+        fn finalize(
+            &mut self,
+            _writer: &mut MigratingStreamWriter,
+        ) -> impl Future<Output = Result<(), mux::MigratingStreamError>> + Send {
+            let delay = self.delay;
+            let stall = self.stall;
+            let fail = self.fail;
+            let calls = Arc::clone(&self.calls);
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if stall {
+                    std::future::pending::<()>().await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
+                if fail {
+                    Err(mux::MigratingStreamError::LaneDead)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// A write half whose shutdown finalize is the caller's substitution. The
+    /// pair's mux tasks are dropped before this returns, so only the
+    /// substituted finalize and the shutdown timeout arm the clock.
+    async fn write_half_with_finalize(
+        logical_id: u64,
+        stall: bool,
+        delay: Duration,
+        fail: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> MigratingWriteHalf {
+        let (opener, _accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (writer, _gen0) =
+            opener.open_migrating_with_reader(logical_id, mux::LaneClass::Interactive);
+        let (half, _rebind) = MigratingWriteHalf::new_with_finalize(
+            writer,
+            SubstitutedFinalize {
+                delay,
+                stall,
+                fail,
+                calls,
+            },
+        );
+        half
+    }
+
+    /// A finalize stuck past the budget must make shutdown report the timeout
+    /// error; reporting success would hide a stream that never closed.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_finalize_makes_shutdown_report_the_timeout_error() {
+        use tokio::io::AsyncWriteExt;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut half =
+            write_half_with_finalize(90, true, Duration::ZERO, false, Arc::clone(&calls)).await;
+        let started = tokio::time::Instant::now();
+        let result = half.shutdown().await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the shutdown must run the finalize exactly once",
+        );
+        let error = result.expect_err(
+            "a finalize stuck past FINALIZE_TIMEOUT must make shutdown report an error, not success",
+        );
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            error.to_string().contains("shutdown finalize timed out"),
+            "the shutdown error must name the finalize timeout, got: {error}",
+        );
+        assert!(
+            elapsed <= Duration::from_secs(10),
+            "a stuck finalize must be abandoned within a small multiple of the {FINALIZE_TIMEOUT:?} \
+             budget, but shutdown waited {elapsed:?}",
+        );
+    }
+
+    /// A finalize that returns inside the budget must let shutdown succeed:
+    /// shrinking the budget below the finalize's duration turns it into a
+    /// timeout error.
+    #[tokio::test(start_paused = true)]
+    async fn a_finalize_that_returns_inside_the_budget_reports_success() {
+        use tokio::io::AsyncWriteExt;
+        let one_second = Duration::from_secs(1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut half =
+            write_half_with_finalize(91, false, one_second, false, Arc::clone(&calls)).await;
+        let result = half.shutdown().await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the shutdown must run the finalize exactly once",
+        );
+        assert!(
+            result.is_ok(),
+            "a finalize that returns after {one_second:?} must complete inside the \
+             {FINALIZE_TIMEOUT:?} budget, but shutdown reported {result:?}",
+        );
+    }
+
+    /// A finalize that fails must surface its own error, not success and not
+    /// the timeout error.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_finalize_makes_shutdown_report_the_finalize_error() {
+        use tokio::io::AsyncWriteExt;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut half =
+            write_half_with_finalize(92, false, Duration::ZERO, true, Arc::clone(&calls)).await;
+        let result = half.shutdown().await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the shutdown must run the finalize exactly once",
+        );
+        let error = result.expect_err("a finalize that fails must make shutdown report an error");
+        assert!(
+            error.to_string().contains("LaneDead"),
+            "shutdown must surface the finalize's own error, got: {error}",
+        );
+        assert!(
+            !error.to_string().contains("timed out"),
+            "a failing finalize is not a timeout, got: {error}",
         );
     }
 }
