@@ -44,6 +44,35 @@ pub(crate) fn client_mux_config() -> MuxConfig {
 mod tests {
     use super::*;
 
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
+    }
+
+    /// The bulk lane is addressed as the interactive lane's port plus one:
+    /// the connector derives the bulk destination from the interactive one, so
+    /// an offset of anything but one (or a silently reused port, which would
+    /// collide with the interactive lane) misroutes the bulk lane.
+    #[test]
+    fn the_bulk_lane_address_is_the_interactive_port_plus_one() {
+        assert_eq!(
+            bulk_lane_addr(addr(1234)).expect("a non-final port has a bulk lane"),
+            addr(1235),
+            "the bulk lane must be the interactive port plus one",
+        );
+        assert_eq!(
+            bulk_lane_addr(addr(65534)).expect("65534 + 1 is still a valid port"),
+            addr(65535),
+            "the last valid interactive/bulk port pair must be usable",
+        );
+        let overflow = bulk_lane_addr(addr(u16::MAX))
+            .expect_err("there is no port above 65535, so the pair cannot exist");
+        assert_eq!(
+            overflow.kind(),
+            io::ErrorKind::InvalidInput,
+            "a bulk lane that cannot exist is a caller input error",
+        );
+    }
+
     #[test]
     fn the_two_lane_configs_declare_complementary_mux_roles() {
         let client = client_mux_config();

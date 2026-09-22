@@ -98,6 +98,116 @@ impl MigrationVerdict {
 mod tests {
     use super::*;
 
+    fn score(secs: f64, loss: f64) -> PathScore {
+        PathScore {
+            rtt: Duration::from_secs_f64(secs),
+            loss,
+        }
+    }
+
+    /// Every migration margin is inclusive at its exact boundary, and no
+    /// margin constant can be widened or narrowed unnoticed: each probe sits
+    /// either exactly on the boundary (the win must still hold) or just
+    /// outside it (the win must still be refused), with the arithmetic exact
+    /// in `f64` so the comparison is decided by the operator, not by rounding.
+    #[test]
+    fn migration_margins_are_inclusive_at_their_exact_boundary() {
+        // rtt margin: 0.5s * (1 - 0.25) == 0.375s exactly.
+        assert_eq!(
+            score(0.375, 0.0).beats_by_margin(&score(0.5, 0.0)),
+            Some(MigrationRule::Rtt),
+            "an rtt exactly at the 25% margin must still win",
+        );
+        assert_eq!(
+            score(0.376, 0.0).beats_by_margin(&score(0.5, 0.0)),
+            None,
+            "an rtt above the 25% margin must not win",
+        );
+        // loss tolerance on an rtt win: best.loss <= active.loss + 0.02.
+        assert_eq!(
+            score(0.375, 0.02).beats_by_margin(&score(0.5, 0.0)),
+            Some(MigrationRule::Rtt),
+            "a loss exactly on the 2% tolerance must not veto an rtt win",
+        );
+        assert_eq!(
+            score(0.375, 0.021).beats_by_margin(&score(0.5, 0.0)),
+            None,
+            "a loss just over the 2% tolerance must veto the rtt win",
+        );
+        // loss margin: best.loss + 0.10 <= active.loss (rtt equal).
+        assert_eq!(
+            score(0.5, 0.0).beats_by_margin(&score(0.5, 0.1)),
+            Some(MigrationRule::Loss),
+            "a 10% loss advantage exactly on the margin must still win",
+        );
+        assert_eq!(
+            score(0.5, 0.01).beats_by_margin(&score(0.5, 0.1)),
+            None,
+            "a 9% loss advantage must not win",
+        );
+        // rtt veto on a loss win: best.rtt <= active.rtt * 1.25.
+        assert_eq!(
+            score(0.625, 0.0).beats_by_margin(&score(0.5, 0.1)),
+            Some(MigrationRule::Loss),
+            "an rtt exactly at 1.25x the active path must still allow a loss win",
+        );
+        assert_eq!(
+            score(0.63, 0.0).beats_by_margin(&score(0.5, 0.1)),
+            None,
+            "an rtt above 1.25x the active path must refuse the loss win",
+        );
+    }
+
+    /// A path that clears both margins at once reports the rtt rule: the rtt
+    /// comparison is consulted first, so the logged migration reason is the
+    /// one the path actually won on rather than an arbitrary tie-break.
+    #[test]
+    fn a_path_that_clears_both_margins_reports_the_rtt_rule() {
+        let best = score(0.375, 0.0);
+        let active = score(0.5, 0.1);
+        assert!(
+            best.rtt.as_secs_f64() <= active.rtt.as_secs_f64() * (1.0 - 0.25),
+            "the probe must clear the rtt margin for this test to be about precedence",
+        );
+        assert!(
+            best.loss + 0.10 <= active.loss,
+            "the probe must clear the loss margin for this test to be about precedence",
+        );
+        assert_eq!(
+            best.beats_by_margin(&active),
+            Some(MigrationRule::Rtt),
+            "a path winning on rtt and loss at once must report the rtt rule",
+        );
+    }
+
+    /// `cost` divides the rtt by the unreliability but never by less than
+    /// 0.05, so a fully lossy path still ranks at twenty times its rtt instead
+    /// of at its raw rtt.
+    #[test]
+    fn cost_never_scales_by_more_than_twenty_times_the_rtt() {
+        let close = |got: f64, want: f64| (got - want).abs() <= want * 1e-9;
+        assert!(
+            close(score(1.0, 1.0).cost(), 20.0),
+            "a fully lossy path must cost 20x its rtt, not {:?}",
+            score(1.0, 1.0).cost(),
+        );
+        assert!(
+            close(score(1.0, 0.9).cost(), 10.0),
+            "a 90% lossy path must cost 10x its rtt, not {:?}",
+            score(1.0, 0.9).cost(),
+        );
+        assert!(
+            close(score(1.0, 0.8).cost(), 5.0),
+            "an 80% lossy path must cost 5x its rtt, not {:?}",
+            score(1.0, 0.8).cost(),
+        );
+        assert!(
+            close(score(1.0, 0.0).cost(), 1.0),
+            "a clean path must cost exactly its rtt, not {:?}",
+            score(1.0, 0.0).cost(),
+        );
+    }
+
     #[test]
     fn cost_penalizes_loss_instead_of_ranking_by_rtt_alone() {
         let fast_but_lossy = PathScore {

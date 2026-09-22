@@ -112,6 +112,39 @@ mod tests {
             .expect("a non-fatal accept error is not returned to the caller");
     }
 
+    /// The retry delay is exactly zero until the warning threshold, exactly
+    /// doubles from the documented 1 ms base afterwards, and stops at the
+    /// documented 100 ms cap: the delay values themselves are pinned, not just
+    /// their ordering, so the accept loop cannot be turned into a spin or into
+    /// a multi-second stall by a constant change.
+    #[test]
+    fn the_retry_backoff_doubles_from_the_warn_threshold_to_the_cap() {
+        let mut backoff = AcceptErrorBackoff::default();
+        let expected = [
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(4),
+            Duration::from_millis(8),
+            Duration::from_millis(16),
+            Duration::from_millis(32),
+            Duration::from_millis(64),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        ];
+        for (index, want) in expected.into_iter().enumerate() {
+            transient(&mut backoff);
+            let errors = index + 1;
+            let got = backoff.retry_delay();
+            assert_eq!(
+                got, want,
+                "after {errors} consecutive accept errors the retry delay was {got:?}, expected {want:?}",
+            );
+        }
+    }
+
     #[test]
     fn a_warned_error_streak_logs_its_recovery() {
         let mut backoff = AcceptErrorBackoff::default();

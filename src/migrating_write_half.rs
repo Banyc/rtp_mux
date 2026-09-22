@@ -668,6 +668,128 @@ mod tests {
         );
     }
 
+    /// One `poll_write` stages exactly one `WRITE_MAX_CHUNK`-capped command.
+    /// The cap is the mux layer's 64 KiB frame/reassembly budget, so accepting
+    /// a larger chunk would hand the mux layer one stream write that it cannot
+    /// carry in a single frame.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_single_poll_write_accepts_exactly_the_max_chunk() {
+        use std::task::Waker;
+        use tokio::io::AsyncWrite;
+        let (opener, _accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (writer, _gen0) = opener.open_migrating_with_reader(78, mux::LaneClass::Interactive);
+        let (mut half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        assert_eq!(
+            WRITE_MAX_CHUNK,
+            64 * 1024,
+            "the chunk cap must stay the mux layer's 64 KiB frame budget",
+        );
+        let payload = vec![0x5Au8; 3 * WRITE_MAX_CHUNK];
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut accepted = 0;
+        for staged in 0..3 {
+            let remaining = payload.len() - accepted;
+            let n = match std::pin::Pin::new(&mut half).poll_write(&mut cx, &payload[accepted..]) {
+                Poll::Ready(Ok(n)) => n,
+                other => panic!("poll_write of {remaining} bytes staged: {other:?}"),
+            };
+            assert_eq!(
+                n,
+                64 * 1024,
+                "command {staged} accepted {n} bytes; one poll_write may stage at most one chunk",
+            );
+            accepted += n;
+        }
+        assert_eq!(accepted, payload.len());
+    }
+
+    /// A payload larger than the chunk cap crosses a chunk boundary and still
+    /// arrives byte for byte: the chunking loop must not drop, duplicate, or
+    /// reorder the tail of a capped command.
+    #[tokio::test]
+    async fn a_write_larger_than_the_chunk_cap_reaches_the_peer_byte_for_byte() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (opener, accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (writer, _gen0) = opener.open_migrating_with_reader(79, mux::LaneClass::Interactive);
+        let (mut half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        let mut accepter = accepter.into_migrating_only();
+        let payload: Vec<u8> = (0..(2 * WRITE_MAX_CHUNK + 7))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        half.write_all(&payload)
+            .await
+            .expect("the payload must reach the peer");
+        half.shutdown().await.expect("the stream must end cleanly");
+        let accepted = tokio::time::timeout(Duration::from_secs(2), accepter.accept())
+            .await
+            .expect("the stream must be accepted")
+            .expect("accept must succeed");
+        let mut reader = match accepted {
+            mux::AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected a migrating stream"),
+        };
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut received))
+            .await
+            .expect("the peer must see the stream end")
+            .expect("the read must succeed");
+        if received != payload {
+            let first_difference = received
+                .iter()
+                .zip(payload.iter())
+                .position(|(got, want)| got != want);
+            panic!(
+                "the peer received {} of {} bytes; the first difference is at {first_difference:?}, \
+                 so the write path lost, duplicated, or reordered bytes across the chunk boundary",
+                received.len(),
+                payload.len(),
+            );
+        }
+    }
+
+    /// The write half stages at most `WRITE_QUEUE_CAPACITY` commands ahead of
+    /// the background writer, and a zero-byte write consumes no slot: the
+    /// queue depth is the in-flight byte budget (8 x 64 KiB), and a free
+    /// zero-byte write is what lets a caller poll an empty slice without
+    /// spending that budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_write_queue_stages_exactly_its_depth_and_zero_byte_writes_are_free() {
+        use std::task::Waker;
+        use tokio::io::AsyncWrite;
+        let (opener, _accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (writer, _gen0) = opener.open_migrating_with_reader(80, mux::LaneClass::Interactive);
+        let (mut half, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(
+            WRITE_QUEUE_CAPACITY, 8,
+            "the in-flight budget must stay eight 64 KiB commands",
+        );
+        // Nothing is awaited between polls, so the background writer cannot
+        // drain and the bounded command channel's depth is exactly observable.
+        for empty in 0..(2 * WRITE_QUEUE_CAPACITY) {
+            let polled = std::pin::Pin::new(&mut half).poll_write(&mut cx, &[]);
+            assert!(
+                matches!(polled, Poll::Ready(Ok(0))),
+                "zero-byte write {empty} returned {polled:?} instead of Ready(Ok(0)), so an empty \
+                 write consumed an in-flight slot",
+            );
+        }
+        let chunk = vec![0x11u8; WRITE_MAX_CHUNK];
+        for staged in 0..WRITE_QUEUE_CAPACITY {
+            let polled = std::pin::Pin::new(&mut half).poll_write(&mut cx, &chunk);
+            assert!(
+                matches!(polled, Poll::Ready(Ok(n)) if n == WRITE_MAX_CHUNK),
+                "queued command {staged} returned {polled:?} instead of Ready(Ok({WRITE_MAX_CHUNK}))",
+            );
+        }
+        let polled = std::pin::Pin::new(&mut half).poll_write(&mut cx, &chunk);
+        assert!(
+            matches!(polled, Poll::Pending),
+            "the command after a full queue returned {polled:?} instead of Pending, so the in-flight \
+             budget is larger than {WRITE_QUEUE_CAPACITY} commands",
+        );
+    }
+
     /// A single `poll_write` builds the background-writer command from exactly
     /// one capped chunk buffer: `Vec::with_capacity(chunk)` is the only
     /// allocation the call may make. Regression guard for the per-write

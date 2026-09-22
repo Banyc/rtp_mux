@@ -190,6 +190,95 @@ mod tests {
         );
     }
 
+    /// Exactly three consecutive losses retire a tuple: two are still a live
+    /// tuple, so one streak boundary decides when a path stops being handed
+    /// out without any protocol-side evidence.
+    #[test]
+    fn exactly_three_consecutive_losses_mark_a_tuple_dead() {
+        let mut stats = TupleStats::new(Instant::now(), Duration::from_secs(8));
+        stats.record(Some(Duration::from_millis(10)));
+        for losses in 1..=2 {
+            stats.record(None);
+            assert!(
+                !stats.dead(),
+                "{losses} consecutive losses must not retire the tuple yet",
+            );
+        }
+        stats.record(None);
+        assert!(
+            stats.dead(),
+            "three consecutive losses must retire the tuple",
+        );
+        assert!(
+            stats.score().is_none(),
+            "a dead tuple must not be scored, so it is never selected",
+        );
+    }
+
+    /// Exactly three samples make a tuple scorable; a loss sample counts
+    /// toward the warm-up too, so a path that has answered nothing yet still
+    /// needs the same three probes before it can be selected.
+    #[test]
+    fn exactly_three_samples_make_a_tuple_scorable() {
+        let mut stats = TupleStats::new(Instant::now(), Duration::from_secs(8));
+        stats.record(Some(Duration::from_millis(10)));
+        stats.record(None);
+        assert!(
+            stats.score().is_none(),
+            "two samples must not make a tuple selectable",
+        );
+        assert!(
+            !stats.report(local()).alive,
+            "a two-sample tuple must still report itself as warming up",
+        );
+        stats.record(Some(Duration::from_millis(10)));
+        assert!(
+            stats.score().is_some(),
+            "three samples must make the tuple selectable",
+        );
+        assert!(
+            stats.report(local()).alive,
+            "a three-sample tuple must report itself as alive",
+        );
+    }
+
+    /// A probe is charged as lost at exactly its timeout: one tick before the
+    /// deadline the probe is still outstanding, and a tick landing exactly on
+    /// the deadline records the loss (so the timeout is not deferred by a
+    /// further poll interval each time).
+    #[test]
+    fn a_probe_is_recorded_lost_at_exactly_its_timeout() {
+        let epoch = Instant::now();
+        let mean = Duration::from_secs(8);
+        let mut stats = TupleStats::new(epoch, mean);
+        let mut io = ScriptedIo::default();
+        let sent_at = epoch + mean;
+        stats.tick(&mut io, sent_at, mean, epoch);
+        assert_eq!(io.sent.len(), 1, "a probe must be outstanding to time out");
+        stats.tick(
+            &mut io,
+            sent_at + PROBE_TIMEOUT - Duration::from_millis(1),
+            mean,
+            epoch,
+        );
+        assert_eq!(
+            stats.report(local()).loss,
+            None,
+            "a probe must not be charged lost before its timeout",
+        );
+        stats.tick(&mut io, sent_at + PROBE_TIMEOUT, mean, epoch);
+        assert_eq!(
+            stats.report(local()).loss,
+            Some(1.0),
+            "a probe must be charged lost exactly at its timeout",
+        );
+        assert_eq!(
+            io.sent.len(),
+            1,
+            "the timeout must not also send a new probe"
+        );
+    }
+
     #[test]
     fn the_rtt_ewma_weights_a_new_sample_less_than_the_history() {
         let mut stats = TupleStats::new(Instant::now(), Duration::from_secs(8));
