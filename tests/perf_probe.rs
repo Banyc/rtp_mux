@@ -242,6 +242,8 @@ async fn probe_hostile_goodput_30s() {
                         | "hostile-fat-pipe"
                         | "controller-fat-pipe"
                         | "deterministic-iid-loss-fat-pipe"
+                        | "jittery-short-rtt"
+                        | "high-rtt-low-rate-bottleneck"
                         | "clean"
                         | "direct"
                         | "hostile-bottleneck-20ms"
@@ -255,7 +257,7 @@ async fn probe_hostile_goodput_30s() {
                         | "hostile-periodic-bottleneck-100ms"
                         | "hostile-periodic-bottleneck-300ms"
                 ),
-                "NETEM_PERF_LINK_PROFILE must be one of the hostile/controller/fec calibration profiles, got {link_profile:?}"
+                "NETEM_PERF_LINK_PROFILE must be one of the hostile/controller/fec/regime calibration profiles, got {link_profile:?}"
             );
             let direct = link_profile == "direct";
             let mss_bytes = std::env::var("NETEM_PERF_MSS_BYTES")
@@ -297,6 +299,16 @@ async fn probe_hostile_goodput_30s() {
                 "controller-fat-pipe" => netem_test::kit::presets::controller_fat_pipe(),
                 "deterministic-iid-loss-fat-pipe" => {
                     netem_test::kit::presets::deterministic_iid_loss_fat_pipe()
+                }
+                // The two regime lanes the battery's shaped/zero-jitter lanes
+                // cannot reach: the jitter lane is the only one that reorders
+                // (so its `4 * rttvar` can exceed `srtt / 4` and disarm the
+                // fast-loss gate), and the thin-link lane's rate and queue can
+                // hold a round trip long enough for RFC 6298's `srtt + 4 *
+                // rttvar` to reach the tens of seconds.
+                "jittery-short-rtt" => netem_test::kit::presets::jittery_short_rtt_link(),
+                "high-rtt-low-rate-bottleneck" => {
+                    netem_test::kit::presets::high_rtt_low_rate_bottleneck()
                 }
                 "clean" | "direct" => netem_test::kit::presets::clean(),
                 "hostile-bottleneck-20ms" => netem_test::kit::presets::hostile_steady_bottleneck_20ms(),
@@ -572,10 +584,15 @@ async fn probe_hostile_goodput_30s() {
                         stats.dropped > 0 && stats.delayed > 0,
                         "lossy link should drop and delay packets, got {stats:?}"
                     );
-                } else if link_profile == "controller-fat-pipe" {
+                } else if matches!(
+                    link_profile.as_str(),
+                    "controller-fat-pipe"
+                        | "jittery-short-rtt"
+                        | "high-rtt-low-rate-bottleneck"
+                ) {
                     assert!(
                         stats.forwarded > 0 && stats.dropped == 0 && stats.delayed > 0,
-                        "fixed-shaping link should forward and delay packets without drops, got {stats:?}"
+                        "delay-configured link without configured loss should forward and delay packets without loss drops, got {stats:?}"
                     );
                 } else {
                     assert!(
