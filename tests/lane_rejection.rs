@@ -394,14 +394,19 @@ async fn a_lane_over_the_per_peer_pending_cap_is_recorded_as_capacity() {
             )
             .await;
             // The next lane from the same peer IP exceeds the per-peer cap
-            // before its hello can even be read. It too must transmit for its
-            // rtp accept to complete server-side.
-            let mut extra = dial(interactive, interactive_config()).await;
+            // before its hello can even be read. It is driven with a single
+            // raw datagram rather than `dial`: one rtp frame write is sent
+            // with immediate retransmission armor (several datagrams for a
+            // single write), and because a rejected lane's connection is torn
+            // down, every later datagram from that source opens a fresh
+            // connection and is rejected again.  A single datagram is what
+            // makes this lane exactly one rejectable connection.
+            let extra = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            extra.connect(interactive).await.unwrap();
             extra
-                .write
-                .write_all(&[0x00u8; PARTIAL_HELLO_LEN])
+                .send(&[0x00u8; PARTIAL_HELLO_LEN])
                 .await
-                .expect("write the 33rd lane's hello prefix");
+                .expect("send the 33rd lane's hello prefix");
             wait_for_metric(
                 METRIC_CAPACITY,
                 before + 1,
