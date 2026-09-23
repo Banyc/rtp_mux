@@ -95,8 +95,23 @@ pub struct RtpMuxServerConfig {
     pub obfuscation_key: Option<crate::ObfuscationKey>,
 }
 
+/// Interactive ports the acquisition may draw while the port adjacent to each
+/// draw is held by another process. Every attempt asks the OS for a fresh
+/// ephemeral port, so the attempts are independent draws; the bound only turns
+/// "every draw landed beside a held port" into a reported error instead of an
+/// unbounded loop.
+const EPHEMERAL_PAIR_ATTEMPTS: usize = 64;
+
 impl RtpMuxServer {
     /// Bind both lanes with the given settings (see [`RtpMuxServerConfig`]).
+    ///
+    /// The two lanes are usable only as an adjacent pair: the connector derives
+    /// the bulk destination as the interactive destination's port plus one
+    /// (see [`bulk_lane_addr`]). A caller passing port `0` asks for *an*
+    /// ephemeral interactive port, not for a particular one, so when the port
+    /// adjacent to a draw is already held by another process the draw is
+    /// discarded and the OS is asked for another port; a named interactive port
+    /// is a fixed address, and its collision is reported unchanged.
     pub async fn bind(
         addr: impl ToSocketAddrs + Clone + Debug,
         config: RtpMuxServerConfig,
@@ -105,28 +120,20 @@ impl RtpMuxServer {
             obfuscation_key: key,
         } = config;
         let key_bytes = key.map(crate::ObfuscationKey::into_bytes);
-        let interactive_listener = rtp::udp::Listener::bind(
-            addr,
-            rtp::udp::ListenerConfig {
-                obfuscation_key: key_bytes,
-                // The mux lane keeps the historical wire behavior: no DPI
-                // padding (explicit regardless of the rtp default).
-                padding: rtp::udp::HarmfulPaddingPolicy::None,
-                ..rtp::udp::ListenerConfig::default()
-            },
-        )
-        .await?;
-        let bulk_addr = bulk_lane_addr(interactive_listener.local_addr())?;
-        let bulk_listener = rtp::udp::Listener::bind(
-            bulk_addr,
-            rtp::udp::ListenerConfig {
-                obfuscation_key: key_bytes,
-                padding: rtp::udp::HarmfulPaddingPolicy::None,
-                ..rtp::udp::ListenerConfig::default()
-            },
-        )
-        .await?;
-        Ok(Self::new(interactive_listener, bulk_listener))
+        let requested = resolve_bind_addrs(addr).await?;
+        let mut last_error = None;
+        for interactive_addr in requested {
+            let interactive_port_is_ephemeral = interactive_addr.port() == 0;
+            match bind_adjacent_pair(interactive_addr, interactive_port_is_ephemeral, key_bytes)
+                .await
+            {
+                Ok((interactive_listener, bulk_listener)) => {
+                    return Ok(Self::new(interactive_listener, bulk_listener));
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.expect("resolve_bind_addrs returns at least one address"))
     }
 
     pub fn new(interactive_listener: crate::Listener, bulk_listener: crate::Listener) -> Self {
@@ -394,6 +401,77 @@ impl RtpMuxServer {
         rejections.flush();
         selected
     }
+}
+
+/// Resolve a bind address the way the RTP listeners do, rejecting an empty
+/// resolution so the caller always has at least one candidate to try.
+async fn resolve_bind_addrs(addr: impl ToSocketAddrs) -> io::Result<Vec<SocketAddr>> {
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(addr).await?.collect();
+    if resolved.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "address resolved to no socket addresses",
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Bind the interactive listener and then the listener on its adjacent bulk
+/// port, with the datagram-obfuscation key fixed at construction on both and
+/// the mux lane's historical no-padding wire behavior.
+///
+/// The pair is acquired as a unit because neither lane is usable without the
+/// other at the adjacent port. When the adjacent bulk port is held by another
+/// process and the caller did not name the interactive port, the interactive
+/// listener is dropped and a fresh OS-assigned port is requested, so a
+/// concurrent holder of one derived port cannot make the bind fail; a named
+/// interactive port cannot move, and its collision is returned.
+async fn bind_adjacent_pair(
+    requested: SocketAddr,
+    interactive_port_is_ephemeral: bool,
+    obfuscation_key: Option<[u8; 32]>,
+) -> io::Result<(rtp::udp::Listener, rtp::udp::Listener)> {
+    let lane_config = rtp::udp::ListenerConfig {
+        obfuscation_key,
+        // The mux lane keeps the historical wire behavior: no DPI padding
+        // (explicit regardless of the rtp default).
+        padding: rtp::udp::HarmfulPaddingPolicy::None,
+        ..rtp::udp::ListenerConfig::default()
+    };
+    let attempts = if interactive_port_is_ephemeral {
+        EPHEMERAL_PAIR_ATTEMPTS
+    } else {
+        1
+    };
+    let mut candidate = requested;
+    let mut last_collision = None;
+    for _ in 0..attempts {
+        let interactive_listener = rtp::udp::Listener::bind(candidate, lane_config).await?;
+        let bulk_addr = match bulk_lane_addr(interactive_listener.local_addr()) {
+            Ok(bulk_addr) => bulk_addr,
+            // The drawn interactive port has no successor, so no adjacent pair
+            // exists for it; only an ephemeral draw may be replaced.
+            Err(error) if interactive_port_is_ephemeral => {
+                drop(interactive_listener);
+                last_collision = Some(error);
+                candidate = SocketAddr::new(requested.ip(), 0);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match rtp::udp::Listener::bind(bulk_addr, lane_config).await {
+            Ok(bulk_listener) => return Ok((interactive_listener, bulk_listener)),
+            Err(error)
+                if interactive_port_is_ephemeral && error.kind() == io::ErrorKind::AddrInUse =>
+            {
+                drop(interactive_listener);
+                last_collision = Some(error);
+                candidate = SocketAddr::new(requested.ip(), 0);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_collision.expect("the acquisition loop only exhausts after a collision"))
 }
 
 async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -1205,6 +1283,81 @@ mod tests {
     fn bulk_lane_port_rejects_overflow() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), u16::MAX);
         assert!(bulk_lane_addr(addr).is_err());
+    }
+
+    /// Hold a port whose predecessor is free, so the pair
+    /// (predecessor, held) is exactly the collision under test: the interactive
+    /// port binds and the derived bulk port does not.
+    async fn hold_a_port_with_a_free_predecessor() -> (tokio::net::UdpSocket, SocketAddr) {
+        for _ in 0..64 {
+            let held = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("hold an ephemeral port");
+            let held_bulk = held.local_addr().expect("held port address").port();
+            let Some(interactive_port) = held_bulk.checked_sub(1) else {
+                continue;
+            };
+            // The acquisition under test must bind the predecessor, so it has
+            // to be free when the test hands it over.
+            let Ok(probe) = tokio::net::UdpSocket::bind(("127.0.0.1", interactive_port)).await
+            else {
+                continue;
+            };
+            drop(probe);
+            return (
+                held,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), interactive_port),
+            );
+        }
+        panic!("no ephemeral port with a free predecessor in 64 draws");
+    }
+
+    /// A held port adjacent to the one the OS handed out is the collision that
+    /// made the bind fail: the caller asked for *an* ephemeral interactive
+    /// port, so the draw moves and the pair still comes out adjacent.
+    #[tokio::test]
+    async fn a_held_bulk_port_re_rolls_an_ephemeral_interactive_port() {
+        let (held, blocked_interactive) = hold_a_port_with_a_free_predecessor().await;
+        let held_bulk = held.local_addr().expect("held port address");
+        let (interactive_listener, bulk_listener) =
+            bind_adjacent_pair(blocked_interactive, true, None)
+                .await
+                .expect("an ephemeral interactive port must move when its neighbour is held");
+        let interactive = interactive_listener.local_addr();
+        let bulk = bulk_listener.local_addr();
+        assert_eq!(
+            bulk.port(),
+            interactive.port() + 1,
+            "the bulk lane is addressed as the interactive port plus one, so a moved interactive port must still form an adjacent pair",
+        );
+        assert_ne!(
+            interactive, blocked_interactive,
+            "the interactive port whose adjacent bulk port is held must be discarded, not returned",
+        );
+        assert_eq!(
+            held.local_addr().expect("held port address"),
+            held_bulk,
+            "re-rolling the interactive port must not disturb the process that holds the bulk port",
+        );
+    }
+
+    /// A named interactive port is a fixed address: its adjacent bulk port
+    /// being taken is reported, never silently moved, and the interactive
+    /// listener the attempt had bound is released.
+    #[tokio::test]
+    async fn a_held_bulk_port_fails_a_named_interactive_port() {
+        let (_held, blocked_interactive) = hold_a_port_with_a_free_predecessor().await;
+        let error = bind_adjacent_pair(blocked_interactive, false, None)
+            .await
+            .expect_err("a named interactive port is a fixed address and must not move");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::AddrInUse,
+            "a named interactive port whose adjacent bulk port is held must report the address as in use",
+        );
+        tokio::net::UdpSocket::bind(blocked_interactive)
+            .await
+            .expect("the failed pair acquisition must release the interactive port it had bound");
     }
 
     #[test]

@@ -154,7 +154,10 @@ of `mux_over_rtp_perf`, and `mux_bulk_clean_stall`'s clean-link bulk progress
 gate plus its teardown vacuity check), plus the crate's own non-scenario
 targets (`bidirectional`, `duplex`, `explorer`, `lane_rejection`,
 `session_stats`, `xsession`), which assert the offer-payload integrity the
-constitution's mandate 2 depends on at the byte level.
+constitution's mandate 2 depends on at the byte level. It also runs
+`bind_race`, which asserts that concurrent ephemeral binds each come away
+holding an adjacent interactive/bulk pair while the host's ephemeral ports are
+occupied — the invariant the connector's derived bulk destination depends on.
 
 The `gate-default-required` block names the asserting scenarios that must stay
 in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed.
