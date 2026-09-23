@@ -1318,16 +1318,22 @@ async fn hol_cap400_fec_solo() {
     .await;
 }
 
-/// Production default-on interactive FEC policy probe: the `rtp_mux`
-/// composition must enable `FecTuning::max_diversity()` plus in-stream group
-/// FEC on the interactive RTP lane with no caller toggle, while the bulk
-/// lane stays FEC-free. Every lane endpoint asserts its typed
-/// `MetricsFecCounters` independently, the interactive lanes must emit parity
-/// on the lossy gaming fat pipe, and — on the [`fec_recovery_fat_pipe_seeded`]
-/// arm whose loss forces a flushed group to lose a data symbol — the receiver
-/// must reconstruct it.  The stock 5 % gaming preset emits parity sporadically
-/// and never makes a flushed group lose its symbol in this contended sparse
-/// stream, so it cannot carry the recovery assertion.
+/// Interactive-lane FEC recovery probe: the `rtp_mux` composition wires the
+/// interactive RTP lane to FEC (the bulk lane stays FEC-free), and this probe
+/// drives that path with the test kit's maximum-diversity FEC preset — three
+/// parity copies for the trailing single-symbol group plus in-stream group FEC
+/// — which is deliberately stronger than the composition's own default
+/// (`FecTuning::interactive_prompt()`, one parity copy, installed by
+/// `RtpMuxServer::new` / `RtpMuxConnectorConfig::standard` and pinned by their
+/// unit tests). Every lane endpoint asserts its typed `MetricsFecCounters`
+/// independently, the interactive lanes must emit parity on the lossy gaming
+/// fat pipe, and — on the [`fec_recovery_fat_pipe_seeded`] arm whose loss
+/// forces a flushed group to lose a data symbol — the receiver must
+/// reconstruct it.  The three-copy preset is what makes the per-arm parity
+/// gate below satisfiable on every seeded arm: the prompt preset's reactive
+/// gate opens on some loss realizations and skips on others.  The stock
+/// `FecTuning::Default` never force-flushes a burst tail, so it cannot carry
+/// the recovery assertion at all.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow default-on FEC policy probe; run in-release mode with --ignored --nocapture --test-threads=1"]
 async fn hol_rtp_mux_fec_default_on_recovery() {

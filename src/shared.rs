@@ -26,6 +26,17 @@ pub(crate) fn bulk_lane_addr(interactive: SocketAddr) -> io::Result<SocketAddr> 
     Ok(bulk)
 }
 
+/// The interactive lane's default FEC policy, stated once for the whole
+/// composition: the prompt-parity preset, with in-stream group FEC left at the
+/// rtp transport default (environment-selected). The bulk lane's FEC-free
+/// policy is owned by [`crate::lane_transport`], not here.
+pub(crate) fn interactive_lane_fec_policy() -> (rtp::FecTuning, bool) {
+    (
+        rtp::FecTuning::interactive_prompt(),
+        rtp::udp::AcceptConfig::default().instream_group_fec,
+    )
+}
+
 pub(crate) fn lane_mux_config(initiation: Initiation) -> MuxConfig {
     MuxConfig {
         initiation,
@@ -70,6 +81,30 @@ mod tests {
             overflow.kind(),
             io::ErrorKind::InvalidInput,
             "a bulk lane that cannot exist is a caller input error",
+        );
+    }
+
+    /// The interactive lane's FEC policy has one authority. Both the connector
+    /// default and the server default must be this exact pair; a second
+    /// statement of either half (a literal preset, or a lane-local re-read of
+    /// the transport default) is the divergence this pins.
+    #[test]
+    fn the_interactive_lane_fec_policy_is_the_prompt_preset_over_the_transport_default() {
+        let (tuning, instream_group_fec) = interactive_lane_fec_policy();
+        assert_eq!(
+            tuning,
+            rtp::FecTuning::interactive_prompt(),
+            "the interactive lane must force-flush prompt parity by default",
+        );
+        assert_eq!(
+            instream_group_fec,
+            rtp::udp::AcceptConfig::default().instream_group_fec,
+            "in-stream group FEC must stay at the transport default, not be re-decided here",
+        );
+        assert_eq!(
+            instream_group_fec,
+            rtp::udp::ConnectConfig::default().instream_group_fec,
+            "the connect and accept transport defaults must agree, so one authority can serve both",
         );
     }
 

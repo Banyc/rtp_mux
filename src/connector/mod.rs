@@ -57,12 +57,13 @@ pub struct RtpMuxConnectorConfig {
 
 impl RtpMuxConnectorConfig {
     pub fn standard(bind: BindSelector) -> Self {
-        let transport_defaults = rtp::udp::ConnectConfig::default();
+        let (interactive_fec_tuning, interactive_instream_group_fec) =
+            crate::shared::interactive_lane_fec_policy();
         Self {
             bind,
             bulk_addr: Arc::new(crate::shared::bulk_lane_addr),
-            interactive_fec_tuning: rtp::FecTuning::interactive_prompt(),
-            interactive_instream_group_fec: transport_defaults.instream_group_fec,
+            interactive_fec_tuning,
+            interactive_instream_group_fec,
             interactive_metrics_observer: None,
             bulk_metrics_observer: None,
             handshake: true,

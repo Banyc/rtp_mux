@@ -500,7 +500,7 @@ impl tokio::io::AsyncWrite for MigratingWriteHalf {
 mod tests {
     use std::time::Duration;
 
-    use mux::{Initiation, MuxConfig, MuxError};
+    use mux::{MuxConfig, MuxError};
     use tokio::task::JoinSet;
 
     use super::*;
@@ -511,13 +511,6 @@ mod tests {
         JoinSet<MuxError>,
         JoinSet<MuxError>,
     ) {
-        fn config(initiation: Initiation) -> MuxConfig {
-            MuxConfig {
-                initiation,
-                heartbeat_interval: Duration::from_secs(5),
-                frame_reassembly: true,
-            }
-        }
         fn lane(
             client_config: MuxConfig,
             server_config: MuxConfig,
@@ -555,10 +548,14 @@ mod tests {
                 server_tasks,
             )
         }
-        let (ci_o, ci_a, ci_t, si_o, si_a, si_t) =
-            lane(config(Initiation::Client), config(Initiation::Server));
-        let (cb_o, cb_a, cb_t, sb_o, sb_a, sb_t) =
-            lane(config(Initiation::Client), config(Initiation::Server));
+        let (ci_o, ci_a, ci_t, si_o, si_a, si_t) = lane(
+            crate::shared::client_mux_config(),
+            crate::shared::server_mux_config(),
+        );
+        let (cb_o, cb_a, cb_t, sb_o, sb_a, sb_t) = lane(
+            crate::shared::client_mux_config(),
+            crate::shared::server_mux_config(),
+        );
         let mut client_supervisor = JoinSet::new();
         let (client_opener, _client_accepter) = mux::spawn_dual_mux_paired_supervised(
             ci_o,

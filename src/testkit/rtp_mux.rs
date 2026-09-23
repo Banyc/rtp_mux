@@ -15,10 +15,21 @@ use netem_test::kit::{
     submit_test_task_required, try_send_observation,
 };
 
-/// Production interactive-lane FEC policy: maximum-diversity tuning plus
-/// in-stream group FEC, owned by the `rtp_mux` composition with no caller
-/// toggle. The bulk lane stays non-FEC by construction.
-fn interactive_fec_tuning() -> (crate::FecTuning, bool) {
+/// The kit's interactive-lane FEC preset for the FEC-recovery probe: the
+/// maximum-diversity tuning (three parity copies for the trailing
+/// single-symbol group) plus in-stream group FEC.
+///
+/// This is deliberately **stronger** than the composition's default policy
+/// ([`crate::shared::interactive_lane_fec_policy`], which
+/// [`crate::RtpMuxServer::new`] and [`crate::RtpMuxConnectorConfig::standard`]
+/// install): the probe asserts parity per arm on a seeded loss realization,
+/// and the prompt preset (one parity copy) opens the reactive gate on some
+/// seeds while skipping it on others, so the per-arm parity gate is only
+/// satisfiable with the three-copy preset. The composition's own default is
+/// asserted by its own tests, not here; keeping both values in one place is
+/// what stops this preset from being mistaken for the shipped policy (see
+/// `the_fec_probe_preset_is_stronger_than_the_shipped_default` below).
+pub(crate) fn probe_interactive_fec_tuning() -> (crate::FecTuning, bool) {
     (crate::FecTuning::max_diversity(), true)
 }
 
@@ -122,11 +133,11 @@ async fn spawn_rtp_mux_latency_bulk_server_core(
     Arc<AtomicU64>,
     TestTaskSubmitter,
 )> {
-    let (fec_tuning, instream_group_fec) = interactive_fec_tuning();
+    let fec_tuning = probe_interactive_fec_tuning();
     let server = crate::RtpMuxServer::bind("127.0.0.1:0", crate::RtpMuxServerConfig::default())
         .await?
         .with_metrics_observers(observers.interactive, observers.bulk)
-        .with_interactive_fec_tuning(fec_tuning, instream_group_fec);
+        .with_interactive_fec_tuning(fec_tuning.0, fec_tuning.1);
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
@@ -253,20 +264,18 @@ fn rtp_mux_connector_core(
         std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
     });
     let bulk_addr: crate::BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
-    let (interactive_fec_tuning, interactive_instream_group_fec) = interactive_fec_tuning();
+    let fec_tuning = probe_interactive_fec_tuning();
     let (connector, driver) = crate::RtpMuxConnector::with_config(crate::RtpMuxConnectorConfig {
-        bind,
         bulk_addr,
-        interactive_fec_tuning,
-        interactive_instream_group_fec,
+        interactive_fec_tuning: fec_tuning.0,
+        interactive_instream_group_fec: fec_tuning.1,
         interactive_metrics_observer: observers.interactive,
         bulk_metrics_observer: observers.bulk,
-        handshake: true,
-        obfuscation_key: None,
         explorer: crate::ExplorerConfig {
             enabled: false,
             ..crate::ExplorerConfig::default()
         },
+        ..crate::RtpMuxConnectorConfig::standard(bind)
     });
     // The connector driver is a non-required background keepalive: like the
     // mux/rtp client session supervisors (e5efa1f6), it may finish at any
@@ -403,4 +412,37 @@ pub fn spawn_tagged_stream_sink(
             let _ = writer.shutdown().await;
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The composition ships `interactive_prompt()` (one parity copy) plus the
+    /// transport's in-stream group FEC default; the FEC-recovery probe needs
+    /// the three-copy maximum-diversity preset for its per-arm parity gate.
+    /// Both halves are asserted here so the probe preset cannot be silently
+    /// re-pointed at the shipped default (which makes the probe's per-arm gate
+    /// seed-dependent and eventually green-by-accident) or the other way
+    /// round.
+    #[test]
+    fn the_fec_probe_preset_is_stronger_than_the_shipped_default() {
+        let probe = probe_interactive_fec_tuning();
+        assert_eq!(
+            probe,
+            (crate::FecTuning::max_diversity(), true),
+            "the FEC-recovery probe's preset is its own value, not a re-statement of the shipped policy",
+        );
+        let shipped = crate::shared::interactive_lane_fec_policy();
+        assert_eq!(
+            shipped.0,
+            crate::FecTuning::interactive_prompt(),
+            "the shipped interactive-lane default must stay the prompt preset",
+        );
+        assert_ne!(
+            probe, shipped,
+            "the probe preset must stay the stronger one; if it ever equals the shipped default, \
+             the probe's per-arm parity gate no longer tests what it claims",
+        );
+    }
 }

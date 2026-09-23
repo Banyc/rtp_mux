@@ -137,13 +137,14 @@ impl RtpMuxServer {
     }
 
     pub fn new(interactive_listener: crate::Listener, bulk_listener: crate::Listener) -> Self {
-        let transport_defaults = rtp::udp::AcceptConfig::default();
+        let (interactive_fec_tuning, interactive_instream_group_fec) =
+            crate::shared::interactive_lane_fec_policy();
         Self {
             interactive_listener,
             bulk_listener,
             mux: JoinSet::new(),
-            interactive_fec_tuning: rtp::FecTuning::interactive_prompt(),
-            interactive_instream_group_fec: transport_defaults.instream_group_fec,
+            interactive_fec_tuning,
+            interactive_instream_group_fec,
             interactive_metrics_observer: None,
             bulk_metrics_observer: None,
             handshake: true,
