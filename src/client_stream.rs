@@ -13,7 +13,7 @@ type PendingInjectFuture =
     Pin<Box<dyn Future<Output = Result<SplicedReader, mux::SpliceFeedError>> + Send>>;
 
 enum ReaderState {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Pending {
         rx: tokio::sync::oneshot::Receiver<StreamReader>,
     },
@@ -25,6 +25,7 @@ enum ReaderState {
     PendingInject {
         future: std::sync::Mutex<PendingInjectFuture>,
     },
+    #[cfg(test)]
     Ready {
         reader: StreamReader,
     },
@@ -103,6 +104,7 @@ fn poll_reader_state(
 ) -> Poll<io::Result<()>> {
     loop {
         match state {
+            #[cfg(test)]
             ReaderState::Pending { rx } => match Pin::new(rx).poll(cx) {
                 Poll::Ready(Ok(reader)) => *state = ReaderState::Ready { reader },
                 Poll::Ready(Err(_)) => {
@@ -151,6 +153,7 @@ fn poll_reader_state(
                     Poll::Pending => return Poll::Pending,
                 }
             }
+            #[cfg(test)]
             ReaderState::Ready { reader } => return Pin::new(reader).poll_read(cx, buf),
             ReaderState::ReadySpliced { reader } => return Pin::new(reader).poll_read(cx, buf),
             ReaderState::Failed { reason } => {
