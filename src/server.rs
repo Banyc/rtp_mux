@@ -1693,6 +1693,49 @@ mod tests {
         );
     }
 
+    /// The dispatch's other direction, on a free pairing slot: the lane is put
+    /// back for a retry partner and *nothing* is recorded as lost. The
+    /// lost-reservation test above is satisfied by a dispatch that rejects
+    /// every restore, so the two directions are asserted separately — this is
+    /// the arm the accept loop takes when a partner's birth heartbeat fails,
+    /// and a rejection recorded here would count a lane as rejected while it
+    /// is still serving.
+    #[tokio::test]
+    async fn a_restorable_partner_is_reinserted_rather_than_rejected() {
+        let registry = PendingLaneRegistry::new();
+        let rejections = LaneRejectionLog::default();
+        let peer: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let local_addr: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let group = mux::GroupToken::generate();
+        reinsert_ready_lane_or_reject(
+            &registry,
+            &rejections,
+            nonce,
+            pending_lane_with_class(&registry, nonce, group, LaneClass::Bulk, peer, local_addr),
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            rejections.recorded(LaneRejectionClass::ReservationLost),
+            0,
+            "a lane restored into a free pairing slot was also recorded as a rejected lane",
+        );
+        let mut permit = Some(registry.try_admit(peer.ip()).unwrap());
+        let admission = registry.register_admitted(
+            nonce,
+            LaneClass::Interactive,
+            peer,
+            local_addr,
+            group,
+            &mut permit,
+        );
+        assert!(
+            matches!(admission, PendingLaneAdmission::Pair { .. }),
+            "the restored lane was not where the next opposite-class arrival could pair with it",
+        );
+    }
+
     #[tokio::test]
     async fn a_lane_whose_reservation_vanished_is_recorded_not_silently_dropped() {
         let registry = PendingLaneRegistry::new();

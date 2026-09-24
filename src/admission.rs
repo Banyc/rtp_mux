@@ -442,6 +442,7 @@ mod tests {
     fn test_pending_lane(
         registry: &Arc<PendingLaneRegistry>,
         nonce: PairingNonce,
+        group: GroupToken,
         peer: SocketAddr,
         local_addr: SocketAddr,
     ) -> PendingLane {
@@ -454,7 +455,6 @@ mod tests {
             mux::MuxConfig::new(mux::Initiation::Server, Duration::from_secs(5)),
             &mut tasks,
         );
-        let group = GroupToken::generate();
         PendingLane {
             pending: mux::UnpairedLane::new(
                 LaneClass::Interactive,
@@ -517,12 +517,53 @@ mod tests {
         );
         let restored = registry.reinsert_ready_lane(
             nonce,
-            test_pending_lane(&registry, nonce, peer, local),
+            test_pending_lane(&registry, nonce, GroupToken::generate(), peer, local),
             Instant::now() + Duration::from_secs(1),
         );
         assert!(
             restored.is_err(),
             "a lane that could not be restored was dropped inside the registry, so nothing upstream can record that it was lost",
+        );
+    }
+
+    /// The other arm of the same decision. A free pairing slot is the *normal*
+    /// live case — the arriving partner's own reservation was consumed by the
+    /// pair it failed to complete — and the restored lane must be the very
+    /// lane the next opposite-class arrival for that nonce is handed. A
+    /// registry that answered `Err` unconditionally still satisfies the
+    /// lost-reservation test above, so the restore direction is asserted
+    /// separately: without this, every partner the accept loop asks to restore
+    /// is silently torn down and counted as a rejected lane.
+    #[tokio::test]
+    async fn reinsert_ready_lane_restores_the_lane_into_a_free_slot() {
+        let registry = PendingLaneRegistry::new();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let nonce = PairingNonce::generate();
+        let group = GroupToken::generate();
+        assert!(
+            registry
+                .reinsert_ready_lane(
+                    nonce,
+                    test_pending_lane(&registry, nonce, group, peer, local),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .is_ok(),
+            "a ready lane was refused a free pairing slot, so it can never pair again",
+        );
+        let mut permit = Some(registry.try_admit(peer.ip()).unwrap());
+        let admission =
+            registry.register_admitted(nonce, LaneClass::Bulk, peer, local, group, &mut permit);
+        let PendingLaneAdmission::Pair { lane, .. } = admission else {
+            panic!(
+                "the opposite-class arrival was not handed the restored lane, so the restore did \
+                 not put it back where a partner can claim it"
+            );
+        };
+        assert_eq!(
+            lane.pending.class,
+            LaneClass::Interactive,
+            "the restored lane must be the one that was put back, not a fresh reservation",
         );
     }
 
