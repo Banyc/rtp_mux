@@ -535,6 +535,7 @@ dependencies = [
 [[package]]
 name = "mux"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/mux.git?tag=v0.0.30#a4dc066ff07bffc177967ab0af07483af997e13c"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -548,6 +549,7 @@ dependencies = [
 [[package]]
 name = "netem-test"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/netem_test.git?tag=v0.0.2#4c315e8f60980c43ea692ca42b5f45e767010d46"
 dependencies = [
  "dfsql",
  "parking_lot 0.12.5",
@@ -904,6 +906,7 @@ checksum = "1e0e61cd21fbddd85fbd9367b775660a01d388c08a61c6d2824af480b0309bb9"
 [[package]]
 name = "rtp"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/rtp.git?tag=v0.0.91#e1ff5ba191c24bdb97fcba47afb6b9592be87177"
 dependencies = [
  "async-trait",
  "async_async_io",
@@ -923,7 +926,7 @@ dependencies = [
  "tokio-util",
  "tokio_chacha20",
  "tokio_udp",
- "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.18)",
+ "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.19)",
 ]
 
 [[package]]
@@ -1211,7 +1214,7 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.18#3e7a53a688e6c996ba87ad25d55386b8c557a8e0"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.19#e28afd889ac8a405ccaa7095f2f7e22f266ae163"
 dependencies = [
  "bytes",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
