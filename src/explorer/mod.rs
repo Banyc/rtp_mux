@@ -596,20 +596,26 @@ mod tests {
         explorer.set_active(Some((Box::new(FakeIo::default()), local(9000))), now);
         assert!(!explorer.reoptimize_verdict().wants_migration());
     }
+    /// The margin probes use durations whose `as_secs_f64` is a dyadic
+    /// rational (375 ms = 0.375, 500 ms = 0.5), so `active * (1 - margin)` is
+    /// exactly the probed rtt and the inclusive comparison is decided by the
+    /// operator rather than by rounding: at 75 ms the product rounds *above*
+    /// `0.075`, so an rtt exactly at the margin would still pass a strict `<`
+    /// and the inclusive boundary would go unpinned.
     #[test]
     fn margin_math_matches_the_documented_constants() {
         let ms = |n: u64| Duration::from_millis(n);
         let score = |rtt, loss| PathScore { rtt, loss };
         assert_eq!(
-            score(ms(75), 0.0).beats_by_margin(&score(ms(100), 0.0)),
+            score(ms(375), 0.0).beats_by_margin(&score(ms(500), 0.0)),
             Some(MigrationRule::Rtt)
         );
         assert_eq!(
-            score(ms(80), 0.0).beats_by_margin(&score(ms(100), 0.0)),
+            score(ms(376), 0.0).beats_by_margin(&score(ms(500), 0.0)),
             None
         );
         assert_eq!(
-            score(ms(70), 0.10).beats_by_margin(&score(ms(100), 0.0)),
+            score(ms(70), 0.10).beats_by_margin(&score(ms(500), 0.0)),
             None
         );
         assert_eq!(
