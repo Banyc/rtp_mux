@@ -263,4 +263,41 @@ mod tests {
         backoff.accepted("t", addr());
         assert_eq!(backoff.retry_delay(), Duration::ZERO);
     }
+
+    /// A computed delay the accept loop never waits out is not backoff: the
+    /// listener spins at accept speed through a persistent error streak, and
+    /// the log says it is backing off while the CPU does not. The wait is
+    /// applied only once the warn threshold is crossed; below it the retry
+    /// must still not consume time (a zero-length sleep would still park the
+    /// loop behind a timer). The clock is virtual, so the test observes the
+    /// wait without paying it.
+    #[tokio::test(start_paused = true)]
+    async fn pause_waits_out_the_retry_delay_only_after_the_warn_threshold() {
+        let mut backoff = AcceptErrorBackoff::default();
+        transient(&mut backoff);
+        let before = tokio::time::Instant::now();
+        backoff.pause().await;
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            Duration::ZERO,
+            "a listener below the warn threshold delayed its next accept",
+        );
+
+        for _ in 0..WARN_AFTER_CONSECUTIVE {
+            transient(&mut backoff);
+        }
+        let expected = backoff.retry_delay();
+        assert!(
+            expected > Duration::ZERO,
+            "a warned error streak must compute a non-zero retry delay",
+        );
+        let before = tokio::time::Instant::now();
+        backoff.pause().await;
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            expected,
+            "the accept loop did not wait out the retry delay it computed, so a persistent \
+             error streak is retried at full speed",
+        );
+    }
 }
