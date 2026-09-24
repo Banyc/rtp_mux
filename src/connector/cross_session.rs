@@ -347,4 +347,39 @@ mod tests {
         assert_eq!(new.live_streams.load(Ordering::Relaxed), 1);
         assert_eq!(old.live_streams.load(Ordering::Relaxed), 0);
     }
+
+    /// The per-session stream registry prunes the streams that have ended, so
+    /// a long-lived session that opens and closes many streams does not
+    /// accumulate one dead `Weak` per stream ever opened. `track_if_current`
+    /// is the hot path (the redial path's `track` is not), so its prune is
+    /// what bounds the registry; a registration after a stream has been
+    /// dropped is what shows whether the dead entry was removed.
+    #[tokio::test]
+    async fn tracking_a_stream_prunes_the_entries_of_the_streams_that_ended() {
+        let addr: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let mut groups = one_address_group(addr);
+        let mut supervisors = JoinSet::new();
+        let mut router_driver = mux::ResponseRouterDriver::new();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let session = install_session(
+            addr,
+            fake_connected_birth(addr, None),
+            &mut groups,
+            &mut supervisors,
+            &mut router_driver,
+            &shutdown_rx,
+        );
+        let (first_slot, _first_wake) = crate::migrating_write_half::RebindSlot::detached();
+        let first = StreamRebind::track(first_slot.handle(), session.guard());
+        assert_eq!(session.streams.lock().unwrap().len(), 1);
+        drop(first);
+        let (second_slot, _second_wake) = crate::migrating_write_half::RebindSlot::detached();
+        let _second = StreamRebind::track(second_slot.handle(), session.guard());
+        assert_eq!(
+            session.streams.lock().unwrap().len(),
+            1,
+            "the ended stream's registry entry survived the next registration, so a session that \
+             opens and closes streams accumulates one dead handle per stream for its whole life",
+        );
+    }
 }
