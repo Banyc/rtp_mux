@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn lane_rejection_log_aggregates_across_classes_peers_and_lanes() {
+    fn lane_rejection_log_aggregates_across_classes_and_lanes() {
         let log = LaneRejectionLog::default();
         let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
         let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
@@ -213,5 +213,74 @@ mod tests {
             Some(LaneRejectionClass::HelloParse),
             "the last rejected-lane context does not name the most recent rejection",
         );
+    }
+
+    /// The log is a window, not a running total: `flush` drains what has
+    /// accumulated so the next window reports only the rejections recorded
+    /// after it, and the first/last endpoints restart from that window. A
+    /// flush that left the summary in place re-reports the whole accumulation
+    /// on every periodic tick, forever naming the first-ever rejection as the
+    /// window's `first`, so a rising rejection rate is invisible in the log.
+    #[test]
+    fn flush_drains_the_window_and_starts_a_fresh_one() {
+        let log = LaneRejectionLog::default();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        log.record(RejectedLaneContext {
+            class: LaneRejectionClass::HelloTimeout,
+            peer,
+            local_addr: local,
+            expected_class: Some(LaneClass::Interactive),
+            reason: "first window".to_string(),
+        });
+        log.flush();
+        {
+            let summary = log.inner.summary.lock().unwrap();
+            assert_eq!(
+                (
+                    summary.total,
+                    summary.by_class.len(),
+                    summary.first.is_some(),
+                    summary.last.is_some(),
+                ),
+                (0, 0, false, false),
+                "a flushed window kept its accumulation, so every tick re-reports the whole total",
+            );
+        }
+        log.record(RejectedLaneContext {
+            class: LaneRejectionClass::HelloParse,
+            peer,
+            local_addr: local,
+            expected_class: Some(LaneClass::Bulk),
+            reason: "second window".to_string(),
+        });
+        let summary = log.inner.summary.lock().unwrap();
+        assert_eq!(
+            summary.total, 1,
+            "the second window carried the first window's total",
+        );
+        assert_eq!(
+            summary.by_class.get(&LaneRejectionClass::HelloTimeout),
+            None,
+            "a flushed rejection survived into the next window",
+        );
+        assert_eq!(
+            summary.by_class.get(&LaneRejectionClass::HelloParse),
+            Some(&1),
+            "the new window did not accumulate its own rejection",
+        );
+        assert_eq!(
+            summary.first.as_ref().map(|context| context.class),
+            Some(LaneRejectionClass::HelloParse),
+            "the new window's first endpoint still names the flushed window's rejection",
+        );
+    }
+
+    /// Flushing an empty window is a no-op: the periodic tick flushes
+    /// unconditionally, so a flush with nothing recorded must neither log (the
+    /// `total == 0` early return) nor panic on the missing endpoints.
+    #[test]
+    fn flushing_an_empty_window_is_a_no_op() {
+        LaneRejectionLog::default().flush();
     }
 }
