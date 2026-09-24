@@ -1787,4 +1787,65 @@ mod tests {
         );
         assert!(!bulk.fec, "the bulk lane must stay FEC-free");
     }
+
+    /// A server handed a shutdown watch that is *already* `true` must return
+    /// without waiting for a change: the cooperative-shutdown receiver is
+    /// documented to stop admitting lanes as soon as it observes `true`, and a
+    /// caller that pre-signals (or reuses a signalled receiver) would
+    /// otherwise park forever, because no later change is ever sent.
+    #[tokio::test]
+    async fn an_already_signalled_shutdown_watch_returns_the_server_promptly() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+        let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
+            .await
+            .expect("bind a loopback server");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.serve_with_shutdown(SessionSpawner::new(|_| {}), |_| {}, shutdown_rx),
+        )
+        .await;
+        // The sender stays alive across the await: a sender that has been
+        // dropped would wake the receiver through the closed channel instead
+        // of through the already-observed `true`, which is not the case under
+        // test here.
+        let _keep_the_sender_alive = &shutdown_tx;
+        let result = outcome.expect(
+            "a server whose shutdown watch is already true never returned, so a pre-signalled \
+             receiver can never stop it",
+        );
+        assert!(
+            result.is_ok(),
+            "cooperative shutdown must report success: {result:?}",
+        );
+    }
+
+    /// The other direction: a running server observes a later `true` and
+    /// returns `Ok(())` after reaping its nested scopes. Removing the shutdown
+    /// arm (or never polling the receiver) leaves the serve loop parked in the
+    /// accept loop, so this test's timeout is the pin.
+    #[tokio::test]
+    async fn a_signalled_shutdown_watch_stops_a_running_server() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
+            .await
+            .expect("bind a loopback server");
+        let mut serve_set = JoinSet::new();
+        serve_set.spawn(server.serve_with_shutdown(
+            SessionSpawner::new(|_| {}),
+            |_| {},
+            shutdown_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown_tx.send_replace(true);
+        let joined = tokio::time::timeout(Duration::from_secs(5), serve_set.join_next())
+            .await
+            .expect("a signalled shutdown watch did not stop the running server");
+        let result = joined
+            .expect("the serve task must complete")
+            .expect("the serve task must not panic");
+        assert!(
+            result.is_ok(),
+            "cooperative shutdown must report success: {result:?}",
+        );
+    }
 }
