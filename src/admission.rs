@@ -680,14 +680,75 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
         assert!(registry.try_admit(addr.ip()).is_ok());
     }
+    /// The global half of the permit-release accounting on its own: a permit
+    /// is the only thing holding a reserved slot, so dropping it hands the
+    /// slot back. The per-peer half is pinned together with the global
+    /// counter by `pending_lane_registry_permit_drop_releases_global_and_per_peer`.
     #[test]
-    fn pending_lane_expiry_releases_per_peer_capacity() {
+    fn pending_lane_permit_drop_releases_the_global_admission_counter() {
         let registry = PendingLaneRegistry::new();
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let permit = registry.try_admit(ip).unwrap();
         assert_eq!(registry.state.lock().unwrap().admitted, 1);
         drop(permit);
         assert_eq!(registry.state.lock().unwrap().admitted, 0);
+    }
+
+    /// The slots an expired reservation held must come back when the entry
+    /// holding them is reaped. `expire` moves each expired entry's permit into
+    /// the value it returns, so the budget is released when the reaper drops
+    /// that value; if the permit never left the registry, a peer could spend
+    /// its whole pending-lane budget on lanes whose partners never arrive and
+    /// then be refused every lane it ever sends again.
+    #[test]
+    fn pending_lane_expiry_releases_per_peer_capacity() {
+        let registry = PendingLaneRegistry::new();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        for _ in 0..MAX_PENDING_LANES_PER_PEER {
+            let nonce = PairingNonce::generate();
+            let mut permit = Some(registry.try_admit(ip).unwrap());
+            assert!(matches!(
+                registry.register_admitted(
+                    nonce,
+                    LaneClass::Interactive,
+                    peer,
+                    local,
+                    GroupToken::generate(),
+                    &mut permit
+                ),
+                PendingLaneAdmission::Reserved
+            ));
+        }
+        assert!(
+            registry.try_admit(ip).is_err(),
+            "the peer's pending-lane budget must be full once every reservation has claimed a slot",
+        );
+        let deadline = registry
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .map(PendingLaneEntry::expires_at)
+            .max()
+            .unwrap();
+        let expired = registry.expire(deadline);
+        assert_eq!(
+            expired.len(),
+            MAX_PENDING_LANES_PER_PEER,
+            "every reservation past its deadline must be reaped",
+        );
+        drop(expired);
+        assert!(
+            !registry.state.lock().unwrap().per_peer.contains_key(&ip),
+            "an expired reservation kept its slot after its entry was reaped, so a peer that never completes a pairing runs out of pending lanes for good",
+        );
+        assert!(
+            registry.try_admit(ip).is_ok(),
+            "the budget the expired lanes held was never handed back",
+        );
     }
     #[test]
     fn register_admitted_reject_duplicate_class() {
