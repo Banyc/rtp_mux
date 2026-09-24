@@ -1,5 +1,6 @@
-//! Pin the five server-side lane-rejection classifications at the live
-//! `serve`/accept boundary.
+//! Pin the server-side lane-rejection classifications at the live
+//! `serve`/accept boundary: `Capacity`, `HelloTimeout`, `HelloParse`,
+//! `ClassMismatch`, `GroupFull` and `Admission`.
 //!
 //! `serve` builds its `LaneRejectionLog` internally (in
 //! `serve_with_handler`), so a test cannot reach into that log directly. The
@@ -13,9 +14,10 @@
 //! The metric-name mapping itself is pinned separately by
 //! `each_lane_rejection_class_reports_its_documented_metric_name`
 //! (`src/lane_rejection.rs`). Together the two close the loop: mutating the
-//! classification at any of the five call sites in `src/server.rs`
-//! (`Capacity`, `HelloTimeout`, `HelloParse`, `ClassMismatch`, `GroupFull`)
-//! makes exactly the test that owns that call site fail.
+//! classification at any of the six call sites in `src/server.rs` that the
+//! tests below own (`Capacity`, `HelloTimeout`, `HelloParse`, `ClassMismatch`,
+//! `GroupFull`, `Admission`) makes exactly the test that owns that call site
+//! fail.
 
 #![allow(clippy::disallowed_methods)]
 
@@ -45,6 +47,7 @@ const METRIC_HELLO_TIMEOUT: &str = "stream.rtp_mux.hello_timeout";
 const METRIC_HELLO_PARSE: &str = "stream.rtp_mux.hello_parse_error";
 const METRIC_CLASS_MISMATCH: &str = "stream.rtp_mux.class_mismatch";
 const METRIC_GROUP_FULL: &str = "stream.rtp_mux.group_full";
+const METRIC_ADMISSION: &str = "stream.rtp_mux.admission_rejected";
 // Two auxiliary counters the tests synchronise on (not rejection classes).
 const METRIC_RTP_ACCEPTS: &str = "stream.rtp_mux.rtp.accepts";
 const METRIC_PAIRED: &str = "stream.rtp_mux.paired";
@@ -290,6 +293,52 @@ async fn a_lane_that_sends_a_garbled_hello_is_recorded_as_hello_parse() {
         recorder().value(METRIC_HELLO_PARSE),
         before + 1,
         "a lane whose hello does not parse must be counted under '{METRIC_HELLO_PARSE}' exactly once"
+    );
+}
+
+/// A lane presenting a pairing nonce its peer has already reserved is refused
+/// by the pairing registry as a duplicate lane class. The class records *where*
+/// in the handshake the lane was turned away, so attributing this refusal to a
+/// later stage (a pairing timeout) or an earlier one (a class mismatch) moves
+/// the operator's rejection totals to the wrong stage without changing the
+/// lane's outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_duplicate_lane_for_a_reserved_nonce_is_recorded_as_admission() {
+    let _serial = serialized().await;
+    let before = recorder().value(METRIC_ADMISSION);
+    let mut scope = TestScope::new();
+    let (interactive, _bulk) = spawn_server(&mut scope).await;
+    scope
+        .run(async {
+            let nonce = PairingNonce::generate();
+            let group = GroupToken::generate();
+            // Two interactive lanes under one pairing nonce and one group
+            // token: whichever the serve loop registers first reserves the
+            // nonce, and the other is refused as a duplicate lane class for
+            // that nonce (the group is not full, so the refusal is the
+            // registry admission check, not the group check).
+            let mut first = dial(interactive, interactive_config()).await;
+            let mut second = dial(interactive, interactive_config()).await;
+            mux::write_lane_hello(&mut first.write, LaneClass::Interactive, nonce, group)
+                .await
+                .expect("write the first lane's hello");
+            mux::write_lane_hello(&mut second.write, LaneClass::Interactive, nonce, group)
+                .await
+                .expect("write the duplicate lane's hello");
+            wait_for_metric(
+                METRIC_ADMISSION,
+                before + 1,
+                "the duplicate-lane admission rejection",
+                Duration::from_secs(15),
+            )
+            .await;
+            let _ = (first, second);
+        })
+        .await;
+    assert_eq!(
+        recorder().value(METRIC_ADMISSION),
+        before + 1,
+        "a lane refused by the pairing registry must be counted under '{METRIC_ADMISSION}' exactly once"
     );
 }
 
