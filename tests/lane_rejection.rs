@@ -1,6 +1,6 @@
 //! Pin the server-side lane-rejection classifications at the live
 //! `serve`/accept boundary: `Capacity`, `HelloTimeout`, `HelloParse`,
-//! `ClassMismatch`, `GroupFull` and `Admission`.
+//! `ClassMismatch`, `GroupFull`, `Admission` and `PairingTimeout`.
 //!
 //! `serve` builds its `LaneRejectionLog` internally (in
 //! `serve_with_handler`), so a test cannot reach into that log directly. The
@@ -14,10 +14,10 @@
 //! The metric-name mapping itself is pinned separately by
 //! `each_lane_rejection_class_reports_its_documented_metric_name`
 //! (`src/lane_rejection.rs`). Together the two close the loop: mutating the
-//! classification at any of the six call sites in `src/server.rs` that the
-//! tests below own (`Capacity`, `HelloTimeout`, `HelloParse`, `ClassMismatch`,
-//! `GroupFull`, `Admission`) makes exactly the test that owns that call site
-//! fail.
+//! classification at any of the call sites in `src/server.rs` that the tests
+//! below own (`Capacity`, `HelloTimeout`, `HelloParse`, `ClassMismatch`,
+//! `GroupFull`, `Admission`, `PairingTimeout`) makes exactly the test that
+//! owns that call site fail.
 
 #![allow(clippy::disallowed_methods)]
 
@@ -48,6 +48,7 @@ const METRIC_HELLO_PARSE: &str = "stream.rtp_mux.hello_parse_error";
 const METRIC_CLASS_MISMATCH: &str = "stream.rtp_mux.class_mismatch";
 const METRIC_GROUP_FULL: &str = "stream.rtp_mux.group_full";
 const METRIC_ADMISSION: &str = "stream.rtp_mux.admission_rejected";
+const METRIC_PAIRING_TIMEOUT: &str = "stream.rtp_mux.pairing_timeout";
 // Two auxiliary counters the tests synchronise on (not rejection classes).
 const METRIC_RTP_ACCEPTS: &str = "stream.rtp_mux.rtp.accepts";
 const METRIC_PAIRED: &str = "stream.rtp_mux.paired";
@@ -66,6 +67,12 @@ const MAX_PENDING_LANES_PER_PEER: usize = 32;
 /// `read_lane_hello`'s `read_exact`, never enough to complete the 33-byte
 /// hello.
 const PARTIAL_HELLO_LEN: usize = 5;
+/// The serve side's pairing deadline (`crate::shared::PAIRING_DEADLINE`),
+/// which this suite cannot name directly because `shared` is `pub(crate)`: an
+/// accepted lane that completes its hello but is never joined by its partner
+/// holds its reservation until this long after the hello was registered, and
+/// is then reaped by the serve side's expiry worker.
+const PAIRING_DEADLINE: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // In-process metrics recorder
@@ -293,6 +300,64 @@ async fn a_lane_that_sends_a_garbled_hello_is_recorded_as_hello_parse() {
         recorder().value(METRIC_HELLO_PARSE),
         before + 1,
         "a lane whose hello does not parse must be counted under '{METRIC_HELLO_PARSE}' exactly once"
+    );
+}
+
+/// A lane that completes its hello and is then never joined by its partner
+/// holds a reservation until the pairing deadline, and the expiry worker that
+/// reaps it records the reap as `PairingTimeout`: the class that says the
+/// engineer's *pairing deadline* expired, as opposed to a lane refused on
+/// arrival (`ClassMismatch`, `GroupFull`, `Admission`) or one that never
+/// finished its hello (`HelloTimeout`).
+///
+/// This drives the expiry worker's unpaired-reservation path
+/// (`ExpiredPendingLane::Ready` in `src/server.rs`). The other two
+/// `PairingTimeout` sites are not driven here: the waiter whose own deadline
+/// passes needs a scheduling race between that deadline and the expiry
+/// worker, and a reservation that is still `Building` at its deadline cannot
+/// happen at all, because a reservation is `Building` only across the birth
+/// heartbeat, which is itself bounded by the shorter `HELLO_DEADLINE`.
+///
+/// The wait is bounded by `PAIRING_DEADLINE` plus a 20-second grace; a
+/// dispatch that re-labels this reap (as `HelloTimeout`, say) leaves the
+/// metric untouched and fails here on the timeout, naming the metric.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpaired_lane_is_recorded_as_pairing_timeout_when_its_deadline_expires() {
+    let _serial = serialized().await;
+    let before = recorder().value(METRIC_PAIRING_TIMEOUT);
+    let mut scope = TestScope::new();
+    let (interactive, _bulk) = spawn_server(&mut scope).await;
+    scope
+        .run(async {
+            // One interactive lane with a fresh nonce and group and no
+            // partner: the hello parses, the class matches the listener, the
+            // group has room, and the registry takes the reservation — so
+            // nothing rejects this lane on arrival. Nothing ever joins it, so
+            // the only engine left that can remove it is the pairing
+            // deadline, and the reap is the event under test.
+            let mut io = dial(interactive, interactive_config()).await;
+            mux::write_lane_hello(
+                &mut io.write,
+                LaneClass::Interactive,
+                PairingNonce::generate(),
+                GroupToken::generate(),
+            )
+            .await
+            .expect("write the unpaired lane's hello");
+            wait_for_metric(
+                METRIC_PAIRING_TIMEOUT,
+                before + 1,
+                "the unpaired lane's pairing-deadline reap",
+                PAIRING_DEADLINE + Duration::from_secs(20),
+            )
+            .await;
+            let _ = io;
+        })
+        .await;
+    assert_eq!(
+        recorder().value(METRIC_PAIRING_TIMEOUT),
+        before + 1,
+        "a lane whose partner never arrived must be counted under '{METRIC_PAIRING_TIMEOUT}' exactly once, when its pairing deadline expires"
     );
 }
 
