@@ -121,6 +121,67 @@ four interactive streams on the same lane keep per-flow delivery ≥ 0.90 and
 p50 ≤ 2.5× the solo reference, so the interactive lane's latency floor also
 holds when several flows share it.
 
+### The tri-mandate smoke set
+
+The one command that measures all three mandates together and leaves
+machine-checkable evidence is the `mandate_smoke` target; `tools/mandate-check`
+(`crates/netem_test/tools/mandate-check`) runs it, renders one panel per
+mandate, prints a verdict block and writes `mandate-check.json` and the six
+`M1/M2/M3.json`/`.csv` evidence files:
+
+```sh
+cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture
+cd crates/netem_test && tools/mandate-check --rtp-mux ../rtp_mux
+```
+
+It is a smoke set **alongside** the gates above, not a replacement: it neither
+retunes nor re-arms them. All three mandates are measured on the production
+dual-lane topology, over three arms in the shape the field sends. `clean` is
+2 % iid loss with 25 ms one-way delay and 5 ms jitter and the production
+2 MiB / 3 s bulk load — the arm the mandate bounds themselves are asserted on.
+`hostile` adds the product's known bad regime: the four-state Gilbert-Elliot
+model `gilbert_elliott_loss(5.0, 8.0)` plus ~100 ms jitter, same cadence and
+bulk load. `lone_tail` rides the same hostile impairment with the
+request/response shape (`depth` 1, one unacked data packet at a time) and no
+bulk lane. Every window is `<= 15 s` and the interactive cadence is ~5 ms, so a
+short run still carries thousands of samples per cadence arm; the run is ~3
+minutes, and `MANDATE_SMOKE_QUICK=1` takes the shortest windows.
+
+M1 asserts the mandate-1 bound (p99 `<= 250 ms` and zero samples `> 250 ms`) on
+`clean`; M2 asserts the mandate-2 bound (`delivery == 1.000`, own-wire `<= 6x`)
+on `clean`; M3 asserts the mandate-3 floor (`>= 0.35x` of the configured link
+rate) as the within-run delivered/shaper-forwarded fraction, median of three.
+Those bounds and their derivations are the ones stated above; the smoke set
+does not restate them.
+
+The `hostile` and `lone_tail` arms carry the product's **known, measured**
+hostile defect — the 1 s `MIN_RTO` repair floor plus exponential backoff (the
+field's GE lone-tail p99 1053–1542 ms, `rtx_rto` 13–38 and `rtx_repeat`
+10–26, the slowest 60 s ladder 1535 / 2532 / 3544 / 5315 ms) — so asserting the
+250 ms ceiling there would assert something currently false. They assert
+**regression guards** derived from those measurements, in the same style as the
+bounds above (measured X, bound Y, so a change that at least doubles it fails):
+
+| quantity | measured | guard |
+| --- | --- | --- |
+| M1 hostile (GE cadence) p99 | 212–280 ms (12 s arm) | `900 ms` (~3×) |
+| M1 hostile `> 250 ms` share | 0–2.75 % | `8 %` (~3×) |
+| M1 lone-tail p99 | field 1053–1542 ms (60 s) | `3200 ms` (~2×) |
+| M1 lone-tail p99.9 | 797–1636 ms (15 s arm); field ladder 5315 ms | `8000 ms` (~1.5× the field ladder) |
+| M1 lone-tail `> 250 ms` share | field 2.7 %, smoke 0–0.7 % | `8 %` |
+| M2 hostile own-wire | 4.63–4.81× | `10×` (~2×) |
+| M2 lone-tail own-wire | 6.07–6.41× (15 s), field 6.22–7.17× | `14×` (~2×) |
+| M2 hostile/lone delivery | 1.000 | `0.995` |
+
+The smoke panels carry the mandate lines regardless: the M1 latency panel
+draws the **250 ms ceiling**, the M2 wire panel draws the **6× budget** and the
+M3 panels draw the **0.35× floor**, so a hostile or lone-tail breach is visible
+in the evidence even when that arm's assertion is only a regression guard. The
+assertion is a tripwire; the panel shows what moved. The M1 evidence also
+draws a p99 CDF panel (the ceiling itself cannot be a horizontal line on a
+latency CDF), and every `MANDATE` line prints p50/p90/p99/p999/max and the
+`> 250 ms` sample count for all three arms.
+
 **Redundancy monotonicity is NOT a mandate** — it was only ever a proxy for
 these outcomes. FEC recovery parity may legitimately grow with loss; what must
 not happen is the interactive lane's extra/armor packets inflating its own
@@ -181,6 +242,9 @@ hol_probe::fec_saturated_pair_keys_loss_to_the_same_rtp_sequence
 perf_probe::controller_fat_pipe_has_only_fixed_shaping
 perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss
 rtp_mux_jitter::jitter_duallane_constitution_gate
+mandate_smoke::m1_interactive_tail_latency
+mandate_smoke::m2_interactive_delivery_and_wire
+mandate_smoke::m3_bulk_goodput_fraction
 mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
 mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
 mux_over_rtp::mux_over_rtp_over_netem_clean_link_echoes
@@ -407,6 +471,9 @@ perf_probe::probe_rtp_echo_4mib_direct
 perf_probe::probe_rtp_echo_4mib_mss8k
 rtp_mux_jitter::jitter_duallane_constitution_gate
 rtp_mux_jitter::jitter_duallane_constitution_gate_p99
+mandate_smoke::m1_interactive_tail_latency
+mandate_smoke::m2_interactive_delivery_and_wire
+mandate_smoke::m3_bulk_goodput_fraction
 ```
 
 ## Perf-tier reach into asserting helpers
