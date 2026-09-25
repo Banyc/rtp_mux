@@ -90,9 +90,13 @@ either sees the whole constitution:
    (derived): sink-delivered goodput ≥ `0.35 ×` the configured bulk-lane rate
    (8 Mbit/s shape, the `rtp_bufferbloat` `0.35 × capacity` precedent — the
    floor is deliberately slack so ordinary host noise never trips it while a
-   change that at least halves the bulk lane's goodput fails). The measured
-   band is ~0.86× of the shaped rate, so the floor leaves ~2.5× headroom.
-   Asserted by
+   change that at least halves the bulk lane's goodput fails). The gate's arm
+   is the deployment's own bulk lane (`LaneRtpConfig::production_bulk`: the
+   byte-stream, FEC-free transport carrying the congestion intent production
+   maps from `LaneClass::Bulk` — `Dedicated`, not the stock `Shared` default
+   a bare byte-stream lane gets), so the mandate measures the configuration
+   the product ships; the measured band is ~0.87× of the shaped rate, so the
+   floor leaves ~2.5× headroom. Asserted by
    `dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction`
    (`full` tier): median of three seeded runs; the sink counter is sampled
    as a window delta so the pre-window saturation phase cannot inflate the

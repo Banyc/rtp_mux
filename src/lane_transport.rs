@@ -71,7 +71,12 @@ fn frame_delivery(lane: LaneClass) -> rtp::FrameMode {
 /// lane shares the host's bottleneck and keeps the conservative tuning.  This
 /// is deliberately independent of [`frame_delivery`]: the bulk lane keeps
 /// frame delivery while still declaring a dedicated congestion lane.
-fn congestion_lane(lane: LaneClass) -> CongestionLane {
+///
+/// This is the one authority for the mapping: the layer-testing kit reads it
+/// (via [`LaneRtpConfig::production_bulk`](crate::testkit::dual::LaneRtpConfig::production_bulk))
+/// so a scenario's arm declares the same congestion lane the deployment does,
+/// and the two cannot drift.
+pub(crate) fn congestion_lane(lane: LaneClass) -> CongestionLane {
     match lane {
         LaneClass::Bulk => CongestionLane::Dedicated,
         LaneClass::Interactive => CongestionLane::Shared,

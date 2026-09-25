@@ -48,8 +48,14 @@
 //!    of that capacity — the same `0.35 × capacity` shape as the
 //!    `rtp_bufferbloat` floor (there, chosen so the gate survives the
 //!    concurrent `rtp` branches without asserting the measured stock number).
+//!    *Arm:* the bulk lane is [`LaneRtpConfig::production_bulk`] — the
+//!    deployment's own lane: the byte-stream, FEC-free transport carrying the
+//!    congestion intent production maps from `LaneClass::Bulk` (`Dedicated`),
+//!    not the stock `Shared` default a bare byte-stream lane would get. The
+//!    interactive lane is unchanged either way, because production's
+//!    interactive lane *is* the `Shared` intent.
 //!    The bulk lane has its own link (no interactive contention), so the
-//!    stock transport sits at ~0.86× of the shaped rate — well above the
+//!    shipped transport sits at ~0.87× of the shaped rate — well above the
 //!    floor; a change that at least halves the bulk lane's goodput fails.
 //!    The sink counter is sampled as a window delta so the pump's pre-window
 //!    saturation phase cannot inflate the reading (the cumulative counter
@@ -132,9 +138,16 @@ fn prompt_tuning() -> rtp::FecTuning {
 
 /// One mandate-3 rep: run the production dual-lane composition — interactive
 /// lane (frame fast-forward + prompt FEC) on its own RTP connection, bulk
-/// lane (strict byte-stream, FEC-free) on a second connection shaped at
+/// lane (strict byte-stream, FEC-free, **the dedicated congestion lane
+/// production maps from `LaneClass::Bulk`**) on a second connection shaped at
 /// [`BULK_RATE_BPS`] — with the bulk lane *saturated* by a back-to-back
 /// sender, and return the sink-delivered goodput measured across the window.
+///
+/// The bulk lane's transport comes from [`LaneRtpConfig::production_bulk`],
+/// not from the stock `byte_stream` lane, so the mandate measures the
+/// configuration the product ships rather than rtp's default congestion
+/// intent; the interactive lane is unchanged either way, since production's
+/// interactive lane *is* the `Shared` intent.
 ///
 /// The interactive lane runs a light latency stream (the composition's own
 /// lane, ~40 pings/s of 256 B on a separate, unshaped link — negligible
@@ -146,7 +159,7 @@ async fn run_bulk_saturation_rep(base: Instant) -> f64 {
     let (goodput_mib_s, received, sent) = tasks
         .run(async {
             let int_rtp = LaneRtpConfig::frame_reordering(true, prompt_tuning());
-            let bulk_rtp = LaneRtpConfig::byte_stream();
+            let bulk_rtp = LaneRtpConfig::production_bulk();
             let (int_addr, bulk_addr, mut latencies, bulk_sink, _task_tx) =
                 spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via(
                     &task_tx, base, int_rtp, bulk_rtp,

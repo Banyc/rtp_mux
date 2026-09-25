@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use rtp::CongestionLane;
 use rtp::FecTuning;
 use rtp::FrameMode;
 
@@ -19,11 +20,8 @@ use netem_test::kit::{
     LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, TEST_TASK_QUEUE_BOUND, TestScope, TestTask,
     TestTaskSubmitter, submit_test_task, submit_test_task_required, try_send_observation,
 };
-use rtp::testkit::frame::{
-    rtp_frame_delivery_connect, rtp_frame_delivery_connect_reorder_with_fec_tuning_via,
-    rtp_frame_delivery_connect_via, rtp_frame_delivery_connect_with_fec_tuning_via,
-};
-use rtp::testkit::rtp::{rtp_connect, rtp_connect_via, rtp_connect_with_mss_and_fec_tuning_via};
+use rtp::testkit::frame::{rtp_frame_delivery_connect, rtp_frame_delivery_connect_via};
+use rtp::testkit::rtp::{rtp_connect, rtp_connect_via};
 
 /// Server that accepts two RTP connections (lane‑hello paired) and handles
 /// both latency‑echo (tag byte `b'L'`) and bulk‑sink streams on the paired
@@ -1599,44 +1597,42 @@ pub async fn dual_mux_client_connect_lane_rtp_via(
     };
     type BoxedRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
     type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
     async fn connect_lane(
         tx: &TestTaskSubmitter,
         addr: std::net::SocketAddr,
         lane: LaneRtpConfig,
         observer: Option<rtp::metrics::MetricsObserver>,
     ) -> (BoxedRead, BoxedWrite) {
+        let addr = addr.to_string();
+        let config = lane_connect_config(lane, observer);
         if lane.frame_mode.enabled {
-            if lane.frame_mode.allow_reorder {
-                let (r, w) = rtp_frame_delivery_connect_reorder_with_fec_tuning_via(
-                    tx,
-                    addr,
-                    lane.fec,
-                    lane.fec_tuning,
-                    observer,
-                )
-                .await;
-                (Box::new(r), Box::new(w))
-            } else {
-                let (r, w) = rtp_frame_delivery_connect_with_fec_tuning_via(
-                    tx,
-                    addr,
-                    lane.fec,
-                    lane.fec_tuning,
-                    observer,
-                )
-                .await;
-                (Box::new(r), Box::new(w))
-            }
-        } else {
-            let (r, w) = rtp_connect_with_mss_and_fec_tuning_via(
+            let connected = rtp::udp::FrameDeliveryIo::connect("0.0.0.0:0", &addr, config)
+                .await
+                .unwrap();
+            let supervisor = connected.supervisor;
+            let (read, write) = (connected.read, connected.write);
+            submit_test_task(
                 tx,
-                addr,
-                lane.fec,
-                rtp::udp::NO_FEC_MSS,
-                lane.fec_tuning,
-            )
-            .await;
-            (Box::new(r), Box::new(w))
+                Box::pin(async move {
+                    let _ = supervisor.await;
+                }),
+            );
+            (Box::new(read), Box::new(write))
+        } else {
+            let connected = rtp::udp::connect_with("0.0.0.0:0", &addr, config)
+                .await
+                .unwrap();
+            let supervisor = connected.supervisor;
+            let read = connected.read.into_async_read();
+            let write = connected.write.into_async_write();
+            submit_test_task(
+                tx,
+                Box::pin(async move {
+                    let _ = supervisor.await;
+                }),
+            );
+            (Box::new(read), Box::new(write))
         }
     }
     let mut super_spawner = JoinSet::new();
@@ -2023,23 +2019,55 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
 /// Per-lane RTP transport configuration for the dual-lane two-listener
 /// server/client helpers: the lane's FEC setting, its receiver-side frame
 /// mode (disabled = byte-stream, `enabled()` = strict frame delivery,
-/// `enabled_reordering()` = fast-forward), and its FEC tuning. Both peers of
-/// a lane must agree on all three (there is no in-band negotiation).
-#[derive(Clone, Copy, Debug)]
+/// `enabled_reordering()` = fast-forward), its FEC tuning, and its declared
+/// congestion intention. Both peers of a lane must agree on the first three
+/// (there is no in-band negotiation); the congestion intention is local to the
+/// connection that declares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneRtpConfig {
     pub fec: bool,
     pub frame_mode: rtp::FrameMode,
     pub fec_tuning: rtp::FecTuning,
+    /// The lane's congestion intent (see [`rtp::CongestionLane`]).  Every
+    /// constructor leaves it [`CongestionLane::Shared`] — rtp's stock
+    /// behaviour — so a scenario that does not opt in opens exactly the
+    /// connection it opened before this became a knob.  A lane standing in
+    /// for the deployment's bulk pipe declares `Dedicated`; use
+    /// [`Self::production_bulk`] so the declaration comes from the same
+    /// mapping the deployment uses.
+    pub congestion_lane: CongestionLane,
 }
 
 impl LaneRtpConfig {
-    /// A byte-stream lane (frame delivery disabled), FEC off, stock tuning.
+    /// A byte-stream lane (frame delivery disabled), FEC off, stock tuning,
+    /// and rtp's stock `Shared` congestion intent.
     pub fn byte_stream() -> Self {
         Self {
             fec: false,
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
+            congestion_lane: CongestionLane::Shared,
         }
+    }
+
+    /// The deployment's bulk lane: byte-stream and FEC-free like
+    /// [`Self::byte_stream`], plus the congestion intent production's lane
+    /// mapping derives for [`mux::LaneClass::Bulk`] (a dedicated pipe).  The
+    /// intent is read from `lane_transport` rather than restated here, so a
+    /// scenario that opens this lane measures the configuration the product
+    /// ships and cannot drift from it.
+    pub fn production_bulk() -> Self {
+        Self {
+            congestion_lane: crate::lane_transport::congestion_lane(mux::LaneClass::Bulk),
+            ..Self::byte_stream()
+        }
+    }
+
+    /// Declare the lane's congestion intent explicitly (the constructors all
+    /// leave it `Shared`).
+    pub fn with_congestion_lane(mut self, congestion_lane: CongestionLane) -> Self {
+        self.congestion_lane = congestion_lane;
+        self
     }
 
     /// A strict frame-delivery lane (fast-forward off) with the given FEC
@@ -2049,6 +2077,7 @@ impl LaneRtpConfig {
             fec,
             frame_mode: FrameMode::enabled(),
             fec_tuning: FecTuning::default(),
+            congestion_lane: CongestionLane::Shared,
         }
     }
 
@@ -2059,6 +2088,7 @@ impl LaneRtpConfig {
             fec,
             frame_mode: FrameMode::enabled_reordering(),
             fec_tuning,
+            congestion_lane: CongestionLane::Shared,
         }
     }
 
@@ -2069,7 +2099,36 @@ impl LaneRtpConfig {
             fec,
             frame_mode: FrameMode::enabled(),
             fec_tuning,
+            congestion_lane: CongestionLane::Shared,
         }
+    }
+}
+
+/// The connect config one lane's client connection opens with: the kit's
+/// per-lane transport knobs plus the lane's declared congestion intent. The
+/// rtp layer kit's connect helpers cannot carry the intent, so
+/// [`dual_mux_client_connect_lane_rtp_via`] opens the connection through the
+/// same public rtp entry points they use; every other field keeps that
+/// helper's value (explicit `handshake: false`, the lane's frame mode, its
+/// FEC setting and tuning, its metrics observer, and rtp's process defaults
+/// for the rest).
+fn lane_connect_config(
+    lane: LaneRtpConfig,
+    observer: Option<rtp::metrics::MetricsObserver>,
+) -> rtp::udp::ConnectConfig<'static> {
+    rtp::udp::ConnectConfig {
+        handshake: false,
+        fec: lane.fec,
+        mss: if lane.frame_mode.enabled {
+            rtp::udp::MssConfig::Default
+        } else {
+            rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS)
+        },
+        fec_tuning: lane.fec_tuning,
+        frame_delivery: lane.frame_mode,
+        metrics_observer: observer,
+        congestion_lane: lane.congestion_lane,
+        ..rtp::udp::ConnectConfig::default()
     }
 }
 
@@ -2107,6 +2166,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             fec,
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
+            congestion_lane: CongestionLane::Shared,
         }
     };
     let bulk_rtp = if bulk_frame {
@@ -2116,6 +2176,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             fec,
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
+            congestion_lane: CongestionLane::Shared,
         }
     };
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
@@ -2154,6 +2215,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
             fec,
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
+            congestion_lane: CongestionLane::Shared,
         }
     };
     let bulk_rtp = if bulk_frame {
@@ -2163,6 +2225,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
             fec,
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
+            congestion_lane: CongestionLane::Shared,
         }
     };
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
@@ -2249,6 +2312,7 @@ async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
                         mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
                         fec_tuning: lane_rtp.fec_tuning,
                         frame_delivery: lane_rtp.frame_mode,
+                        congestion_lane: lane_rtp.congestion_lane,
                         ..rtp::udp::AcceptConfig::default()
                     })
                     .await
@@ -2367,4 +2431,80 @@ async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
         }),
     );
     Ok((int_addr, bulk_addr, rx, bulk_delivered, task_tx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every constructor but [`LaneRtpConfig::production_bulk`] leaves the
+    /// lane on rtp's stock `Shared` intent, so a scenario that does not opt
+    /// in opens exactly the connection it opened before the intent was a
+    /// knob.
+    #[test]
+    fn lane_constructors_keep_the_stock_shared_congestion_intent() {
+        let prompt = FecTuning::default();
+        let stock = [
+            LaneRtpConfig::byte_stream(),
+            LaneRtpConfig::frame_strict(false),
+            LaneRtpConfig::frame_strict(true),
+            LaneRtpConfig::frame_reordering(false, prompt),
+            LaneRtpConfig::frame_strict_tuned(true, prompt),
+        ];
+        for lane in stock {
+            assert_eq!(
+                lane.congestion_lane,
+                CongestionLane::Shared,
+                "a lane constructor must not silently change the stock congestion intent: {lane:?}"
+            );
+            assert_eq!(
+                lane_connect_config(lane, None).congestion_lane,
+                CongestionLane::Shared,
+                "the stock intent must reach the connect config: {lane:?}"
+            );
+        }
+    }
+
+    /// The bulk lane a mandate measures is the one the deployment ships: the
+    /// intent comes from production's `LaneClass::Bulk` mapping rather than a
+    /// literal in the kit that could drift from it, and it changes nothing
+    /// else about the lane.
+    #[test]
+    fn production_bulk_declares_the_dedicated_lane_production_maps() {
+        let bulk = LaneRtpConfig::production_bulk();
+        assert_eq!(bulk.congestion_lane, CongestionLane::Dedicated);
+        assert_eq!(
+            lane_connect_config(bulk, None).congestion_lane,
+            crate::lane_transport::connect_config(
+                mux::LaneClass::Bulk,
+                crate::lane_transport::ConnectSettings {
+                    interactive_fec_tuning: FecTuning::default(),
+                    interactive_instream_group_fec: false,
+                    handshake: false,
+                    metrics_observer: None,
+                    obfuscation_key: None,
+                },
+            )
+            .congestion_lane,
+            "the gate's bulk lane must carry the congestion intent production declares for it"
+        );
+        assert_eq!(
+            LaneRtpConfig {
+                congestion_lane: CongestionLane::Shared,
+                ..bulk
+            },
+            LaneRtpConfig::byte_stream(),
+            "the production bulk lane must differ from the byte-stream lane only in its intent"
+        );
+    }
+
+    #[test]
+    fn with_congestion_lane_overrides_only_the_intent() {
+        let bulk = LaneRtpConfig::byte_stream().with_congestion_lane(CongestionLane::Dedicated);
+        assert_eq!(bulk, LaneRtpConfig::production_bulk());
+        assert_eq!(
+            lane_connect_config(bulk, None).congestion_lane,
+            CongestionLane::Dedicated
+        );
+    }
 }
