@@ -55,11 +55,17 @@
 //!    interactive lane is unchanged either way, because production's
 //!    interactive lane *is* the `Shared` intent.
 //!    The bulk lane has its own link (no interactive contention), so the
-//!    shipped transport sits at ~0.87× of the shaped rate — well above the
+//!    shipped transport sits at ~0.96× of the shaped rate — well above the
 //!    floor; a change that at least halves the bulk lane's goodput fails.
-//!    The sink counter is sampled as a window delta so the pump's pre-window
-//!    saturation phase cannot inflate the reading (the cumulative counter
-//!    measured a spurious 1.88× on a 1.0 MiB/s cap before this fix).
+//!    The goodput is the sink counter's delta across the offered window,
+//!    sampled at both ends while the saturating pump still runs: the mandate
+//!    is the rate the lane sustains while it is offered load, so the interval
+//!    that elapses is that window. Sampling the delta is also what keeps the
+//!    pump's pre-window saturation phase out of the reading (the cumulative
+//!    counter measured a spurious 1.88× on a 1.0 MiB/s cap). The `GRACE`
+//!    drain that follows the window is teardown, not measurement — dividing
+//!    the window's bytes by window + grace (the `rtp_bufferbloat` shape)
+//!    reported 0.86× of the shaped rate where the lane sustains ~0.96×.
 //!    *Asserted by:* [`bulk_lane_goodput_stays_above_capacity_fraction`] below —
 //!    median-of-3, opt-in `full` tier, wall-clock with a documented run
 //!    command.
@@ -111,7 +117,10 @@ const MSG_BYTES: usize = 256;
 const CADENCE: Duration = Duration::from_millis(25);
 /// Measurement window per rep.
 const RUN_FOR: Duration = Duration::from_secs(15);
-/// Drain stragglers through the shaped link before reading the sink counter.
+/// Drain stragglers through the shaped link before teardown. This is not part
+/// of the measured interval: the mandate is the rate the lane sustains while
+/// it is offered a saturating load, so the clock runs only while the sender is
+/// pumping.
 const GRACE: Duration = Duration::from_secs(2);
 
 /// Build one impairment direction: fixed delay + jitter, an optional rate
@@ -240,13 +249,23 @@ async fn run_bulk_saturation_rep(base: Instant) -> f64 {
             let sent = interactive.await;
             // The bulk pump must keep the link saturated for the whole window;
             // a premature end would measure a dead upload.
+            //
+            // The window is sampled at both ends while the pump is still
+            // running: the mandate is the *sustained* rate the lane delivers
+            // while it is offered a saturating load, so the elapsing interval
+            // is the offered window itself, and the drain that follows is
+            // teardown rather than measurement. The pump has been saturating
+            // the link since before the window started (it runs through the
+            // whole interactive phase too), so the sink counter already holds
+            // pre-window bytes; sample the delta over the window, not the
+            // cumulative total, or the goodput is inflated by the pre-window
+            // pumping (measured 1.88x with the cumulative counter through a
+            // 1.0 MiB/s cap). Reading the closing sample after `GRACE`
+            // instead would divide the window's bytes by an interval some 13%
+            // longer in which the sender offers nothing — the shaped link is
+            // still draining its backlog — reporting 0.860x of the shaped
+            // rate where the lane sustained 0.95x.
             let window_start = Instant::now();
-            // The pump has been saturating the link since before the window
-            // started (it runs through the whole interactive phase too), so the
-            // sink counter already holds pre-window bytes; sample the delta
-            // over the window, not the cumulative total, or the goodput is
-            // inflated by the pre-window pumping (measured 1.88x with the
-            // cumulative counter through a 1.0 MiB/s cap).
             let delivered_before = bulk_sink.load(Ordering::Relaxed) as f64;
             tokio::select! {
                 joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
@@ -255,12 +274,13 @@ async fn run_bulk_saturation_rep(base: Instant) -> f64 {
                 }
                 _ = tokio::time::sleep(RUN_FOR) => {}
             }
-            pump_stop_tx.send(true).unwrap();
-            // Give the final bulk bytes time to drain through the shaped link
-            // before measuring elapsed goodput (the `rtp_bufferbloat` shape).
-            tokio::time::sleep(GRACE).await;
             let elapsed = window_start.elapsed();
             let delivered = (bulk_sink.load(Ordering::Relaxed) as f64 - delivered_before).max(0.0);
+            pump_stop_tx.send(true).unwrap();
+            // Drain the window's stragglers through the shaped link before the
+            // pair is stopped, so teardown never truncates bytes the window's
+            // sender already committed.
+            tokio::time::sleep(GRACE).await;
             while let Some(result) = pump_tasks.join_next().await {
                 result.unwrap();
             }

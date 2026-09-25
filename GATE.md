@@ -95,12 +95,17 @@ either sees the whole constitution:
    byte-stream, FEC-free transport carrying the congestion intent production
    maps from `LaneClass::Bulk` — `Dedicated`, not the stock `Shared` default
    a bare byte-stream lane gets), so the mandate measures the configuration
-   the product ships; the measured band is ~0.87× of the shaped rate, so the
-   floor leaves ~2.5× headroom. Asserted by
+   the product ships; the measured band is ~0.96× of the shaped rate, so the
+   floor leaves ~2.7× headroom. Asserted by
    `dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction`
-   (`full` tier): median of three seeded runs; the sink counter is sampled
-   as a window delta so the pre-window saturation phase cannot inflate the
-   reading (a measured 1.88× inflation was fixed with the move).
+   (`full` tier): median of three seeded runs. The goodput is the sink
+   counter's delta across the offered window, sampled at both ends while the
+   saturating pump still runs, so the reading is the rate the lane sustains
+   under load: the delta keeps the pump's pre-window saturation phase out of
+   it (the cumulative counter measured a spurious 1.88× on a 1.0 MiB/s cap),
+   and the interval is the window itself rather than window + drain grace,
+   which divided the window's bytes by an interval ~13 % longer in which the
+   sender offers nothing and reported 0.86× where the lane sustains 0.96×.
    ```sh
    cargo test --release -p rtp_mux --test dual_lane_mandates -- \
        --ignored bulk_lane_goodput_stays_above_capacity_fraction --nocapture --test-threads=1
