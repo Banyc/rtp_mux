@@ -1,6 +1,6 @@
 use std::{io, net::SocketAddr, pin::Pin, task::Context};
 
-use mux::{LaneClass, SplicedReader, StreamReader, StreamWriter};
+use mux::{LaneClass, SplicedReader};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::migrating_write_half::MigratingWriteHalf;
@@ -11,20 +11,13 @@ pub struct SocketAddrPair {
     pub peer_addr: SocketAddr,
 }
 
+/// An accepted RTP mux stream.
+///
+/// The accepter built by `run_dual_mux_accepter` seeds the response opener and
+/// turns plain-stream pass-through off, so `MigratingCapableAccepter::accept`
+/// yields the duplex shape and nothing else.
 #[derive(Debug)]
 pub enum ServerStream {
-    Plain {
-        reader: StreamReader,
-        writer: StreamWriter,
-        addr: SocketAddrPair,
-        source_lane: LaneClass,
-    },
-    Migrating {
-        reader: SplicedReader,
-        writer: StreamWriter,
-        addr: SocketAddrPair,
-        source_lane: LaneClass,
-    },
     MigratingDuplex {
         reader: SplicedReader,
         writer: MigratingWriteHalf,
@@ -36,23 +29,19 @@ pub enum ServerStream {
 impl ServerStream {
     pub fn addr(&self) -> SocketAddrPair {
         match self {
-            Self::Plain { addr, .. }
-            | Self::Migrating { addr, .. }
-            | Self::MigratingDuplex { addr, .. } => *addr,
+            Self::MigratingDuplex { addr, .. } => *addr,
         }
     }
 
     pub fn source_lane(&self) -> LaneClass {
         match self {
-            Self::Plain { source_lane, .. }
-            | Self::Migrating { source_lane, .. }
-            | Self::MigratingDuplex { source_lane, .. } => *source_lane,
+            Self::MigratingDuplex { source_lane, .. } => *source_lane,
         }
     }
 
     pub fn set_name(&self, name: &str) {
-        if let Self::MigratingDuplex { writer, .. } = self {
-            writer.name_handle().set(name);
+        match self {
+            Self::MigratingDuplex { writer, .. } => writer.name_handle().set(name),
         }
     }
 }
@@ -64,8 +53,6 @@ impl AsyncRead for ServerStream {
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         match &mut *self {
-            Self::Plain { reader, .. } => Pin::new(reader).poll_read(cx, buf),
-            Self::Migrating { reader, .. } => Pin::new(reader).poll_read(cx, buf),
             Self::MigratingDuplex { reader, .. } => Pin::new(reader).poll_read(cx, buf),
         }
     }
@@ -78,9 +65,6 @@ impl AsyncWrite for ServerStream {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         match &mut *self {
-            Self::Plain { writer, .. } | Self::Migrating { writer, .. } => {
-                Pin::new(writer).poll_write(cx, buf)
-            }
             Self::MigratingDuplex { writer, .. } => Pin::new(writer).poll_write(cx, buf),
         }
     }
@@ -91,18 +75,12 @@ impl AsyncWrite for ServerStream {
         bufs: &[io::IoSlice<'_>],
     ) -> std::task::Poll<io::Result<usize>> {
         match &mut *self {
-            Self::Plain { writer, .. } | Self::Migrating { writer, .. } => {
-                Pin::new(writer).poll_write_vectored(cx, bufs)
-            }
             Self::MigratingDuplex { writer, .. } => Pin::new(writer).poll_write_vectored(cx, bufs),
         }
     }
 
     fn is_write_vectored(&self) -> bool {
         match self {
-            Self::Plain { writer, .. } | Self::Migrating { writer, .. } => {
-                writer.is_write_vectored()
-            }
             Self::MigratingDuplex { writer, .. } => writer.is_write_vectored(),
         }
     }
@@ -112,9 +90,6 @@ impl AsyncWrite for ServerStream {
         cx: &mut Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         match &mut *self {
-            Self::Plain { writer, .. } | Self::Migrating { writer, .. } => {
-                Pin::new(writer).poll_flush(cx)
-            }
             Self::MigratingDuplex { writer, .. } => Pin::new(writer).poll_flush(cx),
         }
     }
@@ -124,9 +99,6 @@ impl AsyncWrite for ServerStream {
         cx: &mut Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         match &mut *self {
-            Self::Plain { writer, .. } | Self::Migrating { writer, .. } => {
-                Pin::new(writer).poll_shutdown(cx)
-            }
             Self::MigratingDuplex { writer, .. } => Pin::new(writer).poll_shutdown(cx),
         }
     }

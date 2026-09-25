@@ -1224,16 +1224,6 @@ async fn run_dual_mux_accepter(
             Err(_) => break,
         };
         let stream = match accepted {
-            AcceptedStream::Migrating {
-                reader,
-                writer,
-                source_lane,
-            } => ServerStream::Migrating {
-                reader,
-                writer,
-                addr,
-                source_lane,
-            },
             AcceptedStream::MigratingDuplex {
                 reader,
                 writer,
@@ -1249,16 +1239,14 @@ async fn run_dual_mux_accepter(
                     source_lane,
                 }
             }
-            AcceptedStream::Plain {
-                reader,
-                writer,
-                source_lane,
-            } => ServerStream::Plain {
-                reader,
-                writer,
-                addr,
-                source_lane,
-            },
+            // `into_migrating_duplex_with_feed` seeds the response opener, so
+            // `accepted_migrating` never returns the response-less migrating
+            // shape; it also turns plain-stream pass-through off, so a plain
+            // substream is discarded inside the accepter. Neither variant can
+            // reach this call site.
+            AcceptedStream::Migrating { .. } | AcceptedStream::Plain { .. } => {
+                unreachable!("into_migrating_duplex_with_feed yields only MigratingDuplex")
+            }
         };
         counter!("stream.rtp_mux.accepts").increment(1);
         handler(stream);

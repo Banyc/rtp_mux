@@ -238,6 +238,7 @@ mod tests {
 
     async fn make_dual_pair() -> (
         mux::DualStreamOpener,
+        mux::DualStreamOpener,
         mux::DualStreamAccepter,
         JoinSet<MuxError>,
         JoinSet<MuxError>,
@@ -298,7 +299,7 @@ mod tests {
             &mut client_supervisor,
         );
         let mut server_supervisor = JoinSet::new();
-        let (_server_opener, server_accepter) = mux::spawn_dual_mux_paired_supervised(
+        let (server_opener, server_accepter) = mux::spawn_dual_mux_paired_supervised(
             si_o,
             si_a,
             si_t,
@@ -309,6 +310,7 @@ mod tests {
         );
         (
             client_opener,
+            server_opener,
             server_accepter,
             client_supervisor,
             server_supervisor,
@@ -318,7 +320,8 @@ mod tests {
     #[tokio::test]
     async fn write_is_cancellation_safe_and_shutdown_delivers_final() {
         use tokio::io::{AsyncReadExt, AsyncWrite};
-        let (opener, accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (opener, _server_opener, accepter, _client_tasks, _server_tasks) =
+            make_dual_pair().await;
         let addr = SocketAddrPair {
             local_addr: "127.0.0.1:10000".parse().unwrap(),
             peer_addr: "127.0.0.1:10001".parse().unwrap(),
@@ -393,7 +396,8 @@ mod tests {
     async fn vectored_data_precedes_fin_in_both_directions() {
         use std::io::IoSlice;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (opener, accepter, _client_tasks, _server_tasks) = make_dual_pair().await;
+        let (opener, server_opener, accepter, _client_tasks, _server_tasks) =
+            make_dual_pair().await;
         let addr = SocketAddrPair {
             local_addr: "127.0.0.1:10000".parse().unwrap(),
             peer_addr: "127.0.0.1:10001".parse().unwrap(),
@@ -403,21 +407,22 @@ mod tests {
         let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
         let mut accepter_tasks = tokio::task::JoinSet::new();
         accepter_tasks.spawn(async move {
-            let mut accepter = accepter.into_migrating_only();
+            let mut accepter = accepter.into_migrating_duplex(server_opener);
             let mut accepted_tx = Some(accepted_tx);
             while let Ok(accepted) = accepter.accept().await {
                 match accepted {
-                    mux::AcceptedStream::Migrating {
+                    mux::AcceptedStream::MigratingDuplex {
                         reader,
                         writer,
                         source_lane,
-                        ..
                     } => {
                         if let Some(accepted_tx) = accepted_tx.take() {
                             let _ = accepted_tx.send((reader, writer, source_lane));
                         }
                     }
-                    _ => panic!("expected migrating stream"),
+                    mux::AcceptedStream::Migrating { .. } | mux::AcceptedStream::Plain { .. } => {
+                        panic!("expected migrating duplex stream")
+                    }
                 }
             }
         });
@@ -435,7 +440,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        let mut server = crate::ServerStream::Migrating {
+        let (writer, _rebind) = MigratingWriteHalf::new_with_rebind(writer);
+        let mut server = crate::ServerStream::MigratingDuplex {
             reader,
             writer,
             addr,
