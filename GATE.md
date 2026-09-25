@@ -296,6 +296,7 @@ rtp_mux_jitter::jitter_latency_dimension_arms = perf
 rtp_mux_jitter::jitter_nonloss_impairments = perf
 rtp_mux_jitter::jitter_reorder_direction = perf
 rtp_mux_jitter::jitter_reorder_rate_curve = perf
+rtp_mux_jitter::jitter_request_response_arms = perf
 rtp_mux_jitter::jitter_shared_bottleneck_arms = perf
 perf_probe::probe_hostile_goodput_30s = full
 perf_probe::probe_hostile_message_latency = full

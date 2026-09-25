@@ -126,7 +126,8 @@ use rtp_mux::testkit::mux_over_rtp::{
     spawn_mux_frame_delivery_latency_bulk_server_with_fec_tuning_via,
     spawn_mux_latency_bulk_server_with_fec_tuning_via,
 };
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use rtp_mux::testkit::rtp_mux::ECHO_TAG;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::MissedTickBehavior;
 
 /// One-way delay applied to every packet in both directions.
@@ -1998,6 +1999,37 @@ struct DualRun {
     /// The replayed RTO-estimator trajectory: the repair deadlines (reorder
     /// window, RTO) the measured tail was waiting on.
     repair: RepairTrajectory,
+    /// The interactive-lane server's own one-way latency for each echoed request
+    /// (ms), present only on the request/response arms. [`Self::echo_latencies`]
+    /// is the client-side round trip there, so this pairs with it to say which
+    /// direction a slow round was waiting on.
+    one_way_echo_latencies: Vec<f64>,
+}
+
+/// How an arm's interactive lane is offered.
+#[derive(Clone, Copy, Debug)]
+enum InteractiveLoad {
+    /// Fire-and-forget: one `MSG_BYTES` message every [`CADENCE`] for
+    /// [`RUN_FOR`], timestamped on arrival by the server. The lane is always
+    /// *pipelined* — newer data is in flight while an older datagram is being
+    /// repaired — so this is the regime every arm before the request/response
+    /// family measured.
+    Cadence,
+    /// Request/response: write `depth` messages back-to-back, wait for their
+    /// echoes, then offer the next round. At `depth` 1 the tracked tail is
+    /// *lone* (the single unacked data packet on the connection); at `depth` 2
+    /// the round's second message is pipelined behind the first.
+    RequestResponse { depth: usize },
+}
+
+/// What one interactive arm's client offered and, on the request/response arms,
+/// what it measured: one round-trip latency per completed request. The
+/// fire-and-forget arms measure one-way latency at the server sink instead, so
+/// their `rtts` stays empty.
+#[derive(Default)]
+struct RqOutcome {
+    sent: u64,
+    rtts: Vec<f64>,
 }
 
 /// Run one dual-lane arm: the interactive lane on its own RTP connection
@@ -2090,6 +2122,29 @@ async fn run_duallane_links_shaped(
     has_bulk: bool,
     shared_c2s: Option<BottleneckShaper>,
 ) -> DualRun {
+    run_duallane_links_shaped_mode(
+        label,
+        interactive_reorder,
+        links,
+        has_bulk,
+        shared_c2s,
+        InteractiveLoad::Cadence,
+    )
+    .await
+}
+
+/// [`run_duallane_links_shaped`] with an explicit interactive load shape, so the
+/// request/response (lone-tail) arms ride the same server, connector,
+/// impairment, observer and wire-accounting scaffolding as the fire-and-forget
+/// arms and differ only in how the client offers messages.
+async fn run_duallane_links_shaped_mode(
+    label: &str,
+    interactive_reorder: bool,
+    links: DualLaneLinks,
+    has_bulk: bool,
+    shared_c2s: Option<BottleneckShaper>,
+    interactive_load: InteractiveLoad,
+) -> DualRun {
     let DualLaneLinks {
         int_c2s,
         int_s2c,
@@ -2146,20 +2201,12 @@ async fn run_duallane_links_shaped(
             .await
             .unwrap();
 
-            // Interactive latency stream (`b'L'`) on the interactive lane.
+            // Interactive stream on the interactive lane. Its tag byte selects
+            // the server handler: `b'L'` is the one-way latency sink the
+            // fire-and-forget arms use, [`ECHO_TAG`] echoes each frame back so a
+            // request/response client can wait for its own round trip.
             let (mut lat_read, mut lat_write) =
                 opener.open(mux::LaneClass::Interactive).await.unwrap();
-            submit_test_task(
-                &task_tx,
-                Box::pin(async move {
-                    let mut buf = vec![0u8; 8 * 1024];
-                    while let Ok(n) = lat_read.read(&mut buf).await {
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                }),
-            );
 
             // Bulk stream (`b'B'`) on the separate bulk lane, only when offered.
             let bulk_write = if has_bulk {
@@ -2180,11 +2227,69 @@ async fn run_duallane_links_shaped(
                 None
             };
 
-            let interactive = async {
-                if lat_write.write_all(b"L").await.is_err() {
-                    return 0;
+            let task_tx_int = task_tx.clone();
+            // The sink publishes one row per parsed frame into a bounded
+            // channel; a collector task moves it into this sink for the whole
+            // arm, so a lane whose round-trip rate exceeds the channel depth
+            // (a jitter-exposed range collapses toward the floor once the
+            // armour's copies race) cannot overflow it or leave samples
+            // undrained. The rows are still the arm's one-way evidence.
+            let one_way_sink = Arc::new(Mutex::new(Vec::<f64>::new()));
+            let one_way_sink_int = Arc::clone(&one_way_sink);
+            let interactive = async move {
+                submit_test_task(
+                    &task_tx_int,
+                    Box::pin({
+                        let one_way_sink = one_way_sink_int;
+                        async move {
+                            while let Some((_tag, latency)) = latencies.recv().await {
+                                one_way_sink.lock().unwrap().push(latency);
+                            }
+                        }
+                    }),
+                );
+                match interactive_load {
+                    InteractiveLoad::Cadence => {
+                        submit_test_task(
+                            &task_tx_int,
+                            Box::pin(async move {
+                                let mut buf = vec![0u8; 8 * 1024];
+                                while let Ok(n) = lat_read.read(&mut buf).await {
+                                    if n == 0 {
+                                        break;
+                                    }
+                                }
+                            }),
+                        );
+                        let sent = if lat_write.write_all(b"L").await.is_err() {
+                            0
+                        } else {
+                            send_timestamped_messages(
+                                &mut lat_write,
+                                base,
+                                MSG_BYTES,
+                                CADENCE,
+                                RUN_FOR,
+                            )
+                            .await
+                        };
+                        RqOutcome {
+                            sent,
+                            rtts: Vec::new(),
+                        }
+                    }
+                    InteractiveLoad::RequestResponse { depth } => {
+                        request_response_rounds(
+                            &mut lat_write,
+                            &mut lat_read,
+                            base,
+                            ECHO_TAG,
+                            depth,
+                            RQ_WINDOW,
+                        )
+                        .await
+                    }
                 }
-                send_timestamped_messages(&mut lat_write, base, MSG_BYTES, CADENCE, RUN_FOR).await
             };
             let bulk_fut = async {
                 let Some(mut write) = bulk_write else {
@@ -2204,19 +2309,23 @@ async fn run_duallane_links_shaped(
                 )
                 .await
             };
-            let (sent, _bulk_written) = tokio::join!(interactive, bulk_fut);
+            let (outcome, _bulk_written) = tokio::join!(interactive, bulk_fut);
 
             tokio::time::sleep(GRACE).await;
             let int_counters = int_pair.stats();
             let int_c2s_wire_bytes = int_pair.stats_c2s().forwarded_bytes;
             let bulk_counters = bulk_pair.stats();
             let bulk_wire_bytes = bulk_pair.stats_c2s().forwarded_bytes;
-            let mut samples = Vec::new();
-            while let Ok((tag, lat)) = latencies.try_recv() {
-                if tag == b'L' {
-                    samples.push(lat);
-                }
-            }
+            // The collector's sink: which rows become the arm's measured
+            // *sample* is the load shape's choice — the one-way sink latency for
+            // a fire-and-forget arm, the client's own round trip (the deadline
+            // the application actually waits on) for a request/response arm.
+            let one_way = std::mem::take(&mut *one_way_sink.lock().unwrap());
+            let RqOutcome { sent, rtts } = outcome;
+            let (one_way_echo_latencies, samples) = match interactive_load {
+                InteractiveLoad::Cadence => (Vec::new(), one_way),
+                InteractiveLoad::RequestResponse { .. } => (one_way, rtts),
+            };
             let echo_latencies = samples.clone();
             let repair = replay_rto(&rtt_samples.lock().unwrap());
             let received = samples.len() as u64;
@@ -2271,6 +2380,7 @@ async fn run_duallane_links_shaped(
                 bulk_counters,
                 echo_latencies,
                 repair,
+                one_way_echo_latencies,
             }
         })
         .await
@@ -2804,6 +2914,299 @@ async fn jitter_burst_loss_arms() {
     }
     let views: Vec<(&str, &DualRun)> = runs.iter().map(|(n, r)| (*n, r)).collect();
     print_burst_table(&views);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Request/response (lone-tail) interactive arms
+// ══════════════════════════════════════════════════════════════════════
+
+/// The request/response arms' offered window. A lone-tail lane sends one
+/// message per round trip and nothing in between, so it offers far fewer
+/// messages per second than the 25 ms-cadence arms: one round is ~55 ms at
+/// 5 ms jitter and ~130 ms at 200 ms jitter, where the cadence arms' 30 s
+/// window would leave only a few hundred samples. The window is therefore
+/// doubled so every arm's tail percentiles still have a sample count behind
+/// them (printed as `recv`); at ~400-1100 samples `p99` has 4-11 samples and
+/// `p999` is effectively the maximum, so `p999` is read as "the top of the
+/// tail" rather than a percentile with its own sample count.
+const RQ_WINDOW: Duration = Duration::from_secs(60);
+
+/// Offer request/response rounds until `run_for` elapses: write `depth`
+/// timestamped messages back-to-back, read their echoes, then offer the next
+/// round, recording one round-trip latency per completed request.
+///
+/// Waiting for the echo is what makes the tracked tail *lone*: between rounds
+/// the only unacked data packet on the connection is the request just written,
+/// so when a depth-1 round's datagram group is wiped the fresh-tail armour's
+/// whole cover is the repair group and no newer packet is in flight for the
+/// peer's next ACK to SACK the hole with. A `depth` of two or more leaves the
+/// round's later requests pipelined — the transition the `d1` and `d2` arms are
+/// there to show. The round trip rather than the sink's one-way reading is the
+/// measured sample because that is the deadline the application waits on (and
+/// the quantity the field's ping overlay reports).
+async fn request_response_rounds(
+    write: &mut (impl AsyncWrite + Unpin),
+    read: &mut (impl AsyncRead + Unpin),
+    base: Instant,
+    tag: u8,
+    depth: usize,
+    run_for: Duration,
+) -> RqOutcome {
+    let payload_bytes = MSG_BYTES - 12;
+    let payload: Vec<u8> = (0..payload_bytes).map(|i| (i % 251) as u8).collect();
+    let mut frame = Vec::with_capacity(MSG_BYTES);
+    let mut echoed = vec![0u8; MSG_BYTES];
+    let mut outcome = RqOutcome::default();
+    if write.write_all(&[tag]).await.is_err() {
+        return outcome;
+    }
+    let start = Instant::now();
+    while start.elapsed() < run_for {
+        // One timestamp for the whole round: the frames of a round are offered
+        // back-to-back, so the round's completion is the round trip.
+        let sent_us = base.elapsed().as_micros() as u64;
+        for _ in 0..depth {
+            frame.clear();
+            frame.extend_from_slice(&((MSG_BYTES as u32).to_le_bytes()));
+            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(&sent_us.to_le_bytes());
+            if write.write_all(&frame).await.is_err() {
+                return outcome;
+            }
+            outcome.sent += 1;
+        }
+        for _ in 0..depth {
+            if read.read_exact(&mut echoed).await.is_err() {
+                return outcome;
+            }
+            let now_us = base.elapsed().as_micros() as f64;
+            outcome.rtts.push(now_us / 1000.0 - sent_us as f64 / 1000.0);
+        }
+    }
+    outcome
+}
+
+/// Print the request/response arms: the same columns as [`print_burst_table`],
+/// with the round trip (not the sink's one-way reading) as the measured
+/// latency, plus the per-round attribution lines. `inflight` is the sampled
+/// send-window sparsity that decides whether the fresh tail is lone (≤1
+/// unacked data packet) or pipelined, so an arm's lone-tail premise is checkable
+/// from the same run rather than assumed; the `one_way` line pairs the server's
+/// own reading with the round trip so a slow round can be placed in the request
+/// direction or in the echo's.
+fn print_rq_table(runs: &[(&str, &DualRun)]) {
+    eprintln!(
+        "[rq] deployment interactive lane (fast-forward + prompt FEC, own RTP connection, no \
+         bulk lane); client offers `depth` requests then waits for their echoes; latency column \
+         is the CLIENT round trip (compare with the one-way floor 25 ms / round-trip floor ~50 ms)"
+    );
+    eprintln!(
+        "[rq] arm                     p50     p90     p99    p999     max  over250  del  recv  \
+         offered    wire_c2s  x_off   bulk   rtx_first  rtx_rto  rtx_reord  rtx_fast  rtx_tail  \
+         rtx_repeat  parity  recovered"
+    );
+    for (name, r) in runs {
+        let s = &r.run.summary;
+        let rtx = r.run.rtx.unwrap_or_default();
+        let fec = r.run.fec.unwrap_or_default();
+        let offered = s.sent * MSG_BYTES as u64;
+        let wire = r.int_c2s_wire_bytes;
+        eprintln!(
+            "[rq] {name:<22} {p50:7.1} {p90:7.1} {p99:7.1} {p999:7.1} {max:7.1} {o25:7.3} \
+             {del:5.3} {recv:5} {offered:9} {wire:>10} {xoff:6.2} {bulk:5.2} {first:>11} {rto:8} \
+             {reord:10} {fast:9} {tail:9} {repeat:11} {parity:7} {recovered:9}",
+            p50 = s.p50,
+            p90 = s.p90,
+            p99 = s.p99,
+            p999 = s.p999,
+            max = s.max,
+            o25 = s.over250_pct,
+            del = s.delivery_pct,
+            recv = s.received,
+            offered = offered,
+            wire = wire,
+            xoff = wire as f64 / offered as f64,
+            bulk = s.bulk_mibps,
+            first = rtx.first_attempts,
+            rto = rtx.rto_reason,
+            reord = rtx.reorder_reason,
+            fast = rtx.fast_loss_reason,
+            tail = rtx.tail_probes,
+            repeat = rtx.repeat_attempts,
+            parity = fec.parity_sent,
+            recovered = fec.recovered_symbols,
+        );
+    }
+    for (name, r) in runs {
+        // The send-window sparsity the armour decision reads. The observer
+        // samples it at 50 ms cadence, so a lone-tail arm must spend most of
+        // its samples at 0-1 in flight; an arm whose samples sit higher was
+        // pipelined (control frames and keepalives also occupy the window).
+        let inflight: Vec<usize> = r.run.timeline.iter().map(|row| row.in_flight).collect();
+        let lone = inflight.iter().filter(|n| **n <= 1).count();
+        eprintln!(
+            "[rq-inflight] {name:<22} samples={:5} in_flight<=1={} ({:.1}%) max_in_flight={} \
+             0={} 1={} 2={} 3={} >=4={}",
+            inflight.len(),
+            lone,
+            if inflight.is_empty() {
+                0.0
+            } else {
+                100.0 * lone as f64 / inflight.len() as f64
+            },
+            inflight.iter().copied().max().unwrap_or(0),
+            inflight.iter().filter(|n| **n == 0).count(),
+            inflight.iter().filter(|n| **n == 1).count(),
+            inflight.iter().filter(|n| **n == 2).count(),
+            inflight.iter().filter(|n| **n == 3).count(),
+            inflight.iter().filter(|n| **n >= 4).count(),
+        );
+        let deadline = &r.repair;
+        let last = deadline.last.unwrap_or(RepairDeadlines {
+            srtt: Duration::ZERO,
+            rttvar: Duration::ZERO,
+            rto: Duration::ZERO,
+            stock_reorder_window: Duration::ZERO,
+            fast_reorder_window: Duration::ZERO,
+            fast_loss_armed: false,
+        });
+        eprintln!(
+            "[rq-deadline] {name:<22} rtt_samples={:5} last_srtt={:7.1}ms last_rttvar={:7.1}ms \
+             last_rto={:7.1}ms max_srtt={:7.1}ms max_rttvar={:7.1}ms \
+             max_stock_reorder_window={:7.1}ms max_fast_reorder_window={:7.1}ms \
+             fast_loss_armed_any={}",
+            deadline.samples,
+            last.srtt.as_secs_f64() * 1000.0,
+            last.rttvar.as_secs_f64() * 1000.0,
+            last.rto.as_secs_f64() * 1000.0,
+            deadline.srtt_max.as_secs_f64() * 1000.0,
+            deadline.rttvar_max.as_secs_f64() * 1000.0,
+            deadline.stock_reorder_window_max.as_secs_f64() * 1000.0,
+            deadline.fast_reorder_window_max.as_secs_f64() * 1000.0,
+            deadline.fast_loss_armed_any,
+        );
+        // Round-trip bands. The one-way floor is 25 ms, so a round that needed
+        // no repair sits at ~50 ms; a round at ~300 ms waited on the tail-loss
+        // probe's floor, one at the reorder window plus a one-way delay is the
+        // ARQ fall-through, and one at the 1 s `MIN_RTO` floor is the RTO path.
+        let band = |lo: f64| r.echo_latencies.iter().filter(|x| **x > lo).count();
+        let mut slowest = r.echo_latencies.iter().enumerate().collect::<Vec<_>>();
+        slowest.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+        let head: Vec<(usize, String)> = slowest
+            .iter()
+            .take(10)
+            .map(|(i, x)| (*i, format!("{x:.1}")))
+            .collect();
+        eprintln!(
+            "[rq-tail] {name:<22} n={:5} >100ms={:5} >250ms={:5} >500ms={:5} >750ms={:5} \
+             >950ms={:5} >1400ms={:5}",
+            r.echo_latencies.len(),
+            band(100.0),
+            band(250.0),
+            band(500.0),
+            band(750.0),
+            band(950.0),
+            band(1400.0),
+        );
+        eprintln!("[rq-tail] {name:<22} slowest (round ordinal, ms): {head:?}");
+        // The same bands on the server's own one-way reading of the request, so
+        // a slow round can be attributed to the request direction or to the
+        // echo's.
+        let mut one_way = r.one_way_echo_latencies.clone();
+        one_way.sort_by(|a, b| b.total_cmp(a));
+        eprintln!(
+            "[rq-oneway] {name:<22} n={:5} p50={:6.1} p99={:6.1} max={:7.1} ms (server's reading of \
+             the request; a short reading with a long round trip puts the repair in the echo)",
+            one_way.len(),
+            one_way.get(one_way.len() / 2).copied().unwrap_or(0.0),
+            one_way.get(one_way.len() / 100).copied().unwrap_or(0.0),
+            one_way.first().copied().unwrap_or(0.0),
+        );
+    }
+    for (name, r) in runs {
+        print_congestion_timeline(name, &r.run.timeline);
+    }
+}
+
+/// The request/response (lone-tail) interactive arms: the one interactive
+/// regime the harness never measured and the regime the field is in.
+///
+/// Every interactive arm before this one was a fixed-cadence fire-and-forget
+/// stream, so the lane was always *pipelined* (newer data in flight while an
+/// older datagram was repaired) and `fresh_tail.rs`'s pipelined branch was the
+/// only one exercised. A request/response lane withholds the next message until
+/// the last one has come back, so its fresh tail is *lone* and, on `v0.0.93`,
+/// still pays the full six-slot burst cover. This family crosses the two
+/// depths (`d1` lone, `d2` one pipelined request per round) with the loss
+/// dimensions the burst arms use (2 % iid, 6 % iid, and the 5 %-long-term /
+/// mean-8 Gilbert-Elliot burst model) and the three jitter regimes (the arms' 5
+/// ms, and the field's 100 ms and 200 ms). The measured latency is the client's
+/// round trip, so the columns are the field's own ping shape.
+///
+/// Report-only: the table plus the per-arm `inflight`/`deadline`/`tail`/
+/// `oneway` lines are the deliverable. They exist to answer whether a lone tail
+/// reproduces a ~1 s spike and, if so, which deadline produced it — so the
+/// mechanism is read off `rtx_rto`/`rtx_tail`/`rtx_reord` and the deadline
+/// line rather than asserted here.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; eighteen ~65 s request/response (lone-tail) arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_request_response_arms() {
+    let rq_link = |seed: u64, jitter_ms: u64, loss_model: LossModel, loss: u32| NetemConfig {
+        latency: OWD,
+        jitter: Duration::from_millis(jitter_ms),
+        loss,
+        loss_model,
+        seed,
+        ..NetemConfig::default()
+    };
+    // The same three interactive-lane impairment dimensions as
+    // `jitter_burst_loss_arms`, at the same seeds, so the request/response
+    // rows sit beside the pipelined rows: 2 % iid, 6 % iid, and the GE burst
+    // model the field's outages resemble.
+    let dimensions: [(&str, LossModel, u32); 3] = [
+        ("iid2pct", LossModel::Random, LOSS_2),
+        ("iid6pct", LossModel::Random, LOSS_6),
+        ("ge5pct_mean8", gilbert_elliott_loss(5.0, 8.0), 0),
+    ];
+    let jitters: [(&str, u64); 3] = [("j5", 5), ("j100", 100), ("j200", 200)];
+
+    let mut runs: Vec<(String, DualRun)> = Vec::new();
+    for (dim, loss_model, loss) in dimensions {
+        for (jitter_label, jitter_ms) in jitters {
+            for depth in [1usize, 2] {
+                let name = format!("rq_d{depth}_{dim}_{jitter_label}");
+                let label = format!("rq/{name}");
+                let c2s = rq_link(41, jitter_ms, loss_model, loss);
+                let s2c = rq_link(42, jitter_ms, loss_model, loss);
+                eprintln!(
+                    "[newdim] arm={name} depth={depth} jitter={jitter_ms}ms loss={}% (seed 41)",
+                    loss as f64 / (u32::MAX as f64 / 100.0),
+                );
+                let run = with_timeout(
+                    Duration::from_secs(240),
+                    &label,
+                    run_duallane_links_shaped_mode(
+                        &label,
+                        true,
+                        DualLaneLinks {
+                            int_c2s: c2s,
+                            int_s2c: s2c,
+                            bulk_c2s: NetemConfig::default(),
+                            bulk_s2c: NetemConfig::default(),
+                        },
+                        false,
+                        None,
+                        InteractiveLoad::RequestResponse { depth },
+                    ),
+                )
+                .await;
+                assert_reportable(&label, &run.run.summary);
+                runs.push((name, run));
+            }
+        }
+    }
+    let views: Vec<(&str, &DualRun)> = runs.iter().map(|(n, r)| (n.as_str(), r)).collect();
+    print_rq_table(&views);
 }
 
 // ══════════════════════════════════════════════════════════════════════

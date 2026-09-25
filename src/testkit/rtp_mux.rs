@@ -327,6 +327,14 @@ pub fn rtp_mux_connector_observed_via(
     rtp_mux_connector_core(|fut| submit_test_task(tx, fut), bulk_proxy_addr, observers)
 }
 
+/// Stream tag selecting the *echo* handler: the tagged sink parses the same
+/// timestamped frames as [`ECHO_TAG`]'s sibling `b'L'` and writes every frame
+/// straight back to its sender. An interactive request/response client uses it
+/// to withhold the next request until the one it just offered has come back,
+/// which is the only way an application can make a fresh tail *lone* (one
+/// unacked data packet on the connection) instead of pipelined.
+pub const ECHO_TAG: u8 = b'E';
+
 pub fn spawn_tagged_stream_sink(
     task_tx: &TestTaskSubmitter,
     mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -346,7 +354,55 @@ pub fn spawn_tagged_stream_sink(
                 return;
             }
             let is_latency = is_interactive || tag[0] != b'B';
-            if is_latency {
+            if tag[0] == ECHO_TAG {
+                // Echo: parse the timestamped frames, record the one-way
+                // latency of each so the arm keeps its per-echo attribution,
+                // and write the frame back verbatim on the same stream. The
+                // echo half is what makes the client's next request wait for
+                // this one's delivery.
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut offset = 0usize;
+                'echo: while let Ok(n) = reader.read(&mut buf[offset..]).await {
+                    if n == 0 {
+                        break;
+                    }
+                    offset += n;
+                    loop {
+                        if offset < 4 {
+                            break;
+                        }
+                        let frame_len =
+                            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                        if frame_len < 12 {
+                            break;
+                        }
+                        if offset < frame_len {
+                            break;
+                        }
+                        let payload_end = frame_len - 8;
+                        let sent_us = u64::from_le_bytes([
+                            buf[payload_end],
+                            buf[payload_end + 1],
+                            buf[payload_end + 2],
+                            buf[payload_end + 3],
+                            buf[payload_end + 4],
+                            buf[payload_end + 5],
+                            buf[payload_end + 6],
+                            buf[payload_end + 7],
+                        ]);
+                        let now_us = base.elapsed().as_micros() as u64;
+                        let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                        if !try_send_observation(&tx, (tag[0], latency_ms), "latency sample") {
+                            break 'echo;
+                        }
+                        if writer.write_all(&buf[..frame_len]).await.is_err() {
+                            break 'echo;
+                        }
+                        buf.copy_within(frame_len..offset, 0);
+                        offset -= frame_len;
+                    }
+                }
+            } else if is_latency {
                 let mut buf = vec![0u8; 64 * 1024];
                 let mut offset = 0usize;
                 while let Ok(n) = reader.read(&mut buf[offset..]).await {
