@@ -292,6 +292,11 @@ struct CongestionRow {
     cwnd: usize,
     in_flight: usize,
     smooth_rtt: Duration,
+    /// The live retransmission timeout: `max(srtt + 4*rttvar, 1 s)`.
+    rto: Duration,
+    /// The lifetime minimum RTT, the second premise of the queue-premised
+    /// fast-loss arming rule.
+    min_rtt: Option<Duration>,
     floor: Option<Duration>,
     tolerance: Option<Duration>,
     persistent_for: Option<Duration>,
@@ -313,22 +318,31 @@ struct CongestionRow {
     gentle_mode: bool,
 }
 
-/// The metrics observer plus the FEC-counter, full-snapshot, and congestion-
-/// timeline cells it fills, so a run can read the FEC counters, the
-/// retransmission counters, and the congestion state after it completes.
+/// The metrics observer plus the FEC-counter, full-snapshot, congestion-
+/// timeline, and raw-RTT-sample cells it fills, so a run can read the FEC
+/// counters, the retransmission counters, the congestion state, and the RTT
+/// sample stream after it completes.
+///
+/// The raw sample stream is what makes the *repair deadlines* recoverable: the
+/// transport snapshot publishes `smoothed_rtt` and `retransmission_timeout`
+/// but neither `rttvar`, the reorder window, nor the fast-loss arming bit, and
+/// those three decide which repair path a lost interactive tail takes (see
+/// [`replay_rto`]).
 type ObserverBundle = (
     rtp::metrics::MetricsObserver,
     Arc<Mutex<Option<rtp::metrics::MetricsFecCounters>>>,
     Arc<Mutex<Option<rtp::metrics::MetricsSnapshot>>>,
     Arc<Mutex<Vec<CongestionRow>>>,
+    Arc<Mutex<Vec<Duration>>>,
 );
 
 /// A lightweight metrics observer that retains the latest FEC and
-/// retransmission counter snapshots and appends a congestion-controller
-/// timeline row at a 50 ms cadence. The cadence is coarse enough that the
-/// observer does not perturb the measured traffic, while the timeline makes
-/// the controller action / send-rate / drain-floor evolution visible during a
-/// multi-second interactive stall.
+/// retransmission counter snapshots, appends a congestion-controller timeline
+/// row at a 50 ms cadence, and records every accepted raw RTT sample. The
+/// cadence is coarse enough that the state snapshots do not perturb the
+/// measured traffic; the raw RTT samples are captured event-only (no state
+/// scan), because they are the estimator's own input and the only way to
+/// recover `rttvar` from outside the transport.
 fn fec_observer() -> ObserverBundle {
     let cell = Arc::new(Mutex::new(None));
     let sink = Arc::clone(&cell);
@@ -336,19 +350,27 @@ fn fec_observer() -> ObserverBundle {
     let snapshot_sink = Arc::clone(&snapshot_cell);
     let timeline = Arc::new(Mutex::new(Vec::new()));
     let timeline_sink = Arc::clone(&timeline);
+    let rtt_samples = Arc::new(Mutex::new(Vec::new()));
+    let rtt_sink = Arc::clone(&rtt_samples);
     let last_ms = Arc::new(AtomicU64::new(0));
-    let observer = rtp::metrics::MetricsObserver::filtered(
-        move |_event, elapsed| {
+    let observer = rtp::metrics::MetricsObserver::selective(
+        move |event, elapsed| {
+            if event == rtp::metrics::MetricsEvent::RttSample {
+                return rtp::metrics::MetricsInterest::EventOnly;
+            }
             let now = elapsed.as_millis() as u64;
             let previous = last_ms.load(Ordering::Relaxed);
             if now >= previous.saturating_add(50) {
                 last_ms.store(now, Ordering::Relaxed);
-                true
+                rtp::metrics::MetricsInterest::Snapshot
             } else {
-                false
+                rtp::metrics::MetricsInterest::Skip
             }
         },
         move |observation| {
+            if let Some(sample) = observation.raw_rtt_sample {
+                rtt_sink.lock().unwrap().push(sample);
+            }
             if let Some(snapshot) = observation.snapshot {
                 if let Some(fec) = snapshot.fec_counters {
                     *sink.lock().unwrap() = Some(fec);
@@ -361,6 +383,8 @@ fn fec_observer() -> ObserverBundle {
                     cwnd: snapshot.congestion_window_packets,
                     in_flight: snapshot.in_flight_packets,
                     smooth_rtt: snapshot.smoothed_rtt,
+                    rto: snapshot.retransmission_timeout,
+                    min_rtt: snapshot.minimum_rtt,
                     floor: snapshot.congestion_rtt_floor,
                     tolerance: snapshot.congestion_queue_tolerance,
                     persistent_for: snapshot.congestion_persistent_queue_for,
@@ -379,7 +403,106 @@ fn fec_observer() -> ObserverBundle {
             }
         },
     );
-    (observer, cell, snapshot_cell, timeline)
+    (observer, cell, snapshot_cell, timeline, rtt_samples)
+}
+
+/// The RTO estimator's derived repair deadlines, recomputed in the test by
+/// replaying the raw RTT samples through the same recursion as the shipped
+/// `RtxTimer` (`BETA = 1/4`, `ALPHA = 1/8`, `K = 4`, `MIN_RTO = 1 s`).
+///
+/// The transport publishes `smoothed_rtt` and `retransmission_timeout` but not
+/// `rttvar`, the reorder window, or the fast-loss arming bit — and those three
+/// are exactly what decides which repair path a lost interactive tail takes:
+/// an evidence-gated fast-loss declaration, the reorder-window ARQ
+/// fall-through, the tail-loss probe, or the `MIN_RTO` floor.
+#[derive(Clone, Copy, Debug)]
+struct RepairDeadlines {
+    srtt: Duration,
+    rttvar: Duration,
+    rto: Duration,
+    /// `min(srtt + max(4*rttvar, srtt/4), rto)` — the stock reorder window,
+    /// used to schedule an already-armed retransmit when `RTP_JITTER_CAP` is
+    /// off.
+    stock_reorder_window: Duration,
+    /// `min(srtt + max(rttvar, srtt/4), rto)` — the window the shipped default
+    /// (`RTP_JITTER_CAP` ON) actually schedules an out-of-order-passed
+    /// retransmit with.
+    fast_reorder_window: Duration,
+    /// `4*rttvar < srtt/4`: the srtt-relative half of the composite fast-loss
+    /// arming decision. `false` means a SACK gap is treated as reordering
+    /// evidence and the reorder window owns the repair.
+    fast_loss_armed: bool,
+}
+
+impl RepairDeadlines {
+    fn at(srtt: Duration, rttvar: Duration) -> Self {
+        let srtt_f = srtt.as_secs_f64();
+        let rttvar_f = rttvar.as_secs_f64();
+        let rto = Duration::from_secs_f64(srtt_f + 4. * rttvar_f).max(Duration::from_secs(1));
+        let stock = Duration::from_secs_f64(srtt_f + (4. * rttvar_f).max(srtt_f / 4.));
+        let fast = Duration::from_secs_f64(srtt_f + rttvar_f.max(srtt_f / 4.));
+        Self {
+            srtt,
+            rttvar,
+            rto,
+            stock_reorder_window: stock.min(rto),
+            fast_reorder_window: fast.min(rto),
+            fast_loss_armed: 4. * rttvar_f < srtt_f / 4.,
+        }
+    }
+}
+
+/// The estimator trajectory over one arm: the last replayed state plus the
+/// extremes, so an arm reports the *worst* deadline its tail could have been
+/// waiting on rather than only the final one.
+#[derive(Clone, Copy, Debug, Default)]
+struct RepairTrajectory {
+    samples: usize,
+    last: Option<RepairDeadlines>,
+    srtt_max: Duration,
+    rttvar_max: Duration,
+    rto_max: Duration,
+    stock_reorder_window_max: Duration,
+    fast_reorder_window_max: Duration,
+    /// Whether the srtt-relative fast-loss gate was ever armed during the arm.
+    fast_loss_armed_any: bool,
+}
+
+/// Replay the raw RTT samples through the shipped estimator recursion and
+/// report the extremes of the derived deadlines.
+fn replay_rto(samples: &[Duration]) -> RepairTrajectory {
+    let mut trajectory = RepairTrajectory::default();
+    let Some((&first, rest)) = samples.split_first() else {
+        return trajectory;
+    };
+    let mut srtt = first.as_secs_f64();
+    let mut rttvar = first.as_secs_f64() / 2.;
+    let record = |srtt: f64, rttvar: f64, trajectory: &mut RepairTrajectory| {
+        let deadlines = RepairDeadlines::at(
+            Duration::from_secs_f64(srtt),
+            Duration::from_secs_f64(rttvar),
+        );
+        trajectory.last = Some(deadlines);
+        trajectory.srtt_max = trajectory.srtt_max.max(deadlines.srtt);
+        trajectory.rttvar_max = trajectory.rttvar_max.max(deadlines.rttvar);
+        trajectory.rto_max = trajectory.rto_max.max(deadlines.rto);
+        trajectory.stock_reorder_window_max = trajectory
+            .stock_reorder_window_max
+            .max(deadlines.stock_reorder_window);
+        trajectory.fast_reorder_window_max = trajectory
+            .fast_reorder_window_max
+            .max(deadlines.fast_reorder_window);
+        trajectory.fast_loss_armed_any |= deadlines.fast_loss_armed;
+        trajectory.samples += 1;
+    };
+    record(srtt, rttvar, &mut trajectory);
+    for rtt in rest {
+        let sample = rtt.as_secs_f64();
+        rttvar = 0.75 * rttvar + 0.25 * (srtt - sample).abs();
+        srtt = 0.875 * srtt + 0.125 * sample;
+        record(srtt, rttvar, &mut trajectory);
+    }
+    trajectory
 }
 
 /// Print the congestion-controller timeline for one arm, one line per action
@@ -401,7 +524,8 @@ fn print_congestion_timeline(label: &str, rows: &[CongestionRow]) {
             let action = row.action.map(|a| a.as_str()).unwrap_or("none");
             eprintln!(
                 "[ctrl {label}]{marker} t={:>7.1}ms action={action:<14} rate={:>8.1} cwnd={:>4} \
-                 inflight={:>4} srtt={:>7.1}ms floor={:>7.1}ms tol={:>7.1}ms queue={} gentle={} \
+                 inflight={:>4} srtt={:>7.1}ms rto={:>7.1}ms min_rtt={:>7.1}ms floor={:>7.1}ms \
+                 tol={:>7.1}ms queue={} gentle={} \
                  app_lim={:?} q_for={:?} peak={:?} d={:?} drains={} backoffs={} probes={} waiters={} \
                  drain_tgt={:?} bkoff_tgt={:?}",
                 row.at.as_secs_f64() * 1000.0,
@@ -409,6 +533,8 @@ fn print_congestion_timeline(label: &str, rows: &[CongestionRow]) {
                 row.cwnd,
                 row.in_flight,
                 row.smooth_rtt.as_secs_f64() * 1000.0,
+                row.rto.as_secs_f64() * 1000.0,
+                row.min_rtt.map(|m| m.as_secs_f64() * 1000.0).unwrap_or(0.0),
                 row.floor.map(|f| f.as_secs_f64() * 1000.0).unwrap_or(0.0),
                 row.tolerance
                     .map(|t| t.as_secs_f64() * 1000.0)
@@ -459,7 +585,7 @@ async fn run_jitter(scenario: JitterScenario) -> JitterRun {
                     .unwrap();
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-            let (observer, fec_cell, snapshot_cell, timeline_cell) = fec_observer();
+            let (observer, fec_cell, snapshot_cell, timeline_cell, _rtt_samples) = fec_observer();
             let (connected_read, connected_write) =
                 rtp_connect_with_mss_fec_tuning_and_observer_via(
                     &task_tx,
@@ -647,7 +773,7 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
             };
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-            let (observer, fec_cell, snapshot_cell, timeline_cell) = fec_observer();
+            let (observer, fec_cell, snapshot_cell, timeline_cell, _rtt_samples) = fec_observer();
             let (reader, writer) = if reorder {
                 rtp_frame_delivery_connect_reorder_with_fec_tuning_via(
                     &task_tx,
@@ -1863,6 +1989,15 @@ struct DualRun {
     bulk_sink_bytes: u64,
     /// Combined bulk-pair counters (both directions).
     bulk_counters: Counters,
+    /// The interactive lane's echo latencies in delivery order (ms), so an arm
+    /// can report *where* its slow echoes sit rather than one opaque maximum:
+    /// a cluster at `~1000 ms` is the `MIN_RTO` floor, a cluster at the
+    /// reorder window plus a round trip is the ARQ fall-through, and a cluster
+    /// at the one-way floor is a same-round-trip parity/armor recovery.
+    echo_latencies: Vec<f64>,
+    /// The replayed RTO-estimator trajectory: the repair deadlines (reorder
+    /// window, RTO) the measured tail was waiting on.
+    repair: RepairTrajectory,
 }
 
 /// Run one dual-lane arm: the interactive lane on its own RTP connection
@@ -1998,7 +2133,7 @@ async fn run_duallane_links_shaped(
                 None => NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap(),
             };
 
-            let (observer, fec_cell, snapshot_cell, timeline_cell) = fec_observer();
+            let (observer, fec_cell, snapshot_cell, timeline_cell, rtt_samples) = fec_observer();
             let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -2082,6 +2217,8 @@ async fn run_duallane_links_shaped(
                     samples.push(lat);
                 }
             }
+            let echo_latencies = samples.clone();
+            let repair = replay_rto(&rtt_samples.lock().unwrap());
             let received = samples.len() as u64;
             let bulk_active_secs = (RUN_FOR - BULK_RAMP).as_secs_f64();
             let summary = summarize(samples, sent, received, bulk_wire_bytes, bulk_active_secs);
@@ -2132,6 +2269,8 @@ async fn run_duallane_links_shaped(
                 bulk_wire_bytes,
                 bulk_sink_bytes,
                 bulk_counters,
+                echo_latencies,
+                repair,
             }
         })
         .await
@@ -2424,8 +2563,11 @@ async fn jitter_duallane_constitution_gate_p99() {
 }
 
 /// Print one burst-loss arm's interactive-latency percentiles (p99.9 beside
-/// p99 so a rare repair spike is not hidden by the floor), delivery, offered
-/// interactive wire, and the RTP repair counters.
+/// p99 so a rare repair spike is not hidden by the floor), delivery, the
+/// interactive lane's *own* client->server wire against the payload it
+/// offered (mandate 2's budget quantity — not the pair's both-direction
+/// total), the RTP repair counters, and then, per arm, the replayed repair
+/// deadlines and the slow-echo tail that the `max` was drawn from.
 fn print_burst_table(runs: &[(&str, &DualRun)]) {
     eprintln!(
         "[burst] deployment interactive lane (fast-forward + prompt FEC, own RTP connection); \
@@ -2433,16 +2575,21 @@ fn print_burst_table(runs: &[(&str, &DualRun)]) {
     );
     eprintln!(
         "[burst] arm                     p50     p90     p99    p999     max  over250  del  recv  \
-         wire_bytes  rtx_first  rtx_rto  rtx_reord  rtx_fast  rtx_tail  rtx_repeat  parity  recovered"
+         offered    wire_c2s  x_off   bulk   rtx_first  rtx_rto  rtx_reord  rtx_fast  rtx_tail  \
+         rtx_repeat  parity  recovered"
     );
     for (name, r) in runs {
         let s = &r.run.summary;
         let rtx = r.run.rtx.unwrap_or_default();
         let fec = r.run.fec.unwrap_or_default();
+        // The offered interactive payload: `sent` messages of [`MSG_BYTES`]
+        // bytes. The wire is the lane's own client->server forwarded bytes.
+        let offered = s.sent * MSG_BYTES as u64;
+        let wire = r.int_c2s_wire_bytes;
         eprintln!(
             "[burst] {name:<22} {p50:7.1} {p90:7.1} {p99:7.1} {p999:7.1} {max:7.1} {o25:7.3} \
-             {del:5.3} {recv:5} {wbytes:>11} {first:>11} {rto:8} {reord:10} {fast:9} {tail:9} \
-             {repeat:11} {parity:7} {recovered:9}",
+             {del:5.3} {recv:5} {offered:9} {wire:>10} {xoff:6.2} {bulk:5.2} {first:>11} {rto:8} \
+             {reord:10} {fast:9} {tail:9} {repeat:11} {parity:7} {recovered:9}",
             p50 = s.p50,
             p90 = s.p90,
             p99 = s.p99,
@@ -2451,7 +2598,10 @@ fn print_burst_table(runs: &[(&str, &DualRun)]) {
             o25 = s.over250_pct,
             del = s.delivery_pct,
             recv = s.received,
-            wbytes = r.run.counters.forwarded_bytes,
+            offered = offered,
+            wire = wire,
+            xoff = wire as f64 / offered as f64,
+            bulk = s.bulk_mibps,
             first = rtx.first_attempts,
             rto = rtx.rto_reason,
             reord = rtx.reorder_reason,
@@ -2461,6 +2611,57 @@ fn print_burst_table(runs: &[(&str, &DualRun)]) {
             parity = fec.parity_sent,
             recovered = fec.recovered_symbols,
         );
+    }
+    for (name, r) in runs {
+        let deadline = &r.repair;
+        // All-zero when the observer captured no RTT sample at all.
+        let last = deadline.last.unwrap_or(RepairDeadlines {
+            srtt: Duration::ZERO,
+            rttvar: Duration::ZERO,
+            rto: Duration::ZERO,
+            stock_reorder_window: Duration::ZERO,
+            fast_reorder_window: Duration::ZERO,
+            fast_loss_armed: false,
+        });
+        eprintln!(
+            "[burst-deadline] {name:<22} rtt_samples={:5} last_srtt={:7.1}ms last_rttvar={:7.1}ms \
+             last_rto={:7.1}ms max_srtt={:7.1}ms max_rttvar={:7.1}ms max_stock_reorder_window={:7.1}ms \
+             max_fast_reorder_window={:7.1}ms fast_loss_armed_any={}",
+            deadline.samples,
+            last.srtt.as_secs_f64() * 1000.0,
+            last.rttvar.as_secs_f64() * 1000.0,
+            last.rto.as_secs_f64() * 1000.0,
+            deadline.srtt_max.as_secs_f64() * 1000.0,
+            deadline.rttvar_max.as_secs_f64() * 1000.0,
+            deadline.stock_reorder_window_max.as_secs_f64() * 1000.0,
+            deadline.fast_reorder_window_max.as_secs_f64() * 1000.0,
+            deadline.fast_loss_armed_any,
+        );
+        // The latency bands that separate the repair paths: an echo at the
+        // one-way floor is a same-round-trip recovery, one at the 300 ms
+        // tail-loss-probe floor is a TLP, one at the reorder window plus a
+        // one-way delay is the ARQ fall-through, and one at the `MIN_RTO`
+        // floor (1 s) is the RTO path.
+        let band = |lo: f64| r.echo_latencies.iter().filter(|x| **x > lo).count();
+        let mut slowest = r.echo_latencies.iter().enumerate().collect::<Vec<_>>();
+        slowest.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+        let head: Vec<(usize, String)> = slowest
+            .iter()
+            .take(10)
+            .map(|(i, x)| (*i, format!("{x:.1}")))
+            .collect();
+        eprintln!(
+            "[burst-tail] {name:<22} n={:5} >100ms={:5} >250ms={:5} >500ms={:5} >750ms={:5} \
+             >950ms={:5} >1400ms={:5}",
+            r.echo_latencies.len(),
+            band(100.0),
+            band(250.0),
+            band(500.0),
+            band(750.0),
+            band(950.0),
+            band(1400.0),
+        );
+        eprintln!("[burst-tail] {name:<22} slowest (echo ordinal, ms): {head:?}");
     }
     for (name, r) in runs {
         print_congestion_timeline(name, &r.run.timeline);
@@ -2474,9 +2675,23 @@ fn print_burst_table(runs: &[(&str, &DualRun)]) {
 /// on the interactive lane with its own RTP connection and the production
 /// fast-forward + prompt FEC tuning, once without bulk and once at the
 /// production bulk load. p99.9 is printed beside p99 so a rare repair spike
-/// stays visible above the floor. Report-only: the table is the deliverable.
+/// stays visible above the floor.
+///
+/// It also sweeps the *jitter* dimension the clean arms pin at 5 ms, because
+/// the repair deadlines are variance-quantized: the reorder window is
+/// `srtt + max(4*rttvar, srtt/4)` and the fast-loss gate arms only while
+/// `4*rttvar < srtt/4`. The four `jitter_*` arms move only the jitter, so the
+/// measured tail is attributable to the deadline that produced it rather than
+/// to a path change.
+///
+/// Report-only: the table is the deliverable. Each row is followed by the
+/// replayed estimator deadlines (the window an ARQ fall-through waits on) and
+/// the slow-echo tail with its delivery ordinals, so a maximum can be
+/// attributed to the `MIN_RTO` floor, the reorder window, the 300 ms
+/// tail-loss-probe floor, or a same-round-trip parity/armor recovery instead
+/// of being read as one opaque number.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "spawns threads and binds ephemeral ports; six ~35 s burst-loss dual-lane arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+#[ignore = "spawns threads and binds ephemeral ports; twelve ~35 s burst-loss dual-lane arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn jitter_burst_loss_arms() {
     let int_link = |seed: u64, loss_model: LossModel| NetemConfig {
         latency: OWD,
@@ -2497,6 +2712,20 @@ async fn jitter_burst_loss_arms() {
         ..int_link(seed, LossModel::Random)
     };
     let burst = |seed: u64| int_link(seed, gilbert_elliott_loss(5.0, 8.0));
+    // The field path is not the arms' clean 5 ms-jitter link: a real client
+    // behind the deployment sees a ~190 ms RTT floor with excursions of
+    // several hundred ms. The repair deadlines are variance-quantized
+    // (`4*rttvar` vs `srtt/4` decides the fast-loss arming bit, and the
+    // reorder window is `srtt + max(K*rttvar, srtt/4)`), so the high-jitter
+    // arms below sweep the same one-way delay as the clean arms while moving
+    // only the jitter, which is the knob the deadlines respond to.
+    let high_jitter = |seed: u64, jitter_ms: u64, loss: u32| NetemConfig {
+        latency: OWD,
+        jitter: Duration::from_millis(jitter_ms),
+        loss,
+        seed,
+        ..NetemConfig::default()
+    };
 
     let arms: Vec<(&str, NetemConfig, NetemConfig, bool)> = vec![
         ("iid_2pct", iid_2(41), iid_2(42), false),
@@ -2510,11 +2739,53 @@ async fn jitter_burst_loss_arms() {
             int_link(42, gilbert_elliott_loss(10.0, 4.0)),
             false,
         ),
+        (
+            "jitter_50ms_2pct",
+            high_jitter(41, 50, LOSS_2),
+            high_jitter(42, 50, LOSS_2),
+            false,
+        ),
+        (
+            "jitter_50ms_2pct_bulk",
+            high_jitter(41, 50, LOSS_2),
+            high_jitter(42, 50, LOSS_2),
+            true,
+        ),
+        (
+            "jitter_100ms_2pct",
+            high_jitter(41, 100, LOSS_2),
+            high_jitter(42, 100, LOSS_2),
+            false,
+        ),
+        (
+            "jitter_100ms_6pct",
+            high_jitter(41, 100, LOSS_6),
+            high_jitter(42, 100, LOSS_6),
+            false,
+        ),
+        (
+            "jitter_200ms_2pct",
+            high_jitter(41, 200, LOSS_2),
+            high_jitter(42, 200, LOSS_2),
+            false,
+        ),
+        (
+            "jitter_200ms_6pct",
+            high_jitter(41, 200, LOSS_6),
+            high_jitter(42, 200, LOSS_6),
+            false,
+        ),
     ];
 
     let mut runs: Vec<(&str, DualRun)> = Vec::new();
     for (name, int_c2s, int_s2c, with_bulk) in arms {
         let label = format!("burst/{name}");
+        eprintln!(
+            "[newdim] arm={name} primary_jitter={}ms primary_loss={}% (seed {}) bulk={with_bulk}",
+            int_c2s.jitter.as_secs_f64() * 1000.0,
+            int_c2s.loss as f64 / (u32::MAX as f64 / 100.0),
+            int_c2s.seed,
+        );
         let (bulk_c2s, bulk_s2c) = if with_bulk {
             (bulk_c2s.clone(), bulk_s2c.clone())
         } else {
@@ -2862,7 +3133,7 @@ async fn jitter_bulk_idle_restart_arm() {
                 },
             )
             .unwrap();
-            let (observer, _fec_cell, _snapshot_cell, timeline_cell) = fec_observer();
+            let (observer, _fec_cell, _snapshot_cell, timeline_cell, _rtt_samples) = fec_observer();
             let (mut read, mut write) = with_timeout(
                 Duration::from_secs(15),
                 "idle-restart connect",
