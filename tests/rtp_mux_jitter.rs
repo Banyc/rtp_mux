@@ -1967,7 +1967,11 @@ async fn run_duallane_links_shaped(
     } else {
         LaneRtpConfig::frame_strict_tuned(true, prompt)
     };
-    let bulk_rtp = LaneRtpConfig::byte_stream();
+    // The bulk co-tenant is the deployment's own lane, not the stock
+    // byte-stream default: production maps `LaneClass::Bulk` to a
+    // `Dedicated` congestion intent, and the interactive mandate is measured
+    // on the production topology.
+    let bulk_rtp = LaneRtpConfig::production_bulk();
 
     let base = Instant::now();
     let mut tasks = TestScope::new();
