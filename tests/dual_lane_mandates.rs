@@ -25,13 +25,16 @@
 //!    delivers what it is offered (`delivery == 1.000`) **without inflating
 //!    its own wire** to get there.
 //!    *Bound (derived):* the offered payload is the deterministic
-//!    sent-message byte count; the client→server wire forwarded by the
-//!    impairment proxy must stay within a fixed budget of it — `6×` (the
-//!    `INTERACTIVE_WIRE_BUDGET_X` constant of `rtp_mux_jitter.rs`), where
-//!    the measured overhead on the seeded `both` arm is ~3.7×
-//!    (RTP/mux framing + control + the repair traffic that 2% loss needs),
-//!    so the budget leaves ~1.6× headroom while a redundancy inflation of
-//!    +50% still trips it.
+//!    sent-message byte count; the lane's *aggregate* client→server wire
+//!    forwarded by the impairment proxy must stay within a fixed budget of
+//!    it — `6×` (the `INTERACTIVE_WIRE_BUDGET_X` constant of
+//!    `rtp_mux_jitter.rs`), where the measured overhead on the seeded `both`
+//!    arm is ~3.6× (RTP/mux framing + control + the repair traffic that 2%
+//!    loss needs), so the budget leaves ~1.6× headroom and the aggregate
+//!    wire must not grow by more than ~+64%. The budget does not bound one
+//!    message's redundancy: a fully-armored lone interactive tail is
+//!    `primary + 5 copies` = six datagrams carrying the same 256 B payload,
+//!    so it alone costs at least the whole budget before framing.
 //!    *Asserted by:* `rtp_mux_jitter.rs::jitter_duallane_constitution_gate`
 //!    (default tier, runs on every `cargo test -p rtp_mux`). Both quantities
 //!    are deterministic counts over the seeded impairment link — counts

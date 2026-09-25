@@ -40,10 +40,10 @@
 //!   [`jitter_duallane_constitution_gate`] (**default tier** — runs on every
 //!   `cargo test -p rtp_mux`; both quantities are deterministic counts, and
 //!   counts belong in the always-run gate): the offered payload
-//!   is the deterministic sent-message byte count, and the client→server wire
-//!   forwarded by the impairment proxy must stay within a fixed budget of it
-//!   (6×, measured ~3.7× on the seeded `both` arm — ~1.6× headroom, with a
-//!   +50 % redundancy inflation still tripping it).
+//!   is the deterministic sent-message byte count, and the lane's *aggregate*
+//!   client→server wire forwarded by the impairment proxy must stay within a
+//!   fixed budget of it (6×, measured ~3.6× on the seeded `both` arm — ~1.6×
+//!   headroom, so the aggregate wire may grow by ~+64 % before it trips).
 //!
 //! M3 — **high goodput of the bulk lane** (goodput ≥ a derived fraction of
 //! the configured link rate, median-of-N) — is asserted in
@@ -2281,9 +2281,13 @@ async fn jitter_duallane_arms() {
 /// for the interactive lane's client→server wire
 /// versus the offered interactive payload (see
 /// [`jitter_duallane_constitution_gate`]). Measured overhead on the seeded
-/// `both` arm is ~3.7× the offered payload (RTP/mux framing + control + the
-/// repair traffic the 2 % loss needs); 6× leaves ~1.6× headroom while a
-/// duplication or redundancy inflation of +50 % still trips it.
+/// `both` arm is ~3.6× the offered payload (RTP/mux framing + control + the
+/// repair traffic the 2 % loss needs); 6× leaves ~1.6× headroom, so the
+/// lane's aggregate wire must not grow by more than ~+64 %. The budget
+/// bounds that aggregate over the run, not one message's redundancy: a
+/// fully-armored lone interactive tail is `primary + 5 copies` = six
+/// datagrams carrying the same 256 B payload, so it alone is at least the
+/// whole budget before framing.
 const INTERACTIVE_WIRE_BUDGET_X: u64 = 6;
 
 /// The interactive-lane constitution gate (mandate 2): the deployment

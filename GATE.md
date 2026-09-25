@@ -75,10 +75,14 @@ either sees the whole constitution:
 2. **Reasonable goodput of the interactive lane** — the interactive lane
    delivers what it is offered (`delivery == 1.000`) **without inflating its
    own wire** to get there. Bound (derived): offered payload = the
-   deterministic sent-message byte count; the client→server wire forwarded by
-   the impairment proxy must stay within `6×` of it (measured ~3.7× on the
-   seeded `both` arm, ~1.6× headroom, +50 % redundancy inflation still
-   trips it). Asserted by
+   deterministic sent-message byte count; the lane's *aggregate*
+   client→server wire forwarded by the impairment proxy must stay within `6×`
+   of it (measured ~3.6× on the seeded `both` arm — RTP/mux framing +
+   control + the repair traffic 2 % loss needs — so ~1.6× headroom, and the
+   aggregate wire must not grow by more than ~+64 %). The budget does not
+   bound one message's redundancy: a fully-armored lone interactive tail is
+   `primary + 5 copies` = six datagrams carrying the same 256 B payload, so
+   it alone costs at least the whole budget before framing. Asserted by
    `rtp_mux_jitter::jitter_duallane_constitution_gate` (**default tier** —
    both quantities are deterministic counts, and counts belong in the gate
    that always runs); it runs on every `cargo test -p rtp_mux`. The offered
