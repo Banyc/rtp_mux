@@ -159,8 +159,8 @@ recorded as gaps below, so the per-tier sum the checker reports is the declared
 subset.
 
 ```gate-perf-design
-cold_connection::cold_connection_decomposition = standard | 22 | baseline@establishment | cold-connection@lanes=dual+handshake=on+impairment=clean+scale=owd20-and-owd96+metric=min-round-trips-to-stream
-cold_connection::mux_lane_birth_is_one_round_trip = standard | 9 | orthogonal@establishment | cold-connection@lanes=dual+handshake=on+impairment=clean+scale=owd20-and-owd96+metric=mux-pairing-round-trips
+cold_connection::cold_connection_decomposition = standard | 28 | baseline@establishment | cold-connection@lanes=dual+handshake=on+impairment=clean+scale=owd20-and-owd96+metric=min-round-trips-to-stream
+cold_connection::mux_lane_birth_is_one_round_trip = standard | 13 | orthogonal@establishment | cold-connection@lanes=dual+handshake=on+impairment=clean+scale=owd20-and-owd96+metric=mux-pairing-round-trips
 hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full | 66 | baseline | interactive-scaling@flows=4+offer=sequential
 hol_probe::hol_rtt100_ge5_four_interactive_concurrent_frame_delivery = full | 20 | orthogonal | interactive-scaling@flows=4+offer=concurrent
 rtp_mux_jitter::jitter_duallane_constitution_gate = default | 40 | baseline@constitution | M2@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=own-wire-budget
@@ -173,7 +173,7 @@ rtp_mux_jitter::jitter_reorder_direction = perf | 70 | baseline@reorder | reorde
 rtp_mux_jitter::jitter_reorder_rate_curve = perf | 140 | orthogonal@reorder | reorder-rate@impairment=reorder+rate=curve+metric=p99
 ```
 
-Declared sums are `default` 40 s, `standard` 31 s, `full` 191 s and `perf`
+Declared sums are `default` 40 s, `standard` 41 s, `full` 191 s and `perf`
 910 s of the 300 s, 600 s, 200 s and 1000 s budgets. The `standard` ceiling
 keeps its 600 s and now carries the two cold-connection rows, its only
 declared rows. The concurrent row is one
@@ -209,7 +209,18 @@ metric changes from round trips to the stream to the mux pairing's own round
 trips): on two already-established rtp sessions, the lane hello / pairing /
 first-frame readiness costs exactly one base RTT, which pins the mux-side
 share of the decomposition independently of rtp's handshake. Both costs are
-measured, not stated in an `#[ignore]` reason.
+measured, not stated in an `#[ignore]` reason: 28 s and 13 s.
+
+Measured on loopback (median of nine cold connections per arm, achieved base
+RTT calibrated per regime): the bare rtp opening handshake costs ~2.7 x and
+~2.2 x base RTTs (the whole of a one-lane session's setup — the same connect
+with the handshake off is ~0.0 x), two lanes dialed sequentially cost ~5.4 x
+and ~4.3 x, the same two dialed concurrently ~3.0 x and ~2.2 x, the mux lane
+birth 1.0 x, and the production cold connect ~4.1 x and ~3.2 x. The mux
+lane birth on already-established sessions is the production birth's whole
+residue over the concurrent bare rtp floor. The two dials being serialized
+used to put that connect at ~6.4 x and ~5.1 x; the arms fail at both regimes
+when the production path dials them one after the other.
 `RTP_MUX_COLD_CONNECTION_FAULT=serialize` is the vacuity injection: it
 replaces the production arm with a reproduction of the two-serialized-dial
 critical path, which must fail the gate.
