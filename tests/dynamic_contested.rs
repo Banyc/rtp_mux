@@ -825,16 +825,24 @@ async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficRe
                     let frame = make_latency_frame(msg_size, base);
 
                     if is_burst {
-                        if let Ok((_, mut bw)) = opener.open(LaneClass::Bulk).await {
-                            let _ = bw.write_all(LATENCY_TAG).await;
-                            if bw.write_all(&frame).await.is_err() {
-                                break;
-                            }
-                            let _ = bw.shutdown();
-                            match lat_rx.recv().await {
-                                Some(lat) => burst_latencies.push(lat),
-                                None => break,
-                            }
+                        // The burst's bulk-lane stream must open: the lane is
+                        // held open for the whole run by the saturating pump
+                        // above, so an `Err` here is a wiring failure, not a
+                        // tolerable outcome. Tolerating it would skip the burst
+                        // *after* `sent += 1` counted it and would leave the
+                        // burst's echo in `lat_rx` for the next small message to
+                        // dequeue, recording a burst latency as a small one.
+                        let (_, mut bw) = opener.open(LaneClass::Bulk).await.expect(
+                            "the burst's bulk-lane stream must open: the bulk lane is held open for the whole run by the pump, so an `Err` is a wiring failure; skipping the burst would count it in `sent` but attribute its echo latency to the next small message",
+                        );
+                        let _ = bw.write_all(LATENCY_TAG).await;
+                        if bw.write_all(&frame).await.is_err() {
+                            break;
+                        }
+                        let _ = bw.shutdown();
+                        match lat_rx.recv().await {
+                            Some(lat) => burst_latencies.push(lat),
+                            None => break,
                         }
                     } else {
                         if int_writer.write_all(&frame).await.is_err() {
