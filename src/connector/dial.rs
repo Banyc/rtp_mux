@@ -186,21 +186,32 @@ async fn connect_dual_lane_once(
             ..base
         },
     );
-    let mut interactive = match socket {
-        Some(socket) => {
-            rtp::udp::FrameDeliveryIo::connect_with_socket(socket, addr, interactive_config.clone())
-                .await?
+    // The two lanes are independent connections to independent addresses;
+    // dial them together.  Dialing them one after the other adds the second
+    // lane's opening handshake (two round trips plus the transport's random
+    // pre-handshake delay) to the first lane's instead of overlapping it,
+    // which is most of a cold connection's cost on a long-RTT path.
+    let interactive = async {
+        match socket {
+            Some(socket) => {
+                rtp::udp::FrameDeliveryIo::connect_with_socket(
+                    socket,
+                    addr,
+                    interactive_config.clone(),
+                )
+                .await
+            }
+            None => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, interactive_config).await,
         }
-        None => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, interactive_config).await?,
     };
-    let interactive_local = interactive.local_addr;
-    let probe_tap = interactive.probe_tap.take();
     let bulk = rtp::udp::FrameDeliveryIo::connect(
         SocketAddr::new(bind_addr.ip(), 0),
         bulk_addr,
         bulk_config,
-    )
-    .await?;
+    );
+    let (mut interactive, bulk) = tokio::try_join!(interactive, bulk)?;
+    let interactive_local = interactive.local_addr;
+    let probe_tap = interactive.probe_tap.take();
     let nonce = PairingNonce::generate();
     // Keep the client lanes' rtp sessions alive for the whole mux connection;
     // dropping their supervisors aborts those sessions.
