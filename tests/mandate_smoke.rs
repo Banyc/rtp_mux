@@ -1085,6 +1085,75 @@ async fn m1_lone_tail_field_rtt() {
     );
 }
 
+/// The field-RTT lone-tail arm's `depth` dimension, measured instead of
+/// inferred: the same field impairment ([`field_rtt_link`]'s ~190 ms round
+/// trip, the 5 %-mean-8 GE model and 100 ms jitter), the same
+/// request/response shape and the same window as
+/// [`m1_lone_tail_field_rtt`], offered at `depth` 1 and then at `depth` 2.
+///
+/// It is the arm that makes the field row attributable. Against the family's
+/// reference (`rtp_mux_jitter::jitter_request_response_arms`, the 25 ms
+/// impairment sweep at `depth=1-and-2`) it varies exactly one declared
+/// dimension — its impairment, which is the field's own — and against
+/// [`m1_lone_tail_field_rtt`] it varies exactly one — the second, pipelined
+/// message per round. The depth-1 field arm alone moves its impairment and its
+/// depth together, so a tail it reports cannot be assigned to either; the
+/// sweep is what separates them.
+///
+/// Each depth asserts both M1 regression guards, so a depth effect that
+/// breached them is a gate rather than a printed table. It is `#[ignore]`d
+/// (`full` tier) because it needs two more ~20 s windows on top of the smoke
+/// set's ~3 minutes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "field-RTT lone-tail depth sweep; two ~20 s arms; run with --ignored --nocapture"]
+async fn m1_lone_tail_field_rtt_depth_sweep() {
+    let _serial = SERIAL.lock().await;
+    for (name, depth) in [("field_rtt_d1", 1usize), ("field_rtt_d2", 2usize)] {
+        let mut spec = field_rtt_arm();
+        spec.name = name;
+        spec.load = Load::RequestResponse { depth };
+        let run = with_timeout(
+            Duration::from_secs(120),
+            "m1-field-rtt/depth_sweep",
+            run_arm(spec),
+        )
+        .await;
+        print_arm(&run);
+
+        let pass = run.summary.p99 <= M1_FIELD_RTT_P99_GUARD_MS
+            && over250_pct(&run.samples) <= M1_FIELD_RTT_OVER250_GUARD_PCT;
+        println!(
+            "MANDATE M1_FIELD_RTT_DEPTH {} depth={} owd_ms={} samples={} p50={:.1} p90={:.1} p99={:.1} p999={:.1} max={:.1} over250={} over250_pct={:.3} p99_guard={:.1} over250_guard={:.1} ceiling={:.1}",
+            verdict(pass),
+            depth,
+            FIELD_RTT_OWD.as_millis(),
+            run.samples.len(),
+            run.summary.p50,
+            run.summary.p90,
+            run.summary.p99,
+            run.summary.p999,
+            run.summary.max,
+            over250_count(&run.samples),
+            over250_pct(&run.samples),
+            M1_FIELD_RTT_P99_GUARD_MS,
+            M1_FIELD_RTT_OVER250_GUARD_PCT,
+            M1_CEILING_MS,
+        );
+
+        assert!(
+            run.summary.p99 <= M1_FIELD_RTT_P99_GUARD_MS,
+            "[M1] field-RTT depth-{depth} arm p99 {:.1} ms exceeds its {M1_FIELD_RTT_P99_GUARD_MS} ms regression guard (max {:.1} ms): the depth-{depth} field-RTT tail has grown past the guard the depth-1 field arm fixes",
+            run.summary.p99,
+            run.summary.max,
+        );
+        assert!(
+            over250_pct(&run.samples) <= M1_FIELD_RTT_OVER250_GUARD_PCT,
+            "[M1] field-RTT depth-{depth} arm has {:.3}% of samples > {M1_CEILING_MS} ms, over its {M1_FIELD_RTT_OVER250_GUARD_PCT}% regression guard",
+            over250_pct(&run.samples),
+        );
+    }
+}
+
 // ────────────────────────── M2: delivery and wire ────────────────────────────
 
 fn m2_declaration() -> String {
