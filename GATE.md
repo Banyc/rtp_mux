@@ -226,7 +226,7 @@ rtp_mux_jitter::jitter_interactive_solo = perf | 35 | baseline@interactive | int
 rtp_mux_jitter::jitter_interactive_with_loss = perf | 35 | orthogonal@interactive | interactive-cadence@lane=interactive+flows=1+shape=cadence+loss=2pct-iid+rate=none+load=none+metric=latency-percentiles
 rtp_mux_jitter::jitter_interactive_with_bulk = perf | 65 | composite(rate,load)@interactive | interactive-cadence@lane=interactive+flows=1+shape=cadence+loss=none+rate=1MiBps+load=bulk-burst-2MiB-per-3s+metric=latency-percentiles
 rtp_mux_jitter::jitter_interactive_bulk_and_loss = perf | 35 | composite(loss,rate,load)@interactive | interactive-cadence@lane=interactive+flows=1+shape=cadence+loss=2pct-iid+rate=1MiBps+load=bulk-burst-2MiB-per-3s+metric=latency-percentiles
-mandate_smoke::m3_bulk_goodput_fraction = default | 62 | baseline@m3-bulk | m3-bulk@lane=bulk+rate=1MiBps+load=saturated+window=6s+metric=capacity-fraction
+mandate_smoke::m3_bulk_goodput_fraction = default | 108 | baseline@m3-bulk | m3-bulk@lane=bulk+rate=1MiBps+load=saturated+window=6s+metric=capacity-fraction
 dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction = full | 45 | orthogonal@m3-bulk | m3-bulk@lane=bulk+rate=1MiBps+load=saturated+window=15s+metric=capacity-fraction
 rtp_mux_jitter::jitter_bulk_idle_restart_arm = perf | 35 | composite(rate,load,window,metric)@m3-bulk | m3-bulk@lane=bulk+rate=2Mbps-c2s+load=idle-restart-bursts-512KiB+window=34s+metric=delivered-goodput
 rtp_mux_jitter::jitter_latency_dimension_arms = perf | 385 | baseline@latency-sweep | latency-sweep@sweep=shared-capacity-ack-path-cellular+metric=latency-percentiles-and-goodput
@@ -290,7 +290,7 @@ rtp_mux_jitter::jitter_nonloss_impairments = perf | 210 | baseline@non-loss-impa
 rtp_mux_jitter::jitter_cellular_timeline_arms = perf | 70 | composite(impairment,lane,report)@non-loss-impairment | non-loss-impairment@lane=dual+layer=rtp-frame+shape=cadence+flows=1+loss=none+rate=none+load=none+impairment=owd25-jitter100-and-200ms+report=liveness+metric=p99
 ```
 
-Declared sums are `default` 103 s, `standard` 41 s, `full` 1646 s and `perf`
+Declared sums are `default` 149 s, `standard` 41 s, `full` 1646 s and `perf`
 3471 s of the 300 s, 600 s, 1700 s and 3500 s budgets. `full` and `perf` are
 raised as a declared change (200 → 300 and 1000 → 3000), and `full` again
 (300 → 1200) for the 34 `full`-tier `hol` rows this revision adds, which cost
@@ -308,7 +308,10 @@ family's two `perf` rows, 3191 + 210 + 70 = 3471 s. Each raise is the smallest
 ceiling that admits the measured sum with room for the tier's other,
 still-undeclared rows, and the checker prints both the sum and the ceiling.
 The new field-depth arm adds 38 s to `full` (1608 + 38 = 1646 s), which the
-1700 s ceiling already admits, so no further raise is needed. The `standard`
+1700 s ceiling already admits, so no further raise is needed. On the runner's
+own scale the `default` sum is 149 s (the M3 smoke row's 108 s plus the
+constitution gate's 40 s and the lossy smoke's 1 s), inside its
+300 s ceiling: no raise. The `standard`
 ceiling keeps its 600 s and still carries the two cold-connection rows, its
 only declared rows. The concurrent row is one
 dimension (`offer`) away from the default baseline: the same four flows, the
@@ -339,13 +342,32 @@ request/response (lone-tail) arms` → 1170 s;
 `bulk_lane_goodput_stays_above_capacity_fraction` is `three 15 s dual-lane
 saturated runs` → 45 s; and `m1_lone_tail_field_rtt` states its own `~20 s`.
 Two are **measured** for this declaration rather than read:
-`mandate_smoke::m3_bulk_goodput_fraction` ran in 61.56 s (libtest's own
-per-test wall-clock for `cargo test --release -p rtp_mux --test mandate_smoke
--- --exact m3_bulk_goodput_fraction`, with `real 64.99 s` for the whole
-invocation) and is declared 62 s, and `jitter_shared_bottleneck_arms` ran in
+`mandate_smoke::m3_bulk_goodput_fraction` and
+`jitter_shared_bottleneck_arms`. `jitter_shared_bottleneck_arms` ran in
 156.10 s (for `cargo test --release -p rtp_mux --test rtp_mux_jitter --
 --ignored --exact jitter_shared_bottleneck_arms --nocapture
---test-threads=1`, `real 156.33 s`) and is declared 157 s. A row whose
+--test-threads=1`, `real 156.33 s`) and is declared 157 s.
+`mandate_smoke::m3_bulk_goodput_fraction` is stated on the scale the
+checker's **measured side** uses, which is not the same scale as a serialized
+single-test invocation. `check-gate.py --mandate-check-json` compares a
+declared cost with `tools/mandate-check`'s stamp, and that runner invokes the
+`mandate_smoke` target with libtest's default threading, so the four smoke
+tests run four-way concurrent and the row's stamp carries whatever contention
+the scheduler gives it. Four such runs stamped it at 61.564 s, 111.474 s,
+112.541 s and 142.576 s — the first is the row finishing before the other
+three have ramped, the last is the row sharing the box with all of them — so
+the stamp is not one number and a declared figure has to sit inside the band
+the 50 % tolerance admits on both ends: `[142.576/1.5, 61.564/0.5]` =
+`[95.05, 123.13]`. It is declared 108 s, the geometric middle of that window
+(`|61.564-108|/108` = 43 %, `|111.474-108|/108` = 3 %,
+`|112.541-108|/108` = 4 %, `|142.576-108|/108` = 32 %). The earlier revision of
+this declaration stated the `--exact` single-test figure, 61.56 s (with
+`real 64.99 s` for the whole invocation), which is what the row costs without
+contention at all — outside the window, and past the tolerance against the
+runner's larger draws, which is why the drift comparison failed against it.
+Every stated figure in this paragraph is a run this revision performed or the
+previous one recorded; none is inferred, and the budget below carries the
+nominal 108 s rather than the spread. A row whose
 wall-clock appears in no document is **not** given a number: it is recorded as
 a gap below, so an unmeasured cost is visibly pending rather than plausibly
 guessed.
