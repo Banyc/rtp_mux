@@ -138,17 +138,19 @@ move them.
 
 ### Declared perf rows
 
-The rows below declare ten families in the `gate-perf-design` grammar:
+The rows below declare eighteen families in the `gate-perf-design` grammar:
 `<row> = <tier> | <cost_s> | <relation> | <cell>[,<cell>…]`, each cell
 `<property>@<dimension>=<value>[+…]`. The **default** family is the residual —
 every cell name no `members.<family>` claims — and holds the pre-existing
-`interactive-scaling` rows; the nine named families (`constitution`,
-`establishment`, `fec`, `frame-reorder`, `reorder`, `interactive`, `m3-bulk`,
-`latency-sweep`, `lone-tail`) each carry their own baseline and their own
-cell-name namespace in `gate-budgets`, so a row's cells decide whether it
-belongs to the family its relation names. Keeping only the rows whose cells
-actually carry that name is what turns family membership from a free label
-into a property of the row.
+`interactive-scaling` rows plus the two-flow rung declared alongside them; the
+seventeen named families (`constitution`, `establishment`, `fec`,
+`frame-reorder`, `hol-cap400`, `hol-fec`, `hol-frame`, `hol-hostile`,
+`hol-paced`, `hol-rtt100-clean`, `hol-rtt100-ge5`, `hol-rtt40-ge1`,
+`interactive`, `latency-sweep`, `lone-tail`, `m3-bulk`, `reorder`) each carry
+their own baseline and their own cell-name namespace in `gate-budgets`, so a
+row's cells decide whether it belongs to the family its relation names.
+Keeping only the rows whose cells actually carry that name is what turns
+family membership from a free label into a property of the row.
 
 The last four of those namespaces are the ones a **cell-name collision** had
 blocked, and the fix was a rename of the rows' cells, not of any arm:
@@ -168,12 +170,36 @@ declare (the `mandate_smoke` M2 and M4 arms, `jitter_burst_loss_arms` and
 they are declared: either their family is `constitution` — which they are not
 — or their cells are renamed the way these three were.
 
+**The `hol` regime rename.** The largest collision left was the `hol_probe`
+target's own: every one of its arms drew its cells from the same `hol*` space,
+so the eight regimes the pending declaration proposes — the cap400 shaper, the
+rtt100 GE5 burst-loss links, the rtt40 GE1 links, the rtt100 clean links, the
+hostile real link, the frame-delivery layer, the paced-bulk regression and the
+cap400 FEC arm — shared one name and no namespace could separate them; a
+regime's *values*, not its cells, told them apart. Each regime now carries its
+own cell name — `hol-cap400@…`, `hol-rtt100-ge5@…`, `hol-rtt40-ge1@…`,
+`hol-rtt100-clean@…`, `hol-hostile@…`, `hol-frame@…`, `hol-paced@…`,
+`hol-fec@…` — and names its whole link as one `impairment` value, the
+convention the constitution rows already use (`impairment=clean2pct-iid`,
+`impairment=owd25-iid2pct-iid6pct-ge5pct-jitter5-100-200ms`), so the
+dimensions a row states beside it (`bulk`, `flows`, `seeds`, `layer`, `load`,
+`cadence`, `report`, `metric`, `lanes`) are the axes it actually varies. No
+window, cadence, threshold, seed, `#[ignore]` reason, assertion or test body
+changed with the rename: only this declaration's labels moved, and the
+seven rows of the target that stay undeclared carry the blockers recorded
+below — a family name a second family claims, or a reference context no
+sibling arm states.
+
 Every member below is stated against the baseline of its own family, and the
 label is the checker's derivation from the row's own cells rather than a
-judgement call: of the 23 declared rows, 10 are a family's own reference,
-9 vary exactly one dimension from it (`orthogonal`) and 4 vary several
+judgement call: of the 59 declared rows, 18 are a family's own reference,
+24 vary exactly one dimension from it (`orthogonal`) and 17 vary several
 (`composite(…)`), which name the dimensions they vary. No row is a
-`re-measurement`. A composite is a confounded arm — it cannot attribute a
+`re-measurement` — the two `hol_probe` seed-variant rows and their shared-bulk
+siblings declare a `seeds` dimension instead, because their arms differ from
+their reference in the loss realization and not only in the tier or the run
+count, so the seed variation is visible as an axis rather than hidden as an
+unstated repeat. A composite is a confounded arm — it cannot attribute a
 failure on its own — so each is also recorded as an attribution gap below
 rather than presented as an attributable member. The budget block covers the
 rows declared here, not every row of each tier: the remaining rows are either
@@ -204,21 +230,59 @@ rtp_mux_jitter::jitter_latency_dimension_arms = perf | 385 | baseline@latency-sw
 rtp_mux_jitter::jitter_shared_bottleneck_arms = perf | 157 | orthogonal@latency-sweep | latency-sweep@sweep=shared-capacity-queue-depth+metric=latency-percentiles-and-goodput
 rtp_mux_jitter::jitter_request_response_arms = perf | 1170 | baseline@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1-and-2+impairment=owd25-iid2pct-iid6pct-ge5pct-jitter5-100-200ms+metric=p99-and-over250-share
 mandate_smoke::m1_lone_tail_field_rtt = full | 20 | composite(depth,impairment)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd100-ge5pct-jitter100ms+metric=p99-and-over250-share
+hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
+hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
+hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
+hol_probe::hol_cap400_shared_frame_delivery_diag = full | 20 | orthogonal@hol-frame | hol-frame@impairment=cap400-loss1+layer=rtp-frame+bulk=shared+load=saturating+report=diag+metric=delivery
+hol_probe::hol_cap400_solo = full | 59 | baseline@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=none+flows=1+metric=p99-median-of-3
+hol_probe::hol_hostile_shared = full | 20 | orthogonal@hol-hostile | hol-hostile@impairment=hostile-real-link+cadence=200ms+bulk=shared+flows=1+metric=delivery
+hol_probe::hol_hostile_shared_frame_delivery_diag = full | 21 | composite(cadence,impairment)@hol-frame | hol-frame@impairment=hostile-real-link+cadence=200ms+layer=rtp-frame+bulk=shared+load=saturating+report=diag+metric=delivery
+hol_probe::hol_hostile_solo = full | 20 | baseline@hol-hostile | hol-hostile@impairment=hostile-real-link+cadence=200ms+bulk=none+flows=1+metric=delivery
+hol_probe::hol_hostile_split = full | 20 | orthogonal@hol-hostile | hol-hostile@impairment=hostile-real-link+cadence=200ms+bulk=split+flows=1+metric=delivery
+hol_probe::hol_paced_bulk_median_p99_regression = full | 59 | baseline@hol-paced | hol-paced@impairment=rtt100-ge5+layer=rtp-frame+bulk=shared+load=paced+metric=delivery-p50-and-p99-median-of-3
+hol_probe::hol_rtp_mux_fec_default_on_recovery = full | 38 | composite(bulk,fec,impairment,layer,metric)@hol-fec | hol-fec-recovery@layer=rtp-mux+fec=default-on+impairment=fec-gaming-fat-pipe-20pct+bulk=controller-retention+metric=parity-and-reconstruction
+hol_probe::hol_rtt100_clean_shared = full | 20 | orthogonal@hol-rtt100-clean | hol-rtt100-clean@impairment=rtt100-clean+bulk=shared+flows=1+metric=p99
+hol_probe::hol_rtt100_clean_shared_frame_delivery_diag = full | 20 | baseline@hol-frame | hol-frame@impairment=rtt100-clean+layer=rtp-frame+bulk=shared+load=saturating+report=diag+metric=delivery
+hol_probe::hol_rtt100_clean_solo = full | 20 | baseline@hol-rtt100-clean | hol-rtt100-clean@impairment=rtt100-clean+bulk=none+flows=1+metric=p99
+hol_probe::hol_rtt100_clean_split = full | 20 | orthogonal@hol-rtt100-clean | hol-rtt100-clean@impairment=rtt100-clean+bulk=split+flows=1+metric=p99
+hol_probe::hol_rtt100_ge1_loss1_shared = full | 20 | composite(bulk,impairment)@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge1-loss1+bulk=shared+flows=1+metric=p99
+hol_probe::hol_rtt100_ge1_loss1_solo = full | 20 | orthogonal@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge1-loss1+bulk=none+flows=1+metric=p99
+hol_probe::hol_rtt100_ge1_loss1_split = full | 20 | composite(bulk,impairment)@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge1-loss1+bulk=split+flows=1+metric=p99
+hol_probe::hol_rtt100_ge1_shared_frame_delivery_diag = full | 20 | orthogonal@hol-frame | hol-frame@impairment=rtt100-ge1-loss1+layer=rtp-frame+bulk=shared+load=saturating+report=diag+metric=delivery
+hol_probe::hol_rtt100_ge5_shared = full | 20 | orthogonal@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge5+bulk=shared+flows=1+metric=p99
+hol_probe::hol_rtt100_ge5_shared_dual_lane = full | 20 | composite(bulk,lanes)@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge5+bulk=shared+flows=1+lanes=dual+metric=p99
+hol_probe::hol_rtt100_ge5_shared_frame_delivery = full | 20 | composite(load,metric)@hol-paced | hol-paced@impairment=rtt100-ge5+layer=rtp-frame+bulk=shared+load=saturating+metric=delivery
+hol_probe::hol_rtt100_ge5_solo = full | 20 | baseline@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge5+bulk=none+flows=1+metric=p99
+hol_probe::hol_rtt100_ge5_split = full | 20 | orthogonal@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge5+bulk=split+flows=1+metric=p99
+hol_probe::hol_rtt100_ge5_two_interactive_frame_delivery = full | 20 | orthogonal | interactive-scaling@flows=2+offer=sequential
+hol_probe::hol_rtt100_ge5_v2_shared = full | 20 | composite(bulk,seeds)@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge5+bulk=shared+flows=1+seeds=v2+metric=p99
+hol_probe::hol_rtt100_ge5_v2_solo = full | 20 | orthogonal@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge5+bulk=none+flows=1+seeds=v2+metric=p99
+hol_probe::hol_rtt100_ge5_v3_shared = full | 20 | composite(bulk,seeds)@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge5+bulk=shared+flows=1+seeds=v3+metric=p99
+hol_probe::hol_rtt100_ge5_v3_solo = full | 20 | orthogonal@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge5+bulk=none+flows=1+seeds=v3+metric=p99
+hol_probe::hol_rtt100_ge5_v3_split = full | 20 | composite(bulk,seeds)@hol-rtt100-ge5 | hol-rtt100-ge5@impairment=rtt100-ge5+bulk=split+flows=1+seeds=v3+metric=p99
+hol_probe::hol_rtt40_ge1_loss1_shared = full | 20 | composite(bulk,impairment)@hol-rtt40-ge1 | hol-rtt40-ge1@impairment=rtt40-ge1-loss1+bulk=shared+flows=1+metric=p99
+hol_probe::hol_rtt40_ge1_loss1_solo = full | 20 | orthogonal@hol-rtt40-ge1 | hol-rtt40-ge1@impairment=rtt40-ge1-loss1+bulk=none+flows=1+metric=p99
+hol_probe::hol_rtt40_ge1_loss1_split = full | 20 | composite(bulk,impairment)@hol-rtt40-ge1 | hol-rtt40-ge1@impairment=rtt40-ge1-loss1+bulk=split+flows=1+metric=p99
+hol_probe::hol_rtt40_ge1_shared = full | 20 | orthogonal@hol-rtt40-ge1 | hol-rtt40-ge1@impairment=rtt40-ge1+bulk=shared+flows=1+metric=p99
+hol_probe::hol_rtt40_ge1_solo = full | 20 | baseline@hol-rtt40-ge1 | hol-rtt40-ge1@impairment=rtt40-ge1+bulk=none+flows=1+metric=p99
+hol_probe::hol_rtt40_ge1_split = full | 20 | orthogonal@hol-rtt40-ge1 | hol-rtt40-ge1@impairment=rtt40-ge1+bulk=split+flows=1+metric=p99
 ```
 
-Declared sums are `default` 102 s, `standard` 41 s, `full` 256 s and `perf`
-2827 s of the 300 s, 600 s, 300 s and 3000 s budgets. `full` and `perf` are
-raised as a declared change (200 → 300 and 1000 → 3000), because the eleven
-rows the namespace repair adds cost 62 s in `default`, 65 s in `full` and
-1917 s in `perf` and a tier's declared sum must fit its ceiling — the sums are
-the declared subset's costs, not the tiers' full run time. The `standard`
-ceiling keeps its 600 s and still carries the two cold-connection rows, its
-only declared rows. The concurrent row is one
+Declared sums are `default` 102 s, `standard` 41 s, `full` 1033 s and `perf`
+2867 s of the 300 s, 600 s, 1200 s and 3000 s budgets. `full` and `perf` are
+raised as a declared change (200 → 300 and 1000 → 3000), and `full` again
+(300 → 1200) for the 34 `full`-tier `hol` rows this revision adds, which cost
+777 s; a tier's declared sum must fit its ceiling, and the sums are the
+declared subset's costs, not the tiers' full run time. `perf` keeps its
+3000 s ceiling: the two `perf`-tier `hol` rows add 40 s to 2827 s. The
+`standard` ceiling keeps its 600 s and still carries the two cold-connection
+rows, its only declared rows. The concurrent row is one
 dimension (`offer`) away from the default baseline: the same four flows, the
 same lane, the same seeds, the same offer, polled together instead of one
-after another. The two `interactive-scaling` rows keep the costs they already
-declared (66 s and 20 s, measured 69.1 s and 19.5 s), and no previously declared
-row's tier, cost, relation or cells change.
+after another, and the two-flow rung declared with it is that same serialized
+offer at half the flow count. The two `interactive-scaling` rows keep the
+costs they already declared (66 s and 20 s, re-measured 69.0 s and 19.5 s),
+and no previously declared row's tier, cost, relation or cells change.
 
 **Cost provenance.** No cost here is invented. Of the twelve rows the earlier
 revisions declared, `jitter_duallane_constitution_gate` is the "~40 s
@@ -252,6 +316,27 @@ wall-clock appears in no document is **not** given a number: it is recorded as
 a gap below, so an unmeasured cost is visibly pending rather than plausibly
 guessed.
 
+The 36 rows the `hol` rename adds take their costs from **running the arms**
+at the declaration's own scale, not from a document: no `#[ignore]` reason in
+`hol_probe.rs` states a wall-clock, so `RUSTC_BOOTSTRAP=1 cargo test --release
+-p rtp_mux --test hol_probe -- --ignored --test-threads=1 -Z unstable-options
+--report-time --nocapture` ran all 43 ignored arms of that target in one
+invocation and let libtest stamp each one (43 passed, 0 failed, `finished in
+984.45s`; the 43 stamps sum to 984.44 s, so the per-test costs fit the target's
+own total). Each declared cost is its stamp rounded up to the next second:
+20 s for the 19.5 s single-window arms, 59 s for the two triple-run arms
+(`hol_cap400_solo` 58.609 s, `hol_paced_bulk_median_p99_regression` 58.599 s),
+38 s for the two-arm FEC-recovery row (37.667 s) and 21 s for
+`hol_hostile_shared_frame_delivery_diag` (20.086 s). The same run re-measured
+the two already-declared rows on their own stamps and matched the costs they
+already declared (`hol_rtt100_ge5_four_interactive_frame_delivery` 69.019 s
+against 66 s, `..._four_interactive_concurrent_...` 19.524 s against 20 s),
+which is the check that the stamps and the declaration are on one scale. The
+seven rows of the target that stay undeclared are the two default-tier FEC
+instrument arms (0.000 s each, below the one-second resolution the declaration
+rounds to) and the five dual-lane rows (16.9-19.6 s each, measured but not
+declared, for the family reason recorded below).
+
 **The cold-connection rows** are the two `standard` rows of the
 `establishment` family. `cold_connection_decomposition` decomposes a cold
 dual-lane birth against rtp's own public API at two clean regimes (`owd20`
@@ -284,13 +369,21 @@ critical path, which must fail the gate.
 ```gate-budgets
 default = 300
 standard = 600
-full = 300
+full = 1200
 perf = 3000
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.constitution = rtp_mux_jitter::jitter_duallane_constitution_gate
 baseline.establishment = cold_connection::cold_connection_decomposition
 baseline.fec = rtp_mux_jitter::jitter_fec_arms_2pct
 baseline.frame-reorder = rtp_mux_jitter::jitter_frame_reorder_fec_arms
+baseline.hol-cap400 = hol_probe::hol_cap400_solo
+baseline.hol-fec = hol_probe::hol_cap400_fec_solo
+baseline.hol-frame = hol_probe::hol_rtt100_clean_shared_frame_delivery_diag
+baseline.hol-hostile = hol_probe::hol_hostile_solo
+baseline.hol-paced = hol_probe::hol_paced_bulk_median_p99_regression
+baseline.hol-rtt100-clean = hol_probe::hol_rtt100_clean_solo
+baseline.hol-rtt100-ge5 = hol_probe::hol_rtt100_ge5_solo
+baseline.hol-rtt40-ge1 = hol_probe::hol_rtt40_ge1_solo
 baseline.interactive = rtp_mux_jitter::jitter_interactive_solo
 baseline.latency-sweep = rtp_mux_jitter::jitter_latency_dimension_arms
 baseline.lone-tail = rtp_mux_jitter::jitter_request_response_arms
@@ -300,6 +393,14 @@ members.constitution = M*
 members.establishment = cold-connection*
 members.fec = fec-tuning*
 members.frame-reorder = frame-reorder-fec
+members.hol-cap400 = hol-cap400*
+members.hol-fec = hol-fec*
+members.hol-frame = hol-frame*
+members.hol-hostile = hol-hostile*
+members.hol-paced = hol-paced*
+members.hol-rtt100-clean = hol-rtt100-clean*
+members.hol-rtt100-ge5 = hol-rtt100-ge5*
+members.hol-rtt40-ge1 = hol-rtt40-ge1*
 members.interactive = interactive-cadence*
 members.latency-sweep = latency-sweep*
 members.lone-tail = lone-tail*
@@ -319,8 +420,10 @@ claim, a wall-clock no document records, and a family whose rows' cells name a
 context the arm does not have — where the recorded rename would state coverage
 the arm cannot claim. A **new arm closes none of the first two** — a new arm
 inherits the same cell name and is equally misfiled, and it needs its own cost,
-the very thing missing — so no family here was closed by adding an arm, and the
-four families the `M*` collision blocked were closed by renaming cells only.
+the very thing missing — so no family here was closed by adding an arm: the
+four families the `M*` collision blocked were closed by renaming cells only,
+and the eight `hol` regimes by the same repair plus one measurement per row, a
+cost no `#[ignore]` reason states.
 
 ```gate-coverage-gaps
 cold-connection@lanes=dual+handshake=on+impairment=loss-or-jitter-or-reorder = the cold birth is measured on clean links only; what loss does to a birth is rtp's opening handshake's own retry behaviour (its `OPENING_TIMEOUT`/`RETRY_INTERVAL`), which the `rtp` crate owns and which a clean-link decomposition cannot attribute to rtp_mux, so no impaired birth row is claimed here.
@@ -328,7 +431,7 @@ cold-connection@lanes=dual+handshake=off = the same birth with the rtp opening h
 cold-connection@lanes=single+shape=proxy-chain = the row measures the rtp_mux birth on loopback with no proxy in the path; the deployed chain's cold total (and the proxy's share of it) is measured by the proxy-path iteration that owns those arms, and loopback cannot speak to a real path's delay distribution, so no field-scale claim is made here.
 cold-connection@metric=cpu = per-datagram CPU cost is measured by owning-symbol attribution (`tools/samply_hotspots.py`), not by a scenario in this crate.
 cold-connection@lanes=dual+handshake=on+scale=multipath = the multi-path UDP transport (rtp's `mpudp`) has no rtp_mux birth arm; a cell for it belongs to the layer that owns that transport.
-interactive-scaling@flows=2+offer=concurrent = the two-flow rung is the pre-existing serialized `hol_rtt100_ge5_two_interactive_frame_delivery` and stays as it is; the concurrent offer is declared at four flows, the rung this family and M4 name, so a two-flow concurrent row would repeat it at a smaller N without a new regime.
+interactive-scaling@flows=2+offer=concurrent = the two-flow rung is the pre-existing serialized `hol_rtt100_ge5_two_interactive_frame_delivery`, now declared in the default family as `flows=2+offer=sequential`; it stays as an arm, and the concurrent offer is declared at four flows, the rung this family and M4 name, so a two-flow concurrent row would repeat it at a smaller N without a new regime.
 interactive-scaling@flows=4+offer=concurrent+bulk=saturating = the family's bulk-sharing member (`hol_rtt100_ge5_shared_frame_delivery`) is single-flow with a saturating bulk stream; adding a saturating bulk stream to the concurrent row varies two dimensions from the baseline at once and would need its own derivation for what the shared bottleneck does to the offer floor, so it is left to its own row.
 interactive-scaling@flows=4+offer=concurrent+impairment=clean-or-GE1-or-hostile = the concurrent row is declared on the family's GE5 seed pair (31/32) only; the clean, GE1 and hostile rtt100 rows are single-flow arms, and a concurrent arm on those links would be stated against a different baseline family.
 interactive-scaling@flows=8+offer=concurrent = the sink attributes samples by first-byte tag (A, C..H after the reserved `b'B'`), so seven flows is the tag range's limit and an eight-flow row has no per-flow attribution; the four-flow rung is the largest this instrument can measure.
@@ -336,17 +439,17 @@ attribution@baseline-family=interactive = the family is now declared (its four c
 attribution@baseline-family=m3-bulk = the family is now declared (its three cells renamed `m3-bulk@…` off `M3`), but `jitter_bulk_idle_restart_arm` varies four declared dimensions from the smoke reference (rate: 1MiBps -> 2Mbps-c2s; load: saturated -> idle-restart-bursts-512KiB; window: 6s -> 34s; metric: capacity-fraction -> delivered-goodput), so no existing arm attributes it; a one-axis idle-restart arm on the family's own 1 MiB/s saturated link is what closes this.
 attribution@baseline-family=lone-tail = the family is now declared (its cells renamed `lone-tail@…` off `M1`) with the request/response pair, but `mandate_smoke::m1_lone_tail_field_rtt` varies two declared dimensions from the reference (depth: 1-and-2 -> 1; impairment: owd25-iid2pct-iid6pct-ge5pct-jitter5-100-200ms -> owd100-ge5pct-jitter100ms), so no existing arm attributes it; a depth-1 arm at the smoke's own 25 ms scale, or a field-scale arm that sweeps depth, is what closes this. The two rows the pending declaration filed here, `jitter_cellular_timeline_arms` and `jitter_nonloss_impairments`, are **not** declared into this family: both offer the cadence shape (`InteractiveLoad::Cadence`, not `RequestResponse`), so renaming their cells to `lone-tail@…` would state a request/response coverage neither arm has. They need a cadence-shaped family with a reference of its own, which is a refiling of those rows, not a rename of their cells, and their costs (70 s and 210 s) are already recorded for the day that family exists.
 attribution@baseline-family=decomposition = `jitter_frame_reorder_decomposition` carries `frame-reorder` and `jitter_decomposition` carries `loss-vs-queue`, so the family spans two names; the repair is to rename `jitter_decomposition`'s cell `frame-reorder@…` or to split the family, and because `jitter_decomposition` is two declared dimensions (arms, jitter) from its sibling, a single-axis decomposition arm beside it is the other half of the repair.
-attribution@baseline-family=dual-lane = `hol_probe::dual_lane_asym_frame_delivers_and_tears_down` carries `hol-dual-lane` while `jitter_duallane_arms` carries `dual-lane-matched-load`, which `members.dual-lane = hol-dual-lane*` does not claim; the repair is to rename one of the two so both carry the family's own name, and `jitter_duallane_arms` is two dimensions (load, reorder) from the reference, so a single-axis dual-lane arm is the other half.
+attribution@baseline-family=dual-lane = `hol_probe::dual_lane_asym_frame_delivers_and_tears_down` carries `hol-dual-lane` while `jitter_duallane_arms` carries `dual-lane-matched-load`, which `members.dual-lane = hol-dual-lane*` does not claim; the repair is to rename one of the two so both carry the family's own name, and `jitter_duallane_arms` is two dimensions (load, reorder) from the reference, so a single-axis dual-lane arm is the other half. The four other `hol_probe` dual-lane rows (`hol_rtt100_ge5_shared_dual_lane_frame_delivery` 16.9 s, `hol_rtt100_ge5_shared_dual_lane_asym_frame_diag` 19.5 s, `hol_rtt100_ge5_dual_lane_two_interactive_frame_diag` 19.6 s, `hol_rtt100_ge5_dual_lane_two_interactive_stock_diag` 19.5 s, each its own libtest stamp) carry their costs now but no family of the eight regimes: they vary the lane topology, so a `hol-dual-lane` family would need a reference row stated in a context no regime arm states, and their cells would join the namespace this line's conflict already covers.
 attribution@baseline-family=fairness = the proposed family spans five cell names (`M4`, `fairness-sweep`, `fairness-longrun`, `dual-lane-longrun`, `multi-flow-longrun`) across two tiers; the repair is to split it into the three contexts it measures (`fairness-sweep`, `fairness-longrun`, `dual-lane-longrun`) and to rename the M4 arm's cell `fairness-m4@…`, since the M4 arm is a four-flow fairness arm and the longruns are multi-minute measurements, not the same reference's members.
-attribution@baseline-family=hol = the seven `hol_probe` families the pending declaration proposes (`hol-cap400`, `hol-ge5-shared`, `hol-ge5-solo`, `hol-rtt40`, `hol-shared-frame`, `hol-solo`, `hol-split`) draw every cell from the same `hol*` space, so no namespace separates them — those regimes differ in their dimensions' values, not in their cells; the repair is one cell name per regime (`hol-cap400@…`, `hol-rtt100-ge5@…`, `hol-rtt40-ge1@…`, `hol-rtt100-clean@…`, `hol-hostile@…`, `hol-frame@…`, `hol-fec@…`, `hol-paced@…`) plus the wall-clock each `#[ignore]` reason does not state, which is a change to those rows' declarations and to no window, seed or tier.
+attribution@baseline-family=hol-regimes = the eight regimes the pending declaration proposed are now eight declared families with their own cell names (`hol-cap400`, `hol-rtt100-ge5`, `hol-rtt40-ge1`, `hol-rtt100-clean`, `hol-hostile`, `hol-frame`, `hol-paced`, `hol-fec`), and 36 of the target's 43 ignored rows are declared against them with measured costs, so the collision that blocked them is closed. The seven rows that stay undeclared are the five dual-lane topology rows (recorded on the `dual-lane` line above) and the target's two default-tier FEC instrument arms, whose blocker is the `instrument-sanity` name the `perf_probe` pair also carries (recorded on that line below) — neither is a cost, and neither is a regime.
 attribution@baseline-family=hostile-probes = the proposed family spans three cell names (`ceiling`, `contested`, `mux-over-rtp`) and two tiers; the repair is to keep only `probe_hostile_goodput_30s` and `probe_hostile_message_latency` in it and to state `contested_latency::contested_hostile` and `mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf` against their own families, which also needs their costs.
 attribution@baseline-family=rtp-ceiling = `perf_probe::probe_rtp_echo_4mib_direct` and `_mss8k` share the cell name `ceiling` with the hostile probes; the repair is to narrow one of the two names (the hostile pair to `hostile-probe@…`) so the families are separable, and to record both costs, which no `#[ignore]` reason states.
 attribution@baseline-family=mux-ceiling = `mux_ceiling_probe`'s echo and sink pairs all carry `loopback-ceiling`, so the proposed echo and sink families cannot both claim it; the repair is to split the name (`mux-ceiling-echo@…`, `mux-ceiling-sink@…`) and to record the four costs.
 attribution@baseline-family=instrument-sanity = `hol_probe`'s FEC pair and `perf_probe`'s determinism pair all carry `instrument-sanity`; the repair is to narrow the name to one target and to record all four costs, which the `#[ignore]` reasons do not state.
 attribution@baseline-family=mux-over-rtp = `mux_over_rtp_perf`'s lossy pair carries `mux-over-rtp` while `mux_over_rtp_small_stream_while_bulk_perf` carries `small-stream-while-bulk`; the repair is to rename the third cell so all three carry one name and to record the three wall-clocks, none of which appears in a document.
 attribution@baseline-family=hol-verify4 = `hol_verify4::v4_clean_muxbulk` and `v4_ge5_muxbulk` are internally coherent (`bulk-lane-ab`) and one dimension apart, so only their costs are missing — the `#[ignore]` reason states no wall-clock; one measurement per row declares the family with no cell change.
-attribution@baseline-family=fec-recovery = `hol_probe::hol_rtp_mux_fec_default_on_recovery` carries `hol-fec-recovery`, which no family above claims, and the pending declaration files it in the `fec` family four dimensions from that family's reference (fec, impairment, layer, loss); the repair is either a single-axis FEC-recovery arm beside the `fec-tuning` reference or a `fec-recovery` cell name with its own reference, plus the row's cost.
-cost@metric=wall-clock = `mandate_smoke`'s three other arms (M1's, M2's and M4's; M3's is measured and declared above), the four `mux_ceiling_probe` rows, `perf_probe`'s two rtp-echo and two hostile rows, `contested_latency`'s three rows, `mux_over_rtp_perf`'s three rows, `hol_verify4`'s two rows and the 27 `hol_probe` rows have a coherent family or one repairable cell but no wall-clock in any document; each needs one measurement of its own tier's invocation — the tier's `--ignored` run, or a plain `cargo test --release -p rtp_mux --test <target> -- --exact <test>` for a default-tier row — before its family can be declared, because a cost the declaration invents is worse than a cost it records as pending.
+attribution@baseline-family=fec-recovery = `hol_probe::hol_rtp_mux_fec_default_on_recovery` is now declared, in the `hol-fec` family and five declared dimensions from that family's reference (bulk, fec, impairment, layer, metric), so it is a composite no existing arm attributes: its context is the `rtp-mux` layer on the fec-gaming fat pipe at 20 % loss with a controller-retention bulk lane, while the reference is the cap400 shaper with FEC on. A single-axis FEC-recovery arm beside either end is what closes this. Its cost is now measured (38 s, its own libtest stamp) — and the family is a two-row family rather than a one-row namespace, which the checker refuses, because a baseline no sibling row states against is a stale reference.
+cost@metric=wall-clock = `mandate_smoke`'s three other arms (M1's, M2's and M4's; M3's is measured and declared above), the four `mux_ceiling_probe` rows, `perf_probe`'s four rows, `contested_latency`'s three rows, `mux_over_rtp_perf`'s three rows and `hol_verify4`'s two rows have a coherent family or one repairable cell but no wall-clock in any document; each needs one measurement of its own tier's invocation — the tier's `--ignored` run, or a plain `cargo test --release -p rtp_mux --test <target> -- --exact <test>` for a default-tier row — before its family can be declared, because a cost the declaration invents is worse than a cost it records as pending. The 43 `hol_probe` rows this line used to name are measured now: 36 are declared above on their own stamps, and the other seven — the two default-tier FEC instrument arms (0.000 s each) and the five dual-lane rows (16.9-19.6 s each) — carry their measured costs on the `dual-lane` line above and in the cost-provenance paragraph, so those rows are unblocked except for their family.
 M1@lane=single = the constitution's M1 arms run on the production dual-lane topology; a single-connection transport tail is covered by rtp's burst-loss and bufferbloat gates, whose perf declarations are pending, and is not claimed here.
 M3@lane=single = M3 is asserted on the deployment's bulk lane (`dual_lane_mandates`); the single-connection goodput floor belongs to rtp, whose declaration is pending.
 cpu-cost@metric=cpu = per-datagram CPU cost is measured by owning-symbol attribution (`tools/samply_hotspots.py`), not by a scenario in this crate.
