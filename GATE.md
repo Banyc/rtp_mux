@@ -138,18 +138,19 @@ move them.
 
 ### Declared perf rows
 
-The rows below declare twenty-four families in the `gate-perf-design` grammar:
+The rows below declare twenty-five families in the `gate-perf-design` grammar:
 `<row> = <tier> | <cost_s> | <relation> | <cell>[,<cell>…]`, each cell
 `<property>@<dimension>=<value>[+…]`. The **default** family is the residual —
 every cell name no `members.<family>` claims — and holds the pre-existing
 `interactive-scaling` rows plus the two-flow rung declared alongside them; the
-twenty-three named families (`constitution`, `contested`, `dual-lane`,
+twenty-four named families (`constitution`, `contested`, `dual-lane`,
 `establishment`, `fec`,
 `fec-instrument-sanity`, `frame-reorder`, `hol-cap400`, `hol-fec`, `hol-frame`,
 `hol-hostile`, `hol-paced`, `hol-rtt100-clean`, `hol-rtt100-ge5`,
 `hol-rtt40-ge1`, `hostile-probes`, `instrument-sanity`, `interactive`,
 `latency-sweep`,
-`lone-tail`, `m3-bulk`, `mux-over-rtp`, `reorder`) each carry
+`lone-tail`, `m3-bulk`, `mux-over-rtp`, `non-loss-impairment`, `reorder`) each
+carry
 their own baseline and their own cell-name namespace in `gate-budgets`, so a
 row's cells decide whether it belongs to the family its relation names.
 Keeping only the rows whose cells actually carry that name is what turns
@@ -167,9 +168,11 @@ tier, `#[ignore]` reason, assertion or test body changed with those renames:
 they are a change to this declaration's labels only. The collision is closed
 for the rows declared here and not for every row that will ever be: `M*` is a
 prefix namespace, so it claims any `M*` cell name any row carries, and the
-pending declaration proposes `M*` cells for four rows this revision does not
-declare (the `mandate_smoke` M2 and M4 arms, `jitter_burst_loss_arms` and
-`jitter_cellular_timeline_arms`). Those rows face the same conflict on the day
+pending declaration proposes `M*` cells for three rows this revision does not
+declare (the `mandate_smoke` M2 and M4 arms and `jitter_burst_loss_arms`; the
+fourth it named, `jitter_cellular_timeline_arms`, is declared below under the
+`non-loss-impairment` family's own name instead). Those rows face the same
+conflict on the day
 they are declared: either their family is `constitution` — which they are not
 — or their cells are renamed the way these three were.
 
@@ -195,8 +198,8 @@ sibling arm states.
 
 Every member below is stated against the baseline of its own family, and the
 label is the checker's derivation from the row's own cells rather than a
-judgement call: of the 75 declared rows, 24 are a family's own reference,
-27 vary exactly one dimension from it (`orthogonal`) and 24 vary several
+judgement call: of the 77 declared rows, 25 are a family's own reference,
+27 vary exactly one dimension from it (`orthogonal`) and 25 vary several
 (`composite(…)`), which name the dimensions they vary. No row is a
 `re-measurement` — the two `hol_probe` seed-variant rows and their shared-bulk
 siblings declare a `seeds` dimension instead, because their arms differ from
@@ -285,10 +288,12 @@ contested_latency::contested_capped_clean = full | 43 | baseline@contested | con
 contested_latency::contested_hostile = perf | 44 | orthogonal@contested | contested@impairment=hostile-preset+metric=p99-with-bulk
 mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke = default | 1 | baseline@mux-over-rtp | mux-over-rtp@impairment=lossy-400kib-per-sec+shape=echo+scale=1KiB+metric=delivery-and-wire
 mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = full | 344 | composite(impairment,metric,scale,shape)@mux-over-rtp | mux-over-rtp@impairment=hostile-fat-pipe+shape=sink+scale=400MiB+metric=delivery-and-goodput
+rtp_mux_jitter::jitter_nonloss_impairments = perf | 210 | baseline@non-loss-impairment | non-loss-impairment@lane=interactive+layer=rtp-frame+shape=cadence+flows=1+loss=none+rate=none+load=none+impairment=jitter-reorder-duplication-and-strict-reorder+metric=p99
+rtp_mux_jitter::jitter_cellular_timeline_arms = perf | 70 | composite(impairment,lane,report)@non-loss-impairment | non-loss-impairment@lane=dual+layer=rtp-frame+shape=cadence+flows=1+loss=none+rate=none+load=none+impairment=owd25-jitter100-and-200ms+report=liveness+metric=p99
 ```
 
 Declared sums are `default` 103 s, `standard` 41 s, `full` 1608 s and
-`perf` 3191 s of the 300 s, 600 s, 1700 s and 3300 s budgets.
+`perf` 3471 s of the 300 s, 600 s, 1700 s and 3500 s budgets.
 `full` and `perf` are
 raised as a declared change (200 → 300 and 1000 → 3000), and `full` again
 (300 → 1200) for the 34 `full`-tier `hol` rows this revision adds, which cost
@@ -300,7 +305,9 @@ as a declared change (3000 → 3300) for the `dual-lane` family's
 prints. `full` is raised again as a declared change (1200 → 1700) for the four
 `full`-tier rows the `hostile-probes`, `contested` and `mux-over-rtp` families
 add, which cost 478 s and are measured rather than read: 1033 + 97 (the
-`dual-lane` rows) = 1130, plus 51 + 40 + 43 + 344 = 1608 s. Each raise is the
+`dual-lane` rows) = 1130, plus 51 + 40 + 43 + 344 = 1608 s. `perf` is raised a
+second time as a declared change (3300 → 3500) for the `non-loss-impairment`
+family's two `perf` rows, 3191 + 210 + 70 = 3471 s. Each raise is the
 smallest ceiling that admits the measured sum with room for the tier's other,
 still-undeclared rows, and the checker prints both the sum and the ceiling.
 The
@@ -431,6 +438,29 @@ and the 400 MiB hostile arm refiled into it; that arm runs on the
 so its cell names the preset it actually takes rather than a family-level
 "hostile" label.
 
+**The `non-loss-impairment` family.** `jitter_cellular_timeline_arms` and
+`jitter_nonloss_impairments` were the two rows the pending declaration filed
+into `lone-tail`, and they do not belong there: both offer the *cadence* shape
+(`InteractiveLoad::Cadence`, or the equivalent fire-and-forget frame-delivery
+loop), not the request/response shape a lone tail is about, so a `lone-tail@…`
+cell would state a coverage neither arm has. The repair is a refiling rather
+than that rename: they carry `non-loss-impairment@…` — the family's own name,
+which is what they measure, an interactive lane impaired by something that is
+not packet loss — and `jitter_nonloss_impairments` is the family's reference,
+because it is the arm that states that context most completely (the clean
+floor, jitter alone, a reorder window, duplication, reorder-with-duplication
+and the strict reorder path, all at 25 ms one-way on the deployment's
+interactive lane, frame layer). `jitter_cellular_timeline_arms` then varies
+three declared dimensions from it: the topology (`lane=dual` rather than the
+single interactive lane, with the bulk lane idle), the impairment (100/200 ms
+uniform jitter on the same 25 ms delay, rather than the jitter/reorder/
+duplication sweep) and the assertion strength (`report=liveness`, because that
+arm is report-only and asserts only that it ran, while the reference's
+`assert_sane` checks the summary). Its cost and the reference's are the arm
+counts their own `#[ignore]` reasons state — `two ~35 s cellular-jitter arms`
+→ 70 s, `six ~35 s non-loss arms` → 210 s — and neither arm, window, cadence,
+threshold, seed, tier or assertion changed.
+
 **The cold-connection rows** are the two `standard` rows of the
 `establishment` family. `cold_connection_decomposition` decomposes a cold
 dual-lane birth against rtp's own public API at two clean regimes (`owd20`
@@ -464,7 +494,7 @@ critical path, which must fail the gate.
 default = 300
 standard = 600
 full = 1700
-perf = 3300
+perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.constitution = rtp_mux_jitter::jitter_duallane_constitution_gate
 baseline.contested = contested_latency::contested_capped_clean
@@ -488,6 +518,7 @@ baseline.latency-sweep = rtp_mux_jitter::jitter_latency_dimension_arms
 baseline.lone-tail = rtp_mux_jitter::jitter_request_response_arms
 baseline.m3-bulk = mandate_smoke::m3_bulk_goodput_fraction
 baseline.mux-over-rtp = mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
+baseline.non-loss-impairment = rtp_mux_jitter::jitter_nonloss_impairments
 baseline.reorder = rtp_mux_jitter::jitter_reorder_direction
 members.constitution = M*
 members.contested = contested*
@@ -511,6 +542,7 @@ members.latency-sweep = latency-sweep*
 members.lone-tail = lone-tail*
 members.m3-bulk = m3-bulk*
 members.mux-over-rtp = mux-over-rtp*
+members.non-loss-impairment = non-loss-impairment*
 members.reorder = reorder-*
 drift = 0.5
 drift_floor_s = 2.0
@@ -543,7 +575,7 @@ interactive-scaling@flows=4+offer=concurrent+impairment=clean-or-GE1-or-hostile 
 interactive-scaling@flows=8+offer=concurrent = the sink attributes samples by first-byte tag (A, C..H after the reserved `b'B'`), so seven flows is the tag range's limit and an eight-flow row has no per-flow attribution; the four-flow rung is the largest this instrument can measure.
 attribution@baseline-family=interactive = the family is now declared (its four cells renamed `interactive-cadence@…` off `M1`/`M2`), but two of its rows are composites: `jitter_interactive_with_bulk` varies two declared dimensions from the solo reference (rate: none -> 1MiBps; load: none -> bulk-burst-2MiB-per-3s) and `jitter_interactive_bulk_and_loss` three (loss, rate, load), so no existing arm attributes them; an arm that adds the bulk burst on an uncapped link (load alone), or caps an idle link (rate alone), is what closes this.
 attribution@baseline-family=m3-bulk = the family is now declared (its three cells renamed `m3-bulk@…` off `M3`), but `jitter_bulk_idle_restart_arm` varies four declared dimensions from the smoke reference (rate: 1MiBps -> 2Mbps-c2s; load: saturated -> idle-restart-bursts-512KiB; window: 6s -> 34s; metric: capacity-fraction -> delivered-goodput), so no existing arm attributes it; a one-axis idle-restart arm on the family's own 1 MiB/s saturated link is what closes this.
-attribution@baseline-family=lone-tail = the family is now declared (its cells renamed `lone-tail@…` off `M1`) with the request/response pair, but `mandate_smoke::m1_lone_tail_field_rtt` varies two declared dimensions from the reference (depth: 1-and-2 -> 1; impairment: owd25-iid2pct-iid6pct-ge5pct-jitter5-100-200ms -> owd100-ge5pct-jitter100ms), so no existing arm attributes it; a depth-1 arm at the smoke's own 25 ms scale, or a field-scale arm that sweeps depth, is what closes this. The two rows the pending declaration filed here, `jitter_cellular_timeline_arms` and `jitter_nonloss_impairments`, are **not** declared into this family: both offer the cadence shape (`InteractiveLoad::Cadence`, not `RequestResponse`), so renaming their cells to `lone-tail@…` would state a request/response coverage neither arm has. They need a cadence-shaped family with a reference of its own, which is a refiling of those rows, not a rename of their cells, and their costs (70 s and 210 s) are already recorded for the day that family exists.
+attribution@baseline-family=lone-tail = the family is declared (its cells renamed `lone-tail@…` off `M1`) with the request/response pair, and `mandate_smoke::m1_lone_tail_field_rtt` still varies two declared dimensions from the reference (depth: 1-and-2 -> 1; impairment: owd25-iid2pct-iid6pct-ge5pct-jitter5-100-200ms -> owd100-ge5pct-jitter100ms), so no existing arm attributes it: a depth-1 arm at the smoke's own 25 ms scale, or a field-scale arm that sweeps depth, is what closes this. The two rows the pending declaration filed here, `jitter_cellular_timeline_arms` and `jitter_nonloss_impairments`, are **not** declared into this family and are declared instead under the cadence-shaped `non-loss-impairment` family below, because renaming their cells to `lone-tail@…` would state a request/response coverage neither arm has.
 attribution@baseline-family=decomposition = `jitter_frame_reorder_decomposition` carries `frame-reorder` and `jitter_decomposition` carries `loss-vs-queue`, so the family spans two names; the repair is to rename `jitter_decomposition`'s cell `frame-reorder@…` or to split the family, and because `jitter_decomposition` is two declared dimensions (arms, jitter) from its sibling, a single-axis decomposition arm beside it is the other half of the repair.
 attribution@baseline-family=dual-lane = the family is now declared: all six of its rows carry `hol-dual-lane*` cells, the rename moved `jitter_duallane_arms`'s cell into that namespace with no change to the arm, and the five `hol_probe` dual-lane topology rows are declared on their own libtest stamps (20/20/20/20/17 s). Four of the six vary several declared dimensions from the reference `hol_probe::dual_lane_asym_frame_delivers_and_tears_down`, so no existing arm attributes them: `hol_rtt100_ge5_shared_dual_lane_frame_delivery` varies bulk, metric; `hol_rtt100_ge5_dual_lane_two_interactive_frame_diag` flows, metric; `hol_rtt100_ge5_dual_lane_two_interactive_stock_diag` flows, interactive, metric; and `jitter_duallane_arms` impairment, metric, reorder. A single-axis dual-lane arm beside the reference (the second interactive stream alone, or the interactive lane's frame mode alone, or the sixth row's matched bulk load on the reference's own link) is what closes this. The one-dimensional member is `hol_rtt100_ge5_shared_dual_lane_asym_frame_diag`, which is the `hol-dual-lane` arm already carrying the reference's whole config: the two differ only in the metric each asserts (liveness versus delivery-and-teardown), which is why it is the family's orthogonal member rather than a fifth gap.
 attribution@baseline-family=fairness = the proposed family spans five cell names (`M4`, `fairness-sweep`, `fairness-longrun`, `dual-lane-longrun`, `multi-flow-longrun`) across two tiers; the repair is to split it into the three contexts it measures (`fairness-sweep`, `fairness-longrun`, `dual-lane-longrun`) and to rename the M4 arm's cell `fairness-m4@…`, since the M4 arm is a four-flow fairness arm and the longruns are multi-minute measurements, not the same reference's members.
