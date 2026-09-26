@@ -785,8 +785,20 @@ arm's `lone_wire_x` of 5.91–7.42×); and each rung past the probe budget waits
 rtp's `TAIL_PROBED_MIN_RTO = 300 ms`, the floor that binds on every M1 arm
 because the corroborated term `srtt + max(rttvar, srtt / 4)` is 250 ms even at
 the field arm's 190 ms round trip. A burst of `l` datagrams therefore costs
-`floor(l / m)` rungs and `floor(l / m) * 300 ms`, so the window an arm needs is
-`rungs * step + rtt`. Every input is the arm's own — the burst distribution
+`floor(l / m)` rungs and `floor(l / m) * 300 ms` — **when it begins on a
+transmission's first datagram**, which is the case `probe_lone_tail_finite_loss_ladder`
+drives and the only case it drives. A burst beginning `r` datagrams into a group
+leaves that group's other `m - r` copies delivered, the message arrives, and no
+rung fires at all, so the rung-producing events are the bursts that start at a
+transmission boundary: their rate is the number of **transmission starts** times
+the per-datagram burst-start probability, one start per request/response round,
+i.e. `rounds * loss / mean_burst` — the probe below measures 5.6-6.6 starts per
+window over its four windows (900-1056 rounds each) — and not the all-datagram
+rate `E`, which charges every burst the rung cost of an aligned one. `E` remains the right count for the burst *budget* this table's column
+states (how many bursts the window holds, and so how large the largest of them
+plausibly is); the alignment is what turns that budget into a rung frequency.
+So the window an arm needs is `rungs * step + rtt`. Every input is the arm's
+own — the burst distribution
 from its `NetemConfig.loss_model` (`1 / p31` and `p13 / (p13 + p31)`), the
 round trip from its one-way delay, the burst budget from the datagrams its own
 c2s link accepted (`Counters::received`, the instrument's one addition to
@@ -818,15 +830,20 @@ instrument's 300 ms step (3.0 s of rung plus its round trip, and the arm's own
 25 samples over 250 ms across the ten runs below place on that rung) against
 the `lone_tail` arm's 105 s room, 33× inside it, and a 10-rung ladder needs a
 burst of at least 60 consecutive datagrams, which `gilbert_elliott_loss(5, 8)`
-produces with probability `(7/8)^59 = 3.8e-4` per burst — about once in 49
-windows at the arm's own ~54 bursts per window. A **cadence** arm could not
+produces with probability `(7/8)^59 = 3.8e-4` per burst — and only an *aligned*
+burst costs a rung, of which the arm's own drain offers
+`(8610 / 8.96) * 5 % / 8 = 6.0` per window rather than the 53.8 bursts every
+datagram in that drain contains (8.96 c2s datagrams per round is measured, not
+assumed: 35171 over 3926 rounds), so about once in 440 windows. A **cadence**
+arm could not
 observe that ladder at all (2 s = 6 rungs); the request/response shape is the
 one that can, and it does. The rung is the 300 ms floor and not the 1 s
 retransmission floor on this arm, and the arm's own record is the second
 witness: at the 1 s floor, 3.2 s would be 3 rungs — an 18-datagram burst, `E`
-times `(7/8)^17` = 5.6 drawings per window — and a 3.2 s maximum would appear
-in most windows, where the sixteen `lone_tail` runs on record hold exactly
-one maximum above 2.7 s.
+times `(7/8)^17` = 5.6 drawings per window by the all-datagram rate, and
+`6.0 * (7/8)^17 = 0.63` by the aligned one — so a 3.2 s maximum would appear in
+about half of all windows, where the sixteen `lone_tail` runs on record hold
+exactly one maximum above 2.7 s.
 
 **The derivation is corroborated by the arm's scale, not by its maximum.**
 Ten runs of the `lone_tail` arm on one revision and configuration (`rtp
@@ -850,7 +867,46 @@ in the burst length (`P(L >= 6k) = (7/8)^(6k-1)` per burst over that window's
 own `E` = 45–59 bursts), plus the round trip. That design point is an *upper*
 estimate of a typical window's maximum, measured rather than assumed: 7 of
 the ten windows peaked below it at a median of 2.6 rungs and one exceeded it
-at 6.05 rungs. The `field_rtt` arm reads the same way: its required 1100 ms
+at 6.05 rungs, and it is an upper estimate twice over — it is the largest of
+the window's `E` bursts rather than of a typical window's, and only the bursts
+that begin on a transmission boundary cost any rung at all.
+
+**What the arm shows, measured.** `mandate_smoke::m1_lone_tail_rung_distribution`
+is a **new** arm (`full` tier, `#[ignore]`d, 75 s declared and 74.4 s measured)
+that reads the rung counts out of the arm's own round series and prints the law's
+prediction beside them; nothing about `clean`, `hostile` or `lone_tail` changed.
+Its four windows (3926 rounds; 35171 c2s datagrams of which 2273 were dropped,
+i.e. **6.5 % applied on c2s**, 3.8 % on s2c and **5.2 % pooled** against the
+declared 5 %) read:
+
+| threshold | measured, per window | corrected law | law without the alignment term |
+| --- | --- | --- | --- |
+| `> 250 ms` — one rung or more | 2.00 (8 pooled) | 3.15 | 28.19 |
+| `> 550 ms` — two or more | 1.00 (4) | 1.41 | 12.65 |
+| `> 1150 ms` — four or more | 0.25 (1) | 0.28 | 2.55 |
+| `> 1750 ms` — six or more | 0.00 (0) | 0.06 | 0.51 |
+
+`> 250 ms` is the rigorous rung indicator rather than a threshold of
+convenience: `sample_delay` clamps at zero and this arm's impairment is the only
+thing delaying one of its datagrams, so a round trip that waited for nothing is
+at most `2 * (25 + 100) = 250 ms` and every round above it waited a rung; the
+higher rows read the rungs off the 300 ms grid the arm's own series shows (one
+ladder at 1510.5 ms, one at 1037.2, one at 996.6, and five between 276.1 and
+578.3). Three further readings of the same arm agree on the first row to within
+one event: 2.5 per window over the ten runs above (25 rounds with a rung, its
+own `> 250 ms` row) and 2.5 and 2.5 per window over two more four-window samples
+(10 and 10 pooled). The law without the alignment term is
+rejected by the arm's own series (112.8 rounds over these four windows against
+the 8 shown), which is the measurement the correction rests on; the probe prints
+that rejection beside its pass as its vacuity demonstration, and it asserts the
+corrected rate back — so a product change that restored the old frequency (an
+armour cover collapsing to one copy, say) fails the row while a ladder that
+stopped firing altogether also fails it. The residual is honest: the second row
+is 1.4× high and the first 1.6× high on 4 and 8 pooled events, so the corrected
+rate is good to about a factor of two at these counts and the two largest rows
+rest on one event and none.
+
+The `field_rtt` arm reads the same way: its required 1100 ms
 sits at the top of the band its runs measure (max 358.3 / 434.6 / 581.5 /
 1043.6 / 1255.3 ms over six runs on `rtp v0.0.96`), five of those six below
 the requirement and one above it. The readings that repeat are therefore the
@@ -863,14 +919,33 @@ it, so a conservative design point costs no coverage.
 field's 1063 ms is inside it: four of the ten windows peaked above it (1205.7,
 1257.9, 1411.6, 1863.7 ms). The field's 3205 ms is not: no window here reached
 it, and the highest `lone_tail` maximum on record is 2651.7 ms. The arithmetic
-above says why — a 3205 ms maximum is a ≥ 60-datagram burst, about one drawing
-in 49 windows — so a single 15 s window reproduces the field's worst case
-roughly once in fifty runs. Three parts of the field's regime are outside this
+above says why — a 3205 ms maximum is a ≥ 60-datagram **aligned** burst,
+`(7/8)^59 = 3.8e-4` per transmission start against the arm's own 6.0 starts per
+window — so a single 15 s window reproduces the field's worst case roughly once
+in **440** runs. That is an order of magnitude rarer than the 1-in-49 the
+all-bursts rate gave, and the direction is the safe one: the corrected model
+makes the field's worst case *rarer*, not shorter, because the alignment changes
+how often a burst costs a rung and not what a rung costs. What remains
+assumption in that number is the step (300 ms, so "3205 ms" means 10 rungs — at
+the field's 1 s retransmission floor the same 3205 ms is 3 rungs and an
+18-datagram burst, `6.0 * (7/8)^17 = 0.63` per window) and the transfer of the
+arm's own datagram mix and round count to the field's path, which carries a
+proxy chain and a real link rather than this in-process model. Three parts of
+the field's regime are outside this
 arm and are claimed by nothing here: its **floor** (the arm's link is
 `latency: 25 ms` with `jitter: 100 ms`, the impairment draws `latency +
 U(-jitter, +jitter)` clamped at zero, and one run's own c2s one-way readings
-were 80 % under 1 ms with a body p50 near 0.3 ms, where the field's *minimum*
-round trip is 190 ms), its **shape** (no bulk lane, no proxy chain, an
+were 80 % under 1 ms with a body p50 near 0.3 ms — which is **not** a missing
+impairment, and this revision measured the difference: the same window's own c2s
+counter reads 5502 delayed of 8957 forwarded, i.e. the impairment applied to
+61 % of datagrams, against `P(delay > 0) = 0.625`. Why the *frame's* visible
+one-way is nonetheless ~0 is unattributed: the obvious mechanism, "the peer
+reassembles a frame from whichever of its `m` copies arrives first, so its
+one-way is the minimum of `m` draws", does not fit the measurement (`m` copies
+predict `P(min > 0) = 0.625^m = 6 %` at `m = 6`, and the arm reads p50 0.11 ms
+and p90 25.7 ms where that mechanism predicts p90 0) — but the field's *minimum*
+round trip is 190 ms), its **shape**
+(no bulk lane, no proxy chain, an
 in-process modelled link rather than the field's real path) and its **step**
 (the rung here is the 300 ms `TAIL_PROBED_MIN_RTO` floor, where the field's
 records include 1 s-floor ladders up to 5315 ms). The `field_rtt` arm above
