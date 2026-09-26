@@ -2558,6 +2558,16 @@ const INTERACTIVE_WIRE_BUDGET_X: u64 = 6;
 ///
 /// Counts belong in the default gate (the constitution's tier rule), so this
 /// gate is **not** `#[ignore]`d: it runs on every `cargo test -p rtp_mux`.
+///
+/// The wire check is **two-sided**: the budget bounds it from above, and the
+/// offered payload bounds it from below. The floor is a true invariant, not a
+/// measurement expectation. The asserted `received == sent` means every one of
+/// the `sent` `MSG_BYTES`-byte messages was delivered, and every byte of a
+/// delivered message crossed the interactive pair's client->server path, so the
+/// forwarded-byte sum is at least the delivered payload (the `b"L"` stream tag
+/// and per-datagram framing only add). A `wire` reading below `offered`
+/// therefore cannot describe a correct run; it describes an observation that was
+/// never taken (a counter left at zero), which an upper bound alone cannot see.
 #[tokio::test(flavor = "multi_thread")]
 async fn jitter_duallane_constitution_gate() {
     let label = "duallane_constitution/both";
@@ -2581,6 +2591,11 @@ async fn jitter_duallane_constitution_gate() {
         wire <= offered * INTERACTIVE_WIRE_BUDGET_X,
         "[{label}] interactive c2s wire {wire} bytes exceeds the {INTERACTIVE_WIRE_BUDGET_X}x offered-payload budget ({} bytes): redundant wire must not inflate unboundedly (measured {:.2}x)",
         offered * INTERACTIVE_WIRE_BUDGET_X,
+        wire as f64 / offered as f64,
+    );
+    assert!(
+        wire >= offered,
+        "[{label}] interactive c2s wire {wire} bytes is below the {offered}-byte offered payload (measured {:.2}x): the delivered messages crossed this path, so a wire observation under the payload is an observation that was never taken, not a low-redundancy run",
         wire as f64 / offered as f64,
     );
     eprintln!(
@@ -2640,6 +2655,11 @@ async fn jitter_duallane_constitution_gate_p99() {
             wire <= offered * INTERACTIVE_WIRE_BUDGET_X,
             "[{label}] interactive c2s wire {wire} bytes exceeds the {INTERACTIVE_WIRE_BUDGET_X}x offered-payload budget ({} bytes): redundant wire must not inflate unboundedly (measured {:.2}x)",
             offered * INTERACTIVE_WIRE_BUDGET_X,
+            wire as f64 / offered as f64,
+        );
+        assert!(
+            wire >= offered,
+            "[{label}] interactive c2s wire {wire} bytes is below the {offered}-byte offered payload (measured {:.2}x): the delivered messages crossed this path, so a wire observation under the payload is an observation that was never taken, not a low-redundancy run",
             wire as f64 / offered as f64,
         );
         assert_eq!(

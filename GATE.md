@@ -82,7 +82,11 @@ either sees the whole constitution:
    aggregate wire must not grow by more than ~+64 %). The budget does not
    bound one message's redundancy: a fully-armored lone interactive tail is
    `primary + 5 copies` = six datagrams carrying the same 256 B payload, so
-   it alone costs at least the whole budget before framing. Asserted by
+   it alone costs at least the whole budget before framing. The check is
+   **two-sided**: the floor `wire >= offered` is asserted alongside the budget,
+   because the messages whose delivery the same arm asserts must have crossed
+   that path — a zeroed or unobserved wire counter reads as a pass against the
+   upper bound alone. Asserted by
    `rtp_mux_jitter::jitter_duallane_constitution_gate` (**default tier** —
    both quantities are deterministic counts, and counts belong in the gate
    that always runs); it runs on every `cargo test -p rtp_mux`. The offered
@@ -148,8 +152,8 @@ short run still carries thousands of samples per cadence arm; the run is ~3
 minutes, and `MANDATE_SMOKE_QUICK=1` takes the shortest windows.
 
 M1 asserts the mandate-1 bound (p99 `<= 250 ms` and zero samples `> 250 ms`) on
-`clean`; M2 asserts the mandate-2 bound (`delivery == 1.000`, own-wire `<= 6x`)
-on `clean`; M3 asserts the mandate-3 floor (`>= 0.35x` of the configured link
+`clean`; M2 asserts the mandate-2 bound (`delivery == 1.000`,
+`offered <= own-wire <= 6x`) on `clean`; M3 asserts the mandate-3 floor (`>= 0.35x` of the configured link
 rate) as the within-run delivered/shaper-forwarded fraction, median of three.
 Those bounds and their derivations are the ones stated above; the smoke set
 does not restate them.

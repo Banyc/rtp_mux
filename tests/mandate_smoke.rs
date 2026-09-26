@@ -1113,8 +1113,8 @@ fn m2_rows(runs: &[ArmRun]) -> Vec<(String, String, f64, f64)> {
 
 /// Mandate 2: the interactive lane delivers what it is offered without
 /// inflating its own wire. The clean arm asserts the mandate bound
-/// (`delivery == 1.000`, own-wire `<= 6x`); the hostile arms assert the
-/// regression guards.
+/// (`delivery == 1.000`, `offered <= own-wire <= 6x`); the hostile arms
+/// assert the regression guards.
 #[tokio::test(flavor = "multi_thread")]
 async fn m2_interactive_delivery_and_wire() {
     let _serial = SERIAL.lock().await;
@@ -1156,6 +1156,12 @@ async fn m2_interactive_delivery_and_wire() {
         "[M2] clean-arm interactive c2s wire {} bytes is {:.2}x the offered {} bytes, over the {M2_WIRE_BUDGET_X}x own-wire budget: redundant wire must not inflate unboundedly",
         clean.int_c2s_wire_bytes,
         clean.wire_x,
+        clean.offered_bytes,
+    );
+    assert!(
+        clean.int_c2s_wire_bytes >= clean.offered_bytes,
+        "[M2] clean-arm interactive c2s wire {} bytes is below the {} bytes offered: the messages asserted delivered above crossed this path, so a wire observation under the payload is an observation that was never taken, not a low-redundancy run",
+        clean.int_c2s_wire_bytes,
         clean.offered_bytes,
     );
     assert!(
