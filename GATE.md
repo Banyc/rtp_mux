@@ -126,8 +126,8 @@ holds when several flows share it.
 The one command that measures all three mandates together and leaves
 machine-checkable evidence is the `mandate_smoke` target; `tools/mandate-check`
 (`crates/netem_test/tools/mandate-check`) runs it, renders one panel per
-mandate, prints a verdict block and writes `mandate-check.json` and the six
-`M1/M2/M3.json`/`.csv` evidence files:
+mandate, prints a verdict block and writes `mandate-check.json` and the
+evidence files (`M1/M2/M3/M4.json`/`.csv`):
 
 ```sh
 cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture
@@ -190,6 +190,69 @@ latency, inflate the wire, drop a delivery, starve the bulk lane — and the
 gate fails naming the mandate); the harness must not restate this
 constitution.
 
+### M4: the interactive lane's split across several flows
+
+M1 and M2 each measure **one** interactive flow, so a mandate result obtained
+by starving one of several flows sharing the interactive lane would pass all
+three mandates. `mandate_smoke::m4_interactive_lane_fairness` closes that. The
+arm is the M1/M2 `clean` interactive lane — the production
+`LaneRtpConfig::frame_reordering(true, prompt)` lane, the same tagged-stream
+sink (`spawn_tagged_stream_sink`, which buckets every sample by its stream's
+first-byte tag exactly as the two-interactive battery does) and the same
+`send_timestamped_messages` offer — carrying **four** interactive streams
+(`M4_FLOWS`) instead of one, each offered the same 256 B payload at the same
+~5 ms cadence, each attributed by its own tag. Every flow's delivered bytes and
+latency are measured; the bulk lane is connected (the topology is the
+production dual-lane one) but carries no stream, so the quantity measured is
+the interactive lane's own split, which no other arm measures. A second arm
+repeats the multi-flow offer on the M1/M2 `hostile` link.
+
+Four quantities, asserted on both arms unless the row says otherwise:
+
+| quantity | measured (M4's own runs) | bound (derived) |
+| --- | --- | --- |
+| per-flow delivery (`received_i / offered_i`) | 1.000 on every flow of both arms, 29 runs | `>= 0.995` (no starvation) |
+| fair-share imbalance `max_i \|share_i − 1/N\| / (1/N)`, `share_i` = flow `i`'s share of the lane's delivered bytes | `0.46 %` (clean worst), `0.43 %` (hostile worst) | `1 %` (2.2× the worst measured, so a change that at least doubles the imbalance fails) |
+| clean-arm p99 spread `max p99 / min p99` | `1.20×` (36 runs, both windows) | `2×` (1.67× the worst measured) |
+| hostile-arm per-flow p99 | `<= 423 ms` | M1's hostile p99 regression guard (item 1's row above; not restated) |
+
+The imbalance bound's derivation in full: one delivered frame is
+`1 / (4 × 2064) = 0.012 %` of the lane, i.e. `0.048 %` of the equal share, so
+the measured skew is a handful of frames of connection ramp at the window
+edges; the `1 %` bound is 2.2× the worst of 29 runs and cannot be reached by
+frame-edge ramp. The share statistic is blind to a scheduler bias that is
+hidden by an idle lane (with equal offers and delivery at 1.000 every share
+would be equal however the frames were ordered), which is why the clean arm
+also asserts a **fair-latency** bound: no flow's p99 may exceed the best flow's
+p99 by more than `2×`. That bound is deliberately not asserted on the hostile
+arm, where the per-flow p99 differences are a GE loss realization rather than a
+scheduler property (that arm measured a spread of up to `2.93×` across 10
+runs); the hostile arm keeps M1's absolute guard instead.
+
+M4 **reports** rather than asserts the absolute interactive ceiling: the
+4-flow clean arm measures p99 179–231 ms — `0.72–0.92` of M1's ceiling — so an
+absolute per-flow assertion there would sit within 1.1× of the arm's own
+measurement and fire on host noise. M1 remains the authority for the ceiling,
+the M4 latency panel draws it, and the `MANDATE M4` line prints
+`clean_p50_max`/`clean_p99_max`/`hostile_p99_max`, so a multi-flow latency
+regression is visible in the evidence and in the verdict line. The arm's own
+cost is the queueing delay of four flows behind the shared interactive window
+(p50 24 ms, p90 155 ms, p99 180 ms on the 12 s window where the one-flow arm
+sits at the 25 ms floor): the split is fair, and the lane's latency budget
+under 4× multiplexing is the finding that number carries.
+
+M4 is **default tier** (not `#[ignore]`d): its asserted quantities are counts
+and shares over a seeded link, the same class as the mandate-2 constitution
+gate, and its ~31 s wall-clock belongs in the gate that always runs. The
+measurement is part of the one command above — M4's evidence is `M4.json` plus
+four panels (per-flow shares against the fair-share line, per-flow departure
+from it against the ±bound, per-flow delivery against the floor, and per-flow
+p50/p99 against M1's ceiling). The two vacuity demonstrations are
+`MANDATE_SMOKE_FAULT=M4_starve` (flow 0 is offered the whole window and the
+rest only its second half: the fair-share bound fails naming M4 at 0.70
+imbalance) and `MANDATE_SMOKE_FAULT=M4_drop` (90 % loss on the clean link: the
+per-flow delivery floor fails naming M4).
+
 ## Tiers
 
 - **default** — not `#[ignore]`d, so a plain `cargo test -p rtp_mux` runs it.
@@ -245,6 +308,7 @@ rtp_mux_jitter::jitter_duallane_constitution_gate
 mandate_smoke::m1_interactive_tail_latency
 mandate_smoke::m2_interactive_delivery_and_wire
 mandate_smoke::m3_bulk_goodput_fraction
+mandate_smoke::m4_interactive_lane_fairness
 mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
 mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
 mux_over_rtp::mux_over_rtp_over_netem_clean_link_echoes
@@ -474,6 +538,7 @@ rtp_mux_jitter::jitter_duallane_constitution_gate_p99
 mandate_smoke::m1_interactive_tail_latency
 mandate_smoke::m2_interactive_delivery_and_wire
 mandate_smoke::m3_bulk_goodput_fraction
+mandate_smoke::m4_interactive_lane_fairness
 ```
 
 ## Perf-tier reach into asserting helpers

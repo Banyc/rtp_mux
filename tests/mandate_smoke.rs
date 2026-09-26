@@ -57,12 +57,34 @@
 //!
 //! The regression bounds and their derivation are recorded in `GATE.md`; the
 //! constants below carry a one-line pointer rather than restating it.
+//!
+//! # M4: the interactive lane's split across several flows
+//!
+//! M1 and M2 measure one interactive flow, so a mandate result obtained by
+//! starving one of several flows sharing the interactive lane would pass them.
+//! **M4** closes that: `M4_FLOWS` interactive flows are multiplexed on ONE
+//! interactive lane (the same production `LaneRtpConfig::frame_reordering`
+//! lane as M1/M2's clean arm), each offering the same payload at the same
+//! cadence, and the arm asserts the outcome pair the fairness mandate names —
+//! **no starvation** (every flow delivers what it is offered) and **fair
+//! share** (no flow's share of the lane's delivered bytes departs from the
+//! equal share by more than [`M4_IMBALANCE_BOUND`]) — plus a fair-latency bound
+//! (no flow's p99 exceeds the best flow's p99 by more than
+//! [`M4_LATENCY_SPREAD_BOUND`] on the clean arm, the dimension the share
+//! statistic cannot see; the hostile arm keeps M1's absolute guard).
+//! The per-flow latencies are reported and the panel draws M1's ceiling, so a
+//! fair-but-slow split is visible; M1 remains the authority for the absolute
+//! interactive ceiling. The statistic, its derived
+//! bound and the arms are stated in `rtp_mux/GATE.md` ("Performance"), one
+//! authority with the rest of the mandate bounds; the constants below carry a
+//! pointer, not a restatement.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::future::join_all;
 use mux::LaneClass;
 use netem_test::kit::payload::{cyclic_payload, with_timeout};
 use netem_test::kit::presets::gilbert_elliott_loss;
@@ -211,7 +233,8 @@ fn out_dir() -> PathBuf {
 }
 
 /// The deliberate-fault selector used only by the vacuity demonstrations:
-/// `M1_latency`, `M2_wire`, `M2_delivery` or `M3_starve`. Unset in every real
+/// `M1_latency`, `M2_wire`, `M2_delivery`, `M3_starve`, `M4_starve` or
+/// `M4_drop`. Unset in every real
 /// run (the runner never sets it). Faults perturb an arm's *input* — the
 /// impairment or the offered payload — never the assertion, so the failure is
 /// produced by the measurement path.
@@ -1242,4 +1265,592 @@ async fn m3_bulk_goodput_fraction() {
         "[M3] median bulk goodput fraction {median:.3} < the {M3_CAPACITY_FRACTION} floor (delivered {delivered_median:.3} MiB/s of the {:.3} MiB/s configured link rate; per-rep fractions {fractions:?}): the bulk lane must keep a high fraction of its link's capacity on the dual-lane topology",
         reps[0].capacity_mib_s,
     );
+}
+
+// ───────────────────────── M4: interactive lane fairness ─────────────────────
+//
+// M1 and M2 measure ONE interactive flow. A mandate result achieved by
+// starving one of several flows sharing the interactive lane is not a pass, so
+// M4 measures the *split* of the same production interactive lane across
+// several flows offering the same payload at the same cadence: every flow must
+// deliver what it is offered (no starvation), no flow's share of the lane's
+// delivered bytes may depart from the equal share by more than the bound
+// derived in `rtp_mux/GATE.md` (fair share), and no flow's p99 may depart from
+// its peers' the way the share statistic cannot see. The per-flow latencies
+// are also reported and drawn against M1's own ceiling, so a result that is
+// fair and slow is visible; M1 stays the authority for that ceiling.
+//
+// The arm is the M1/M2 `clean` interactive lane with `M4_FLOWS` interactive
+// streams on it instead of one, and the second arm is the M1/M2 `hostile`
+// impairment with the same multi-flow offer — the same link, the same tagged-
+// stream sink (`spawn_tagged_stream_sink` buckets every sample by the flow's
+// first-byte tag as it already does for the two-interactive battery), the same
+// `send_timestamped_messages` offer. The bulk lane is connected (the topology
+// is the production dual-lane one) but carries no stream: M4 isolates the
+// interactive lane's own split, which is the quantity the mandate-3 arms do
+// not measure.
+
+/// The interactive flows multiplexed on the one interactive lane. Four is the
+/// smallest count that makes an unfair split a *share* rather than a binary
+/// win/lose, and it is the count the existing 4-flow scaling probe uses, so a
+/// skew seen here is comparable with that arm's per-flow floors.
+const M4_FLOWS: usize = 4;
+
+/// The per-flow delivery floor. Derived from M4's own measurement (GATE.md):
+/// both arms delivered every offered message on every flow across the 29 runs
+/// the bound is derived from, so the floor carries the same slack M2's hostile
+/// floor uses -- a flow that loses more than ~0.5 % of its own offer is
+/// starved, while ordinary tail-repair jitter never trips it.
+const M4_DELIVERY_FLOOR: f64 = 0.995;
+
+/// The fair-share imbalance bound: the worst flow's share of the lane's
+/// delivered bytes may not depart from the equal share `1/M4_FLOWS` by more
+/// than this fraction of the equal share. Derived from M4's own measurement
+/// (GATE.md): across the 29 runs the bound is derived from, the worst
+/// departure was `0.46 %` (clean arm; hostile `0.43 %`), while one
+/// delivered frame is `1 / (4 x 2064) = 0.012 %` of the lane -- `0.048 %` of
+/// the equal share -- so the observed skew is a handful of frames of
+/// connection ramp at the window edges. The bound is `2.2x` the worst measured
+/// departure, so a change that at least doubles the imbalance fails while
+/// frame-edge ramp cannot reach it.
+const M4_IMBALANCE_BOUND: f64 = 0.01;
+
+/// The fair-latency bound: the worst flow's p99 may not exceed the best flow's
+/// p99 by more than this factor, asserted on the **clean** arm. Derived from
+/// M4's own measurement (GATE.md): over the 36 clean-arm runs the bound is
+/// derived from (both windows) the worst spread was `1.20x`, so the bound is
+/// `1.67x` the worst measured spread. It asserts the dimension the share
+/// statistic cannot see: with equal offers and per-flow delivery at 1.000, a
+/// scheduler that favours one flow's *ordering* rather than its goodput would
+/// show up here and not in the shares. It is deliberately **not** asserted on
+/// the hostile arm, where the per-flow p99 differences are a GE loss
+/// realization rather than a scheduler property: that arm measured a spread of
+/// up to `2.93x` across 10 runs, so an asserted spread there would measure
+/// which flow caught the burst. The hostile arm keeps M1's absolute guard.
+const M4_LATENCY_SPREAD_BOUND: f64 = 2.0;
+
+/// The per-flow tag byte, the same A/L/C/D convention the multi-flow scaling
+/// probe uses (`b'B'` is the reserved bulk-sink tag, so it is skipped). The
+/// server's tagged sink routes every interactive-lane stream through its
+/// latency parser and labels each sample with the stream's tag, which is what
+/// makes per-flow attribution possible.
+fn m4_flow_tag(flow: usize) -> u8 {
+    match flow {
+        0 => b'A',
+        1 => b'L',
+        _ => b'A' + flow as u8,
+    }
+}
+
+/// One M4 arm: the production interactive lane, `M4_FLOWS` flows offering the
+/// same payload at the same cadence, and the impairment the clean/hostile arms
+/// already use.
+struct FairArmSpec {
+    name: &'static str,
+    int_c2s: NetemConfig,
+    int_s2c: NetemConfig,
+    window: Duration,
+    /// The preferential-service fault injection: every flow but the first
+    /// starts offering this long into the window (zero in every real run).
+    stagger: Duration,
+}
+
+/// One flow's measured outcome: what it offered, what the lane delivered for
+/// it, its share of the lane's delivered bytes, and its latency summary.
+struct FlowSample {
+    tag: u8,
+    sent: u64,
+    received: u64,
+    offered_bytes: u64,
+    delivered_bytes: u64,
+    share: f64,
+    summary: HolSummary,
+}
+
+/// One M4 arm's outcome, plus the aggregate statistic the fair-share bound is
+/// asserted on.
+struct FairRun {
+    name: &'static str,
+    flows: Vec<FlowSample>,
+    ideal_share: f64,
+    min_share: f64,
+    max_share: f64,
+    /// The worst flow's relative departure from the equal share:
+    /// `max_i |share_i - 1/N| / (1/N)`. Zero means every flow received exactly
+    /// its equal share of the lane's delivered bytes; it is the statistic the
+    /// fair-share bound is derived from.
+    imbalance: f64,
+    window: Duration,
+    wall: Duration,
+}
+
+/// The fairness window. The share statistic's resolution is one delivered
+/// frame: `1 / (M4_FLOWS x frames-per-flow)` of the lane, and the flows are
+/// opened in sequence and each runs its own 5 ms interval, so their frame
+/// counts differ by a few frames of connection ramp. At the arms' 12 s window
+/// that structural skew measured under 0.5 %, but at a 4 s window it reached
+/// the 1 % bound on a handful of frames alone, so M4's quick window is longer
+/// than the other mandates' (still well under the full 12 s).
+const M4_QUICK_WINDOW: Duration = Duration::from_secs(8);
+
+fn fairness_window() -> Duration {
+    if quick() { M4_QUICK_WINDOW } else { WINDOW }
+}
+
+/// The M4 arm set. `clean` is the mandate arm (M1/M2's clean interactive link)
+/// and carries the fault injection when one is selected; `hostile` is the
+/// regression-guard arm (M1/M2's GE `5 %`/mean-8 + 100 ms-jitter link).
+fn fairness_arms(mandate: &str) -> Vec<FairArmSpec> {
+    let clean_fault = fault(mandate);
+    let mut clean_c2s = link(41, OWD, JITTER, LOSS_2, 0);
+    let mut clean_s2c = link(42, OWD, JITTER, LOSS_2, 0);
+    let mut stagger = Duration::ZERO;
+    if let Some(fault) = clean_fault.as_deref() {
+        match fault {
+            // Serve one flow preferentially: flows 1.. offer only the second
+            // half of the window, so the lane's delivered bytes concentrate on
+            // flow 0 and the fair-share bound must fail while every flow still
+            // delivers everything it offers.
+            "M4_starve" => stagger = fairness_window() / 2,
+            // Collapse every flow's delivery: the per-flow delivery floor must
+            // fail naming M4.
+            "M4_drop" => {
+                clean_c2s.loss = loss_pct(99);
+                clean_s2c.loss = loss_pct(99);
+            }
+            _ => {}
+        }
+    }
+    vec![
+        FairArmSpec {
+            name: "clean",
+            int_c2s: clean_c2s,
+            int_s2c: clean_s2c,
+            window: fairness_window(),
+            stagger,
+        },
+        FairArmSpec {
+            name: "hostile",
+            int_c2s: hostile_link(41),
+            int_s2c: hostile_link(42),
+            window: fairness_window(),
+            stagger: Duration::ZERO,
+        },
+    ]
+}
+
+/// Run one fairness arm: `M4_FLOWS` interactive streams on ONE interactive
+/// lane, all tagged, all offered the same `MSG_BYTES` payload at `CADENCE` for
+/// `window`, all drained by one collector that buckets the tagged sink's
+/// samples per flow.
+async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
+    let FairArmSpec {
+        name,
+        int_c2s,
+        int_s2c,
+        window,
+        stagger,
+    } = spec;
+    let wall = Instant::now();
+    let int_rtp = LaneRtpConfig::frame_reordering(true, prompt_tuning());
+    let bulk_rtp = LaneRtpConfig::production_bulk();
+    let base = Instant::now();
+    let mut tasks = TestScope::new();
+    let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+    let outcome = tasks
+        .run(async {
+            let (int_addr, bulk_addr, mut latencies, _bulk_counter, _sink_streams) =
+                spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via(
+                    &task_tx, base, int_rtp, bulk_rtp,
+                )
+                .await
+                .unwrap();
+            let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+            // The bulk lane is connected (the production topology pairs both
+            // lanes at connect) but never opened: M4 measures the interactive
+            // lane's own split.
+            let bulk_pair =
+                NetemPair::spawn(bulk_addr, NetemConfig::default(), NetemConfig::default())
+                    .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                int_rtp,
+                bulk_rtp,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            // One collector drains the shared tagged channel for the whole arm,
+            // keeping `(tag, elapsed, latency)` so each sample is attributable
+            // to its flow: the sink's channel is bounded and a lane carrying N
+            // flows produces N times the sample rate.
+            let collector = Arc::new(Mutex::new(Vec::<(u8, f64, f64)>::new()));
+            let collector_sink = Arc::clone(&collector);
+            let task_tx_collector = task_tx.clone();
+            submit_test_task(
+                &task_tx_collector,
+                Box::pin(async move {
+                    while let Some((tag, latency)) = latencies.recv().await {
+                        collector_sink.lock().unwrap().push((
+                            tag,
+                            base.elapsed().as_secs_f64(),
+                            latency,
+                        ));
+                    }
+                }),
+            );
+
+            let mut streams = Vec::with_capacity(M4_FLOWS);
+            for flow in 0..M4_FLOWS {
+                let (mut read, write) = opener.open(LaneClass::Interactive).await.unwrap();
+                // Parked until the streams close; the owning scope aborts them.
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; 8 * 1024];
+                        while let Ok(n) = read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }),
+                );
+                streams.push((m4_flow_tag(flow), write));
+            }
+
+            // Tag first, then offer every flow *concurrently*: the arm is N
+            // flows multiplexed on one lane, not N sequential sweeps. In every
+            // real run `delay` is zero and every flow offers for the whole
+            // window; the preferential-service fault gives flow 0 the whole
+            // window while the rest offer only its second half, so the lane's
+            // delivered bytes concentrate on flow 0.
+            let mut futs = Vec::with_capacity(M4_FLOWS);
+            for (index, (tag, write)) in streams.iter_mut().enumerate() {
+                if write.write_all(&[*tag]).await.is_err() {
+                    return (vec![0u64; M4_FLOWS], Vec::new());
+                }
+                let delay = if index == 0 { Duration::ZERO } else { stagger };
+                let run_for = window.saturating_sub(delay);
+                let write = &mut *write;
+                futs.push(async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    send_timestamped_messages(write, base, MSG_BYTES, CADENCE, run_for).await
+                });
+            }
+            let sent_per_flow: Vec<u64> = join_all(futs).await;
+            for (_, write) in streams.iter_mut() {
+                let _ = write.shutdown();
+            }
+
+            tokio::time::sleep(GRACE).await;
+            let collected = std::mem::take(&mut *collector.lock().unwrap());
+            int_pair.stop();
+            bulk_pair.stop();
+            (sent_per_flow, collected)
+        })
+        .await;
+    let (sent_per_flow, collected) = outcome;
+
+    let mut per_flow_samples: Vec<Vec<f64>> = vec![Vec::new(); M4_FLOWS];
+    for (tag, _elapsed, latency) in collected {
+        if let Some(flow) = (0..M4_FLOWS).find(|&i| m4_flow_tag(i) == tag) {
+            per_flow_samples[flow].push(latency);
+        }
+    }
+    let delivered: Vec<u64> = per_flow_samples
+        .iter()
+        .map(|samples| samples.len() as u64 * MSG_BYTES as u64)
+        .collect();
+    let total_delivered: u64 = delivered.iter().sum();
+    let ideal_share = 1.0 / M4_FLOWS as f64;
+    let mut flows = Vec::with_capacity(M4_FLOWS);
+    for flow in 0..M4_FLOWS {
+        let sent = sent_per_flow[flow];
+        let received = per_flow_samples[flow].len() as u64;
+        let offered_bytes = sent.saturating_mul(MSG_BYTES as u64);
+        let share = if total_delivered == 0 {
+            0.0
+        } else {
+            delivered[flow] as f64 / total_delivered as f64
+        };
+        let summary = summarize(per_flow_samples[flow].clone(), sent, received, 0, 0.0);
+        flows.push(FlowSample {
+            tag: m4_flow_tag(flow),
+            sent,
+            received,
+            offered_bytes,
+            delivered_bytes: delivered[flow],
+            share,
+            summary,
+        });
+    }
+    let min_share = flows.iter().map(|f| f.share).fold(f64::INFINITY, f64::min);
+    let max_share = flows.iter().map(|f| f.share).fold(0.0, f64::max);
+    let imbalance = flows
+        .iter()
+        .map(|f| ((f.share - ideal_share) / ideal_share).abs())
+        .fold(0.0, f64::max);
+    FairRun {
+        name,
+        flows,
+        ideal_share,
+        min_share,
+        max_share,
+        imbalance,
+        window,
+        wall: wall.elapsed(),
+    }
+}
+
+fn print_fair_arm(run: &FairRun) {
+    for flow in &run.flows {
+        eprintln!(
+            "[mandate-smoke m4/{name} flow {tag}] sent={sent:>5} recv={recv:>5} \
+             delivery={del:.3} share={share:.4} offered={offered:>8}B delivered={delivered:>8}B \
+             p50={p50:7.1} p90={p90:7.1} p99={p99:7.1} max={max:8.1}",
+            name = run.name,
+            tag = flow.tag as char,
+            sent = flow.sent,
+            recv = flow.received,
+            del = flow.summary.delivery_pct,
+            share = flow.share,
+            offered = flow.offered_bytes,
+            delivered = flow.delivered_bytes,
+            p50 = flow.summary.p50,
+            p90 = flow.summary.p90,
+            p99 = flow.summary.p99,
+            max = flow.summary.max,
+        );
+    }
+    eprintln!(
+        "[mandate-smoke m4/{name}] ideal_share={ideal:.4} min_share={min:.4} max_share={max:+.4} \
+         imbalance={imbalance:.4} window={window:?} wall={wall:.1}s",
+        name = run.name,
+        ideal = run.ideal_share,
+        min = run.min_share,
+        max = run.max_share,
+        imbalance = run.imbalance,
+        window = run.window,
+        wall = run.wall.as_secs_f64(),
+    );
+}
+
+// ────────────────────────── M4: evidence writing ─────────────────────────────
+
+fn m4_declaration() -> String {
+    let ideal = 1.0 / M4_FLOWS as f64;
+    let ideal_pct = ideal * 100.0;
+    let bound_pct = M4_IMBALANCE_BOUND * 100.0;
+    let bound = M4_IMBALANCE_BOUND;
+    let flows = M4_FLOWS;
+    let delivery_floor = M4_DELIVERY_FLOOR;
+    let ceiling = M1_CEILING_MS;
+    // The fair-share line is drawn on the share panel; the floor is the same
+    // line pulled in by the imbalance bound, so drawing both there overprints
+    // two labels one percent apart. The floor is drawn instead on the imbalance
+    // panel, whose axis is the deviation itself, where the two bounds and every
+    // flow's departure are legible.
+    format!(
+        r#"{{"mandate":"M4","title":"M4 interactive lane fairness: {flows} flows on one interactive lane","x_label":"flow (1..{flows})","y_label":"share of the lane's delivered bytes","panels":[{{"id":"shares","chart":"bar","series":[{{"name":"clean"}},{{"name":"hostile"}}],"bounds":[{{"y":{ideal:.6},"label":"fair share {ideal_pct:.1}%"}}]}},{{"id":"imbalance","chart":"bar","y_label":"departure from the fair share","x_label":"flow (1..{flows})","series":[{{"name":"clean"}},{{"name":"hostile"}}],"bounds":[{{"y":{bound},"label":"fair-share bound \u00b1{bound_pct:.1}%"}}]}},{{"id":"delivery","chart":"bar","y_label":"delivery (received / offered)","series":[{{"name":"clean"}},{{"name":"hostile"}}],"bounds":[{{"y":{delivery_floor},"label":"M4 per-flow delivery floor {delivery_floor}"}}]}},{{"id":"latency","chart":"bar","y_label":"latency (ms)","series":[{{"name":"clean_p50"}},{{"name":"clean_p99"}},{{"name":"hostile_p50"}},{{"name":"hostile_p99"}}],"bounds":[{{"y":{ceiling},"label":"M1 ceiling {ceiling} ms"}}]}}]}}"#
+    )
+}
+
+fn m4_rows(runs: &[FairRun]) -> Vec<(String, String, f64, f64)> {
+    let mut rows = Vec::new();
+    for run in runs {
+        for (index, flow) in run.flows.iter().enumerate() {
+            let x = (index + 1) as f64;
+            rows.push(("shares".to_owned(), run.name.to_owned(), x, flow.share));
+            rows.push((
+                "imbalance".to_owned(),
+                run.name.to_owned(),
+                x,
+                (flow.share - run.ideal_share) / run.ideal_share,
+            ));
+            rows.push((
+                "delivery".to_owned(),
+                run.name.to_owned(),
+                x,
+                flow.summary.delivery_pct,
+            ));
+            rows.push((
+                "latency".to_owned(),
+                format!("{}_p50", run.name),
+                x,
+                flow.summary.p50,
+            ));
+            rows.push((
+                "latency".to_owned(),
+                format!("{}_p99", run.name),
+                x,
+                flow.summary.p99,
+            ));
+        }
+    }
+    rows
+}
+
+/// Mandate 4: the interactive lane's split across several flows. Every flow
+/// must deliver what it is offered (no starvation), no flow's share of the
+/// lane's delivered bytes may depart from the equal share by more than
+/// [`M4_IMBALANCE_BOUND`] (fair share), the clean arm's worst flow's p99 may
+/// not exceed the best flow's p99 by more than [`M4_LATENCY_SPREAD_BOUND`]
+/// (fair latency), and no hostile-arm flow's p99 may cross M1's hostile guard. The absolute
+/// interactive ceiling is **not** re-asserted per flow here: the 4-flow arm
+/// measures p99 179-231 ms, 0.72-0.92 of M1's 250 ms ceiling, so an absolute
+/// per-flow assertion would sit within 1.1x of the arm's own measurement and
+/// fire on host noise. M1 owns the ceiling, the M4 latency panel draws it, and
+/// the `MANDATE M4` line reports `clean_p99_max` -- which is what makes a
+/// multi-flow latency regression visible.
+#[tokio::test(flavor = "multi_thread")]
+async fn m4_interactive_lane_fairness() {
+    let _serial = SERIAL.lock().await;
+    let dir = out_dir();
+    let arms = fairness_arms("M4");
+    let mut runs = Vec::new();
+    for spec in arms {
+        let label = format!("m4/{}", spec.name);
+        let run = with_timeout(Duration::from_secs(120), &label, run_fairness_arm(spec)).await;
+        print_fair_arm(&run);
+        runs.push(run);
+    }
+    write_evidence(&dir, "M4", &m4_declaration(), &m4_rows(&runs));
+
+    let clean = &runs[0];
+    let hostile = &runs[1];
+    let delivery_floor_of = |run: &FairRun| {
+        run.flows
+            .iter()
+            .map(|f| f.summary.delivery_pct)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let p99_floor_of = |run: &FairRun| {
+        run.flows
+            .iter()
+            .map(|f| f.summary.p99)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let p99_ceiling_of =
+        |run: &FairRun| run.flows.iter().map(|f| f.summary.p99).fold(0.0, f64::max);
+    let p50_ceiling_of =
+        |run: &FairRun| run.flows.iter().map(|f| f.summary.p50).fold(0.0, f64::max);
+    let clean_floor = delivery_floor_of(clean);
+    let hostile_floor = delivery_floor_of(hostile);
+    // A flow that delivered nothing has no p99, so the spread is undefined
+    // (`summarize` yields NaN). Report 0 instead of NaN so the verdict line
+    // stays machine-parseable: the per-flow delivery floor is what names such a
+    // run, and it fires before this statistic is even reached.
+    let spread_of = |run: &FairRun| {
+        let floor = p99_floor_of(run);
+        let ceiling = p99_ceiling_of(run);
+        if floor.is_finite() && floor > 0.0 {
+            ceiling / floor
+        } else {
+            0.0
+        }
+    };
+    let clean_spread = spread_of(clean);
+    let hostile_spread = spread_of(hostile);
+    let clean_p99_max = p99_ceiling_of(clean);
+    let clean_p50_max = p50_ceiling_of(clean);
+    let hostile_p99_max = p99_ceiling_of(hostile);
+    let wall = clean.wall.as_secs_f64() + hostile.wall.as_secs_f64();
+    let pass = clean_floor >= M4_DELIVERY_FLOOR
+        && hostile_floor >= M4_DELIVERY_FLOOR
+        && clean.imbalance <= M4_IMBALANCE_BOUND
+        && hostile.imbalance <= M4_IMBALANCE_BOUND
+        && clean_spread <= M4_LATENCY_SPREAD_BOUND
+        && hostile_p99_max <= M1_HOSTILE_P99_GUARD_MS;
+    println!(
+        "MANDATE M4 {} flows={} clean_delivery_min={:.3} hostile_delivery_min={:.3} clean_share_min={:.4} clean_share_max={:.4} hostile_share_min={:.4} hostile_share_max={:.4} clean_imbalance={:.4} hostile_imbalance={:.4} imbalance_bound={:.3} fair_share={:.4} delivery_floor={:.3} clean_p99_spread={:.3} hostile_p99_spread={:.3} spread_bound={:.1} clean_p50_max={:.1} clean_p99_max={:.1} hostile_p99_max={:.1} ceiling={:.1} hostile_p99_guard={:.1} window_s={:.1} wall_s={:.1}",
+        verdict(pass),
+        M4_FLOWS,
+        clean_floor,
+        hostile_floor,
+        clean.min_share,
+        clean.max_share,
+        hostile.min_share,
+        hostile.max_share,
+        clean.imbalance,
+        hostile.imbalance,
+        M4_IMBALANCE_BOUND,
+        clean.ideal_share,
+        M4_DELIVERY_FLOOR,
+        clean_spread,
+        hostile_spread,
+        M4_LATENCY_SPREAD_BOUND,
+        clean_p50_max,
+        clean_p99_max,
+        hostile_p99_max,
+        M1_CEILING_MS,
+        M1_HOSTILE_P99_GUARD_MS,
+        clean.window.as_secs_f64(),
+        wall,
+    );
+
+    for (index, flow) in clean.flows.iter().enumerate() {
+        assert!(
+            flow.summary.delivery_pct >= M4_DELIVERY_FLOOR,
+            "[M4] clean-arm flow {} (tag {}) delivered {}/{} messages ({:.3} < the {M4_DELIVERY_FLOOR} floor): a flow sharing the interactive lane was starved of what it offered",
+            index + 1,
+            flow.tag as char,
+            flow.received,
+            flow.sent,
+            flow.summary.delivery_pct,
+        );
+    }
+    for (index, flow) in hostile.flows.iter().enumerate() {
+        assert!(
+            flow.summary.delivery_pct >= M4_DELIVERY_FLOOR,
+            "[M4] hostile-arm flow {} (tag {}) delivered {}/{} messages ({:.3} < the {M4_DELIVERY_FLOOR} floor): a flow sharing the interactive lane was starved of what it offered under the hostile impairment",
+            index + 1,
+            flow.tag as char,
+            flow.received,
+            flow.sent,
+            flow.summary.delivery_pct,
+        );
+    }
+    assert!(
+        clean.imbalance <= M4_IMBALANCE_BOUND,
+        "[M4] clean-arm fair-share breach: the worst flow's share of the lane's delivered bytes departs {:.4} from the equal share {:.4} (shares {:?}), over the {M4_IMBALANCE_BOUND} bound -- one flow is being served preferentially on the shared interactive lane",
+        clean.imbalance,
+        clean.ideal_share,
+        clean.flows.iter().map(|f| f.share).collect::<Vec<_>>(),
+    );
+    assert!(
+        hostile.imbalance <= M4_IMBALANCE_BOUND,
+        "[M4] hostile-arm fair-share breach: the worst flow's share of the lane's delivered bytes departs {:.4} from the equal share {:.4} (shares {:?}), over the {M4_IMBALANCE_BOUND} bound -- one flow is being served preferentially on the shared interactive lane under the hostile impairment",
+        hostile.imbalance,
+        hostile.ideal_share,
+        hostile.flows.iter().map(|f| f.share).collect::<Vec<_>>(),
+    );
+    for (index, flow) in clean.flows.iter().enumerate() {
+        assert!(
+            flow.summary.p99 <= p99_floor_of(clean) * M4_LATENCY_SPREAD_BOUND,
+            "[M4] clean-arm flow {} (tag {}) p99 {:.1} ms is more than {M4_LATENCY_SPREAD_BOUND}x the best flow's p99 {:.1} ms (p50 {:.1}, max {:.1}), over the fair-latency bound -- one flow's tail is being served preferentially",
+            index + 1,
+            flow.tag as char,
+            flow.summary.p99,
+            p99_floor_of(clean),
+            flow.summary.p50,
+            flow.summary.max,
+        );
+    }
+    for (index, flow) in hostile.flows.iter().enumerate() {
+        assert!(
+            flow.summary.p99 <= M1_HOSTILE_P99_GUARD_MS,
+            "[M4] hostile-arm flow {} (tag {}) p99 {:.1} ms exceeds M1's {M1_HOSTILE_P99_GUARD_MS} ms hostile guard (p50 {:.1}, max {:.1}): the known hostile tail defect has at least doubled with several flows on the lane",
+            index + 1,
+            flow.tag as char,
+            flow.summary.p99,
+            flow.summary.p50,
+            flow.summary.max,
+        );
+    }
 }
