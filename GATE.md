@@ -154,6 +154,35 @@ rate) as the within-run delivered/shaper-forwarded fraction, median of three.
 Those bounds and their derivations are the ones stated above; the smoke set
 does not restate them.
 
+The smoke set's three arms all run the deployment's **25 ms one-way** profile
+(~50 ms round trip), which is not the RTT the deployed client sees: the field
+reports a ~190 ms *minimum* round trip. `mandate_smoke::m1_lone_tail_field_rtt`
+(`full` tier, `#[ignore]`d) is the same request/response shape moved onto the
+field's scale — GE `gilbert_elliott_loss(5, 8)` and ~100 ms jitter at a
+`100 ms` one-way delay, one unacked 256 B message at a time, no bulk lane — and
+asserts the two regression guards in the table above. It is a **new arm**: the
+`clean`, `hostile` and `lone_tail` arms keep their impairment, windows,
+cadence and guards untouched, and the arm does not enter `M1`'s panel or
+assertion. Its vacuity demonstration is the input fault
+`MANDATE_SMOKE_FAULT=M1_FIELD_RTT_slow` (+1000 ms one-way on both directions),
+which drives both guards past their bounds from the measurement path.
+
+The arm exists because the tail is **not** RTT-invariant. The lone tail's
+delivery is a repair ladder — a fresh single-symbol message carries a cover of
+copies, and when that cover is consumed each further rung waits a repair
+deadline — and the deadlines that drive it are constants rather than
+RTT-derived values: the tail-loss probe window is floored at the `300 ms`
+`TAIL_PROBED_MIN_RTO` (`rtp/src/traffic_shaping/recovery/tlp.rs`) while the
+subsequent *retransmission* deadline is floored at the `1 s` `MIN_RTO`
+(`rtp/src/traffic_shaping/recovery/rto.rs`). On a ~50 ms path the second floor
+is ~20x the path RTT, so the ladder's step is a whole second per rung and the
+measured rungs sit at 1001 ms; on a ~190 ms path the RTT-derived term and the
+`300 ms` floor bind instead, and the same impairment produces a shorter
+ladder. Measuring only at 50 ms RTT therefore hides the field scale, and this
+arm is the tripwire that keeps it in the battery. The revision-to-revision
+delta in the table is what the landed transport bought at the field's RTT;
+the `1 s` floor is what still dominates at 50 ms.
+
 The `hostile` and `lone_tail` arms carry the product's **known, measured**
 hostile defect — the 1 s `MIN_RTO` repair floor plus exponential backoff (the
 field's GE lone-tail p99 1053–1542 ms, `rtx_rto` 13–38 and `rtx_repeat`
@@ -169,6 +198,9 @@ bounds above (measured X, bound Y, so a change that at least doubles it fails):
 | M1 lone-tail p99 | field 1053–1542 ms (60 s) | `3200 ms` (~2×) |
 | M1 lone-tail p99.9 | 797–1636 ms (15 s arm); field ladder 5315 ms | `8000 ms` (~1.5× the field ladder) |
 | M1 lone-tail `> 250 ms` share | field 2.7 %, smoke 0–0.7 % | `8 %` |
+| M1 field-RTT lone-tail p99 | `rtp v0.0.94`: 427–719 ms; landed `rtp` `bdacf5c0`: 293–432 ms | `1500 ms` (~2.1× the pinned band) |
+| M1 field-RTT lone-tail `> 250 ms` share | `v0.0.94` 3.3–5.6 %; landed 2.6–5.3 % | `15 %` (~2.7×) |
+| M1 field-RTT lone-tail max | `v0.0.94`: 1015–3868 ms; landed: 386–529 ms | not asserted (one sample at n≈200) |
 | M2 hostile own-wire | 4.63–4.81× | `10×` (~2×) |
 | M2 lone-tail own-wire | 6.07–6.41× (15 s), field 6.22–7.17× | `14×` (~2×) |
 | M2 hostile/lone delivery | 1.000 | `0.995` |
@@ -399,6 +431,7 @@ mux_ceiling_probe::probe_mux_sink_4mib_mss8k = standard
 mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = full
 mux_stream_fairness::mux_stream_fairness_longrun = full
 mux_stream_fairness::mux_stream_fairness_sweep = full
+mandate_smoke::m1_lone_tail_field_rtt = full
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
 rtp_mux::rtp_mux_explorer_relays_onto_better_path = full
@@ -518,6 +551,7 @@ mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
 mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf
 mux_stream_fairness::mux_stream_fairness_longrun
 mux_stream_fairness::mux_stream_fairness_sweep
+mandate_smoke::m1_lone_tail_field_rtt
 rtp_and_mux::mux_over_rtp_over_netem_clean_link_echoes
 rtp_and_mux::rtp_over_netem_clean_link_delivers_data
 rtp_and_mux::rtp_over_netem_reliability_survives_mild_loss

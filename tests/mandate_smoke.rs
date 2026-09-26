@@ -179,6 +179,28 @@ const M1_LONE_P999_GUARD_MS: f64 = 8000.0;
 /// M1 lone-tail `> 250 ms` sample-count guard. The field measured up to 2.7 %
 /// and the smoke arm 0-0.7 %; ~3x the field band.
 const M1_LONE_OVER250_GUARD_PCT: f64 = 8.0;
+/// One-way delay of the field-RTT lone-tail arm. The smoke arms above run the
+/// deployment's 25 ms profile (~50 ms round trip); the deployed client reports
+/// a ~190 ms *minimum* round trip, so this arm moves the same request/response
+/// shape onto a ~100 ms one-way path and asks whether the tail follows the
+/// RTT. It does not: the repair ladder's step is a constant (the 1 s
+/// `MIN_RTO` floor, `rtp/src/traffic_shaping/recovery/rto.rs`), not an
+/// RTT-derived value, so the arm only gets *smaller* as the RTT grows.
+const FIELD_RTT_OWD: Duration = Duration::from_millis(100);
+/// M1 field-RTT lone-tail p99 guard. The band spans the two revisions this
+/// crate has run: on the pinned `rtp v0.0.94` three 15 s runs measured p99
+/// 427-719 ms, and on the landed `rtp` dev (`bdacf5c0`) four runs measured
+/// 293-432 ms. The guard clears the top of the *pinned* band at ~2.1x, so a
+/// change that doubles the arm's tail fails on either revision. It is a
+/// regression tripwire, not the 250 ms mandate ceiling, for the same reason
+/// the other impaired arms carry guards: the tail defect is open. The
+/// revision-to-revision delta is recorded in `GATE.md` as the arm's reading of
+/// what the landed transport bought at the field's RTT.
+const M1_FIELD_RTT_P99_GUARD_MS: f64 = 1500.0;
+/// M1 field-RTT lone-tail `> 250 ms` guard. The pinned arm measured 3.3-5.6 %
+/// of samples over the ceiling and the landed arm 2.6-5.3 %; ~2.7x the worst
+/// of the band.
+const M1_FIELD_RTT_OVER250_GUARD_PCT: f64 = 15.0;
 /// M2 hostile cadence-arm delivery floor (regression guard; measured 1.000).
 const M2_HOSTILE_DELIVERY_FLOOR: f64 = 0.995;
 /// M2 lone-tail delivery floor (measured 1.000).
@@ -292,6 +314,42 @@ fn hostile_link(seed: u64) -> NetemConfig {
         loss_model: gilbert_elliott_loss(5.0, 8.0),
         seed,
         ..NetemConfig::default()
+    }
+}
+
+/// [`hostile_link`] moved onto the field's ~190 ms round trip: the same GE
+/// model and jitter with the one-way delay the deployed client reports.
+fn field_rtt_link(seed: u64) -> NetemConfig {
+    NetemConfig {
+        latency: FIELD_RTT_OWD,
+        ..hostile_link(seed)
+    }
+}
+
+/// The field-RTT lone-tail arm: the M1/M2 `lone_tail` shape (one unacked 256 B
+/// message at a time, no bulk lane) at [`FIELD_RTT_OWD`]. The fault selector
+/// `MANDATE_SMOKE_FAULT=M1_FIELD_RTT_slow` injects +1000 ms one-way delay on
+/// both directions, the arm's own vacuity demonstration: it perturbs the arm's
+/// *input*, so the failure it produces comes from the measurement path.
+fn field_rtt_arm() -> ArmSpec {
+    let slow = fault("M1_FIELD_RTT").is_some();
+    let extra = if slow {
+        Duration::from_millis(1000)
+    } else {
+        Duration::ZERO
+    };
+    let shift = |mut link: NetemConfig| {
+        link.latency += extra;
+        link
+    };
+    ArmSpec {
+        name: "field_rtt",
+        int_c2s: shift(field_rtt_link(41)),
+        int_s2c: shift(field_rtt_link(42)),
+        bulk: false,
+        load: Load::RequestResponse { depth: 1 },
+        window: rr_window(),
+        msg_bytes: MSG_BYTES,
     }
 }
 
@@ -888,6 +946,69 @@ async fn m1_interactive_tail_latency() {
         over250_pct(&lone.samples) <= M1_LONE_OVER250_GUARD_PCT,
         "[M1] lone-tail arm has {:.3}% of samples > {M1_CEILING_MS} ms, over its {M1_LONE_OVER250_GUARD_PCT}% regression guard",
         over250_pct(&lone.samples),
+    );
+}
+
+// ───────────────────── M1 at the field's RTT scale ─────────────────────────
+
+/// Mandate 1 at the deployed client's round-trip scale.
+///
+/// The M1/M2 arms above run the deployment's 25 ms one-way profile (~50 ms
+/// round trip). The deployed client reports a ~190 ms *minimum* round trip, so
+/// "the tail holds on the `clean` arm" says nothing about the RTT the field
+/// sees: the M1 breach is a repair ladder, and a ladder's step and rung count
+/// are not RTT-invariant. This arm re-runs the `lone_tail` shape
+/// (request/response, depth 1, one unacked 256 B message) on
+/// [`FIELD_RTT_OWD`]'s ~190 ms round trip and asserts a derived regression
+/// guard on the same two quantities M1 asserts on the smoke arms.
+///
+/// It is a **new** arm, not a retuned one: the `clean`, `hostile` and
+/// `lone_tail` arms keep their settings, tiers and guards. It is `#[ignore]`d
+/// (`full` tier) because it needs its own ~20 s window on top of the smoke
+/// set's ~3 minutes, and because it is a measurement of the open tail defect
+/// rather than a mandate bound that currently holds. The guard's derivation is
+/// in `GATE.md`; the constants above carry a pointer to it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "field-RTT lone-tail arm; ~20 s; run with --ignored --nocapture"]
+async fn m1_lone_tail_field_rtt() {
+    let _serial = SERIAL.lock().await;
+    let run = with_timeout(
+        Duration::from_secs(120),
+        "m1-field-rtt/lone_tail",
+        run_arm(field_rtt_arm()),
+    )
+    .await;
+    print_arm(&run);
+
+    let pass = run.summary.p99 <= M1_FIELD_RTT_P99_GUARD_MS
+        && over250_pct(&run.samples) <= M1_FIELD_RTT_OVER250_GUARD_PCT;
+    println!(
+        "MANDATE M1_FIELD_RTT {} owd_ms={} samples={} p50={:.1} p90={:.1} p99={:.1} p999={:.1} max={:.1} over250={} over250_pct={:.3} p99_guard={:.1} over250_guard={:.1} ceiling={:.1}",
+        verdict(pass),
+        FIELD_RTT_OWD.as_millis(),
+        run.samples.len(),
+        run.summary.p50,
+        run.summary.p90,
+        run.summary.p99,
+        run.summary.p999,
+        run.summary.max,
+        over250_count(&run.samples),
+        over250_pct(&run.samples),
+        M1_FIELD_RTT_P99_GUARD_MS,
+        M1_FIELD_RTT_OVER250_GUARD_PCT,
+        M1_CEILING_MS,
+    );
+
+    assert!(
+        run.summary.p99 <= M1_FIELD_RTT_P99_GUARD_MS,
+        "[M1] field-RTT ({FIELD_RTT_OWD:?} one-way) lone-tail arm p99 {:.1} ms exceeds its {M1_FIELD_RTT_P99_GUARD_MS} ms regression guard (max {:.1} ms): the lone-tail defect at the deployed client's ~190 ms round trip has grown by at least 2x",
+        run.summary.p99,
+        run.summary.max,
+    );
+    assert!(
+        over250_pct(&run.samples) <= M1_FIELD_RTT_OVER250_GUARD_PCT,
+        "[M1] field-RTT lone-tail arm has {:.3}% of samples > {M1_CEILING_MS} ms, over its {M1_FIELD_RTT_OVER250_GUARD_PCT}% regression guard",
+        over250_pct(&run.samples),
     );
 }
 
