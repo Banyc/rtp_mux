@@ -138,17 +138,17 @@ move them.
 
 ### Declared perf rows
 
-The rows below declare twenty-five families in the `gate-perf-design` grammar:
+The rows below declare twenty-six families in the `gate-perf-design` grammar:
 `<row> = <tier> | <cost_s> | <relation> | <cell>[,<cell>…]`, each cell
 `<property>@<dimension>=<value>[+…]`. The **default** family is the residual —
 every cell name no `members.<family>` claims — and holds the pre-existing
 `interactive-scaling` rows plus the two-flow rung declared alongside them; the
-twenty-four named families (`constitution`, `contested`, `dual-lane`,
+twenty-five named families (`constitution`, `contested`, `dual-lane`,
 `establishment`, `fec`, `fec-instrument-sanity`, `frame-reorder`, `hol-cap400`,
 `hol-fec`, `hol-frame`, `hol-hostile`, `hol-paced`, `hol-rtt100-clean`,
 `hol-rtt100-ge5`, `hol-rtt40-ge1`, `hostile-probes`, `instrument-sanity`,
 `interactive`, `latency-sweep`, `lone-tail`, `m3-bulk`, `mux-over-rtp`,
-`non-loss-impairment`, `reorder`) each carry
+`non-loss-impairment`, `reorder`, `spike-survival`) each carry
 their own baseline and their own cell-name namespace in `gate-budgets`, so a
 row's cells decide whether it belongs to the family its relation names.
 Keeping only the rows whose cells actually carry that name is what turns
@@ -195,8 +195,8 @@ sibling arm states.
 
 Every member below is stated against the baseline of its own family, and the
 label is the checker's derivation from the row's own cells rather than a
-judgement call: of the 79 declared rows, 25 are a family's own reference,
-28 vary exactly one dimension from it (`orthogonal`) and 26 vary several
+judgement call: of the 81 declared rows, 26 are a family's own reference,
+29 vary exactly one dimension from it (`orthogonal`) and 26 vary several
 (`composite(…)`), which name the dimensions they vary. No row is a
 `re-measurement` — the two `hol_probe` seed-variant rows and their shared-bulk
 siblings declare a `seeds` dimension instead, because their arms differ from
@@ -289,6 +289,8 @@ mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke = default | 1 | baseline@mux-ov
 mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = full | 344 | composite(impairment,metric,scale,shape)@mux-over-rtp | mux-over-rtp@impairment=hostile-fat-pipe+shape=sink+scale=400MiB+metric=delivery-and-goodput
 rtp_mux_jitter::jitter_nonloss_impairments = perf | 210 | baseline@non-loss-impairment | non-loss-impairment@lane=interactive+layer=rtp-frame+shape=cadence+flows=1+loss=none+rate=none+load=none+impairment=jitter-reorder-duplication-and-strict-reorder+metric=p99
 rtp_mux_jitter::jitter_cellular_timeline_arms = perf | 70 | composite(impairment,lane,report)@non-loss-impairment | non-loss-impairment@lane=dual+layer=rtp-frame+shape=cadence+flows=1+loss=none+rate=none+load=none+impairment=owd25-jitter100-and-200ms+report=liveness+metric=p99
+spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable = standard | 2 | baseline@spike-survival | spike-survival@spike=none+lanes=dual+impairment=owd95-floor+metric=delay-and-session-identity
+spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect = standard | 9 | orthogonal@spike-survival | spike-survival@spike=field-3205ms-round-trip+lanes=dual+impairment=owd95-floor+metric=delay-and-session-identity
 ```
 
 Declared sums are `default` 149 s, `standard` 41 s, `full` 1721 s and `perf`
@@ -319,8 +321,9 @@ the tier's still-undeclared rows. On the runner's
 own scale the `default` sum is 149 s (the M3 smoke row's 108 s plus the
 constitution gate's 40 s and the lossy smoke's 1 s), inside its
 300 s ceiling: no raise. The `standard`
-ceiling keeps its 600 s and still carries the two cold-connection rows, its
-only declared rows. The concurrent row is one
+ceiling keeps its 600 s and now carries four rows: the two cold-connection rows
+(28 s + 13 s) and the two `spike-survival` rows (2 s + 9 s, measured 1.58/8.77 s),
+52 s of 600. The concurrent row is one
 dimension (`offer`) away from the default baseline: the same four flows, the
 same lane, the same seeds, the same offer, polled together instead of one
 after another, and the two-flow rung declared with it is that same serialized
@@ -520,6 +523,45 @@ when the production path dials them one after the other.
 replaces the production arm with a reproduction of the two-serialized-dial
 critical path, which must fail the gate.
 
+**The `spike-survival` family** is the row the `establishment` family's
+coverage gap asked for. That family measures a session being **born**
+(`cold_connection_decomposition`, `mux_lane_birth_is_one_round_trip`) and only
+on clean links; `rtp_mux`'s deployed client multiplexes everything over **one
+long-lived mux session**, and the field's own round trips reach 3205 ms (1063 ms
+on another run) on a ~190 ms floor — **spikes on a live path**, not a dead path.
+The two rows measure a live dual-lane session carrying a request/response loop
+on the field's 190 ms floor, with the interactive lane's pair swapped mid-round:
+the pinned harness has no runtime latency setter (`NetemConfig.latency` is fixed
+at spawn and `NetemLink` exposes only `set_blackout`), so the pair is stopped
+and respawned on the **same** client-side and server-side bind addresses with a
+latency-only config — no address the app or the server knows moves, and the
+swap itself is measured at ~5.6 ms. The baseline runs uncut; the member varies
+the one `spike` dimension to the field's largest round trip (3205 ms, ~17x the
+floor). They pin the **positive** property: every round completes — no error, no
+EOF, no lost stream, the write in flight at the onset included — the steady
+spike round observes the injected delay (3396 ms for the 3204 ms injection), the
+stream returns to the floor (191 ms) when the path does, and the **session
+identity never moves**: the sampler reads `RtpMuxConnector::probe_session` every
+25 ms across the spike and sees one id, never absent (276 samples). The timer
+inventory the row rests on is stated, with citations, in the target's module doc
+and summarised here: mux's sliding receive deadline is `heartbeat_interval * 4`
+= 20 s (`mux/src/central_io/reader.rs:25,117`), 5.6x above the spike; rtp's
+`MIN_RTO` (1 s) and `TAIL_PROBED_MIN_RTO` (300 ms) are *retransmission cadences*
+with no max-retry or give-up path in the reliable layer; and the proxy's pool
+heartbeat is a 30 s write timeout
+(`proxy/common/src/stream_runtime/pool.rs:19`). The one exception is a *birth*
+deadline: rtp's opening handshake is `OPENING_TIMEOUT = 3 s`
+(`rtp/src/traffic_shaping/control/handshake/opening/mod.rs:13`), shorter than a
+3.2 s spike round trip — the mechanical reason a reconnect during a spike is
+worse than the spike, and why the identity guard is the point of the row. A
+birth-on-spike arm is `rtp`'s, not this crate's. The vacuity injections are
+`SPIKE_SURVIVAL_FAULT=no_spike` (the injection is skipped, so the
+delay-matches-injection check fails on a 191 ms round), `=churn_session`
+(`RtpMuxConnector::reset()` mid-spike: the in-flight rounds error
+`BrokenPipe`/`WriteFailed` and the survival check fails) and `=late_churn` (the
+reset lands after every round has passed, so only the identity guard can catch
+it — it does, on an absent id).
+
 ```gate-budgets
 default = 300
 standard = 600
@@ -574,6 +616,8 @@ members.m3-bulk = m3-bulk*
 members.mux-over-rtp = mux-over-rtp*
 members.non-loss-impairment = non-loss-impairment*
 members.reorder = reorder-*
+members.spike-survival = spike-survival*
+baseline.spike-survival = spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable
 drift = 0.5
 drift_floor_s = 2.0
 ```
@@ -594,7 +638,7 @@ and the eight `hol` regimes by the same repair plus one measurement per row, a
 cost no `#[ignore]` reason states.
 
 ```gate-coverage-gaps
-cold-connection@lanes=dual+handshake=on+impairment=loss-or-jitter-or-reorder = the cold birth is measured on clean links only; what loss does to a birth is rtp's opening handshake's own retry behaviour (its `OPENING_TIMEOUT`/`RETRY_INTERVAL`), which the `rtp` crate owns and which a clean-link decomposition cannot attribute to rtp_mux, so no impaired birth row is claimed here.
+cold-connection@lanes=dual+handshake=on+impairment=loss-or-jitter-or-reorder = the cold birth is measured on clean links only; what loss does to a birth is rtp's opening handshake's own retry behaviour (its `OPENING_TIMEOUT`/`RETRY_INTERVAL`), which the `rtp` crate owns and which a clean-link decomposition cannot attribute to rtp_mux, so no impaired birth row is claimed here. A *live* session under a delay spike is now claimed by the `spike-survival` family, but a *birth* under impairment (rtp's 3 s `OPENING_TIMEOUT` against a 3.2 s spike round trip) is not exercised by any row here and belongs to `rtp`.
 cold-connection@lanes=dual+handshake=off = the same birth with the rtp opening handshake disabled is a *different* protocol configuration (the production server binds `handshake: true`); it is measured inside the row as the bare one-lane arm's no-handshake control (min 0.0-0.1 ms, i.e. the whole one-lane cost is the handshake), not as a separate row, because the deployed path never takes it.
 cold-connection@lanes=single+shape=proxy-chain = the row measures the rtp_mux birth on loopback with no proxy in the path; the deployed chain's cold total (and the proxy's share of it) is measured by the proxy-path iteration that owns those arms, and loopback cannot speak to a real path's delay distribution, so no field-scale claim is made here.
 cold-connection@metric=cpu = per-datagram CPU cost is measured by owning-symbol attribution (`tools/samply_hotspots.py`), not by a scenario in this crate.
@@ -1233,6 +1277,8 @@ perf_probe::probe_hostile_goodput_30s = full
 perf_probe::probe_hostile_message_latency = full
 perf_probe::probe_rtp_echo_4mib_direct = standard
 perf_probe::probe_rtp_echo_4mib_mss8k = standard
+spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect = standard
+spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable = standard
 ```
 
 The `gate-asserting` block below records the report-only/asserting split. It
@@ -1344,6 +1390,8 @@ perf_probe::probe_rtp_echo_4mib_mss8k
 rtp_mux_jitter::jitter_duallane_constitution_gate
 rtp_mux_jitter::jitter_duallane_constitution_gate_p99
 mandate_smoke::m1_interactive_tail_latency
+spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect
+spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable
 mandate_smoke::m1_lone_tail_rung_distribution
 mandate_smoke::m2_interactive_delivery_and_wire
 mandate_smoke::m3_bulk_goodput_fraction
