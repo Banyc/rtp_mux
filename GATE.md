@@ -119,11 +119,67 @@ either sees the whole constitution:
        --ignored bulk_lane_goodput_stays_above_capacity_fraction --nocapture --test-threads=1
    ```
 
-The interactive scaling boundary is additionally gated by
-`hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery` (`full` tier):
-four interactive streams on the same lane keep per-flow delivery ≥ 0.90 and
-p50 ≤ 2.5× the solo reference, so the interactive lane's latency floor also
-holds when several flows share it.
+The interactive scaling boundary is gated by
+`hol_probe::hol_rtt100_ge5_four_interactive_concurrent_frame_delivery`
+(`full` tier): four interactive streams on the same lane, offered together on
+one mux connection over one frame-delivery RTP link, keep per-flow delivery
+≥ 0.90 and p50 ≤ 2.5× the solo reference, keep every flow's offering window
+inside a common window for at least half its length, and keep every flow
+within 15 % of its `run_for / cadence` offer schedule — so the interactive
+lane's latency floor and its split across several flows both hold while the
+flows are in flight together.
+
+`hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery` (`full` tier) is
+that row's baseline: the same four streams, lane, impairment, seed, message
+shape and measurement over a **serialized** offer, four sweeps offered one
+after another. Its per-flow numbers are therefore single-flow numbers
+repeated, and no scheduler that starves a flow while another is active can
+move them.
+
+### Declared perf rows
+
+The rows below declare the interactive-scaling family in the `gate-perf-design`
+grammar: `<row> = <tier> | <cost_s> | <relation> | <cell>[,<cell>…]`, each cell
+`<property>@<dimension>=<value>[+…]`. The budget block covers the rows
+declared here — the family — not the whole `full` tier: the migration starts
+with this family and the remaining `full`-tier rows are not declared yet, so
+the per-tier sum the checker reports is the declared subset.
+
+```gate-perf-design
+hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full | 66 | baseline | interactive-scaling@flows=4+offer=sequential
+hol_probe::hol_rtt100_ge5_four_interactive_concurrent_frame_delivery = full | 20 | orthogonal | interactive-scaling@flows=4+offer=concurrent
+```
+
+Declared sums are `full` 86 s; measured 69.1 s and 19.5 s. The concurrent row
+is one dimension (`offer`) away from the baseline: the same four flows, the
+same lane, the same seeds, the same offer, polled together instead of one
+after another.
+
+```gate-budgets
+full = 86
+baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
+drift = 0.5
+drift_floor_s = 2.0
+```
+
+Cells the family does **not** claim, with the reason each is empty:
+
+```gate-coverage-gaps
+interactive-scaling@flows=2+offer=concurrent = the two-flow rung is the pre-existing serialized `hol_rtt100_ge5_two_interactive_frame_delivery` and stays as it is; the concurrent offer is declared at four flows, the rung this family and M4 name, so a two-flow concurrent row would repeat it at a smaller N without a new regime.
+interactive-scaling@flows=4+offer=concurrent+bulk=saturating = the family's bulk-sharing member (`hol_rtt100_ge5_shared_frame_delivery`) is single-flow with a saturating bulk stream; adding a saturating bulk stream to the concurrent row varies two dimensions from the baseline at once and would need its own derivation for what the shared bottleneck does to the offer floor, so it is left to its own row.
+interactive-scaling@flows=4+offer=concurrent+impairment=clean-or-GE1-or-hostile = the concurrent row is declared on the family's GE5 seed pair (31/32) only; the clean, GE1 and hostile rtt100 rows are single-flow arms, and a concurrent arm on those links would be stated against a different baseline family.
+interactive-scaling@flows=8+offer=concurrent = the sink attributes samples by first-byte tag (A, C..H after the reserved `b'B'`), so seven flows is the tag range's limit and an eight-flow row has no per-flow attribution; the four-flow rung is the largest this instrument can measure.
+```
+
+The concurrent row's vacuity demonstrations are `HOL_PROBE_FAULT=serialize`
+(no flow but the first may offer until the first flow's window has closed: the
+overlap assertion fails at −0.000 s while delivery, p50 and offer counts stay
+green) and `HOL_PROBE_FAULT=throttle` (every other flow offered at an eighth
+of the cadence with its window still spanning the run: the offer floor fails at
+83 of 660 while the overlap, delivery and p50 signals stay green). Both are
+offering-input faults on the shared path, so the baseline row is run under the
+same selector and keeps its numbers — its flows are already disjoint and it
+asserts nothing about an offer schedule.
 
 ### The tri-mandate smoke set
 
@@ -402,6 +458,7 @@ hol_probe::hol_rtt100_ge1_loss1_split = full
 hol_probe::hol_rtt100_ge1_shared_frame_delivery_diag = full
 hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_frame_diag = full
 hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_stock_diag = full
+hol_probe::hol_rtt100_ge5_four_interactive_concurrent_frame_delivery = full
 hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full
 hol_probe::hol_rtt100_ge5_shared = full
 hol_probe::hol_rtt100_ge5_shared_dual_lane = full
@@ -517,6 +574,7 @@ hol_probe::hol_rtt100_ge1_loss1_split
 hol_probe::hol_rtt100_ge1_shared_frame_delivery_diag
 hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_frame_diag
 hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_stock_diag
+hol_probe::hol_rtt100_ge5_four_interactive_concurrent_frame_delivery
 hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 hol_probe::hol_rtt100_ge5_shared
 hol_probe::hol_rtt100_ge5_shared_dual_lane

@@ -46,6 +46,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use futures::future::join_all;
 use mux::testkit::mux::mux_client_connect_via;
 use netem_test::kit::payload::{cyclic_payload, run_bounded, with_timeout};
 use netem_test::kit::presets::gilbert_elliott_loss;
@@ -2315,26 +2316,130 @@ fn flow_tag(flow: usize) -> u8 {
     }
 }
 
+/// One interactive flow's offering window, in seconds since the probe's
+/// `base`: the instant its first message was offered and the instant its last
+/// write returned. Two flows' windows overlap iff the intervals intersect, so
+/// all `flows` were offering at once for `min(end) - max(start)`.
+#[derive(Clone, Copy, Debug)]
+struct OfferSpan {
+    start: f64,
+    end: f64,
+}
+
+/// How a multi-interactive probe offers its flows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OfferMode {
+    /// The next flow's offering future is built up front but polled only after
+    /// the previous flow's window has closed: `flows` serialized sweeps inside
+    /// one run.
+    Sequential,
+    /// Every flow's offering future is polled together, so each flow's window
+    /// is open while the others' are.
+    Concurrent,
+}
+
+/// The settings of a multi-interactive probe: the family's frame-delivery
+/// config plus how its flows are offered.
+#[derive(Clone, Copy, Debug)]
+struct MultiInteractiveProbeConfig {
+    offer: OfferMode,
+    traffic: FrameDeliveryProbeConfig,
+}
+
+/// The deliberate faults of the concurrent arm's vacuity demonstrations,
+/// selected by `HOL_PROBE_FAULT` and unset in every real run. Both perturb the
+/// offering *input* — when a flow may offer, or how fast — never an assertion,
+/// so a failure they produce comes from the measurement path. Both are
+/// consulted by the serialized arm too, through the same futures: the serialized
+/// arm's flows are disjoint and it asserts nothing about their offer schedule,
+/// so neither fault moves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OfferFault {
+    /// `serialize`: no flow but the first may offer anything until the
+    /// offering window of the first flow has closed — one flow served at a
+    /// time, the serialization the concurrent arm's name denies. Fails the
+    /// overlap assertion; leaves every delivery, latency and schedule number
+    /// green, which is what the serialized arm reports.
+    Serialize,
+    /// `throttle`: every flow but the first is offered at a cadence of
+    /// [`THROTTLED_CADENCE_FACTOR`] times the requested interval, its window
+    /// still spanning the whole run. Fails the offer floor and leaves the
+    /// overlap, delivery and latency signals green.
+    Throttle,
+}
+
+/// The cadence multiplier the `throttle` fault applies to every flow but the
+/// first: an eighth of the rate is 83 offers in the default 16.5 s window
+/// against a 660-offer schedule.
+const THROTTLED_CADENCE_FACTOR: u32 = 8;
+
+fn offer_fault() -> Option<OfferFault> {
+    match std::env::var("HOL_PROBE_FAULT") {
+        Ok(value) if value.trim() == "serialize" => Some(OfferFault::Serialize),
+        Ok(value) if value.trim() == "throttle" => Some(OfferFault::Throttle),
+        _ => None,
+    }
+}
+
+/// The gate the injected serialization fault passes through. It is created in
+/// every run and flow 0's future opens it when its window closes; only the
+/// fault's non-first flows ever wait on it. The open flag is the authority —
+/// the watch channel only wakes waiters — so a late waiter sees an already
+/// open gate and returns without waiting: under [`OfferMode::Sequential`],
+/// where flow 0's future has already completed by the time a later flow's
+/// future is polled, the wait is one non-blocking poll.
+struct OfferGate {
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+impl OfferGate {
+    fn new() -> Self {
+        let (open, _receiver) = tokio::sync::watch::channel(false);
+        Self { open }
+    }
+
+    /// Holds a non-first flow back until flow 0's window closes, when the
+    /// serialization fault is installed.
+    async fn admit(&self, flow: usize, serialize: bool) {
+        if !serialize || flow == 0 {
+            return;
+        }
+        let mut open = self.open.subscribe();
+        let _ = open.wait_for(|open| *open).await;
+    }
+
+    /// Opens the gate for every other flow once the first flow's window has
+    /// closed.
+    fn release(&self, flow: usize) {
+        if flow == 0 {
+            self.open.send_replace(true);
+        }
+    }
+}
+
 /// Run a frame-delivery probe with `flows` interactive streams on ONE mux
 /// connection over ONE frame-delivery RTP connection: the two-interactive
 /// pattern generalized. Every stream tags its first message with a distinct
 /// [`flow_tag`] byte so the server routes it through the latency parser and
 /// its samples are bucketed per flow; the returned vector is indexed by flow
 /// with the combined summary last. The single connection is the point of the
-/// arm — four interactive flows sharing one frame path — and the link is
+/// arm — several interactive flows sharing one frame path — and the link is
 /// exactly the two-interactive battery's GE5 seed pair so the per-flow
-/// percentiles are comparable.
-async fn run_frame_delivery_multi_interactive(
+/// percentiles are comparable. The third element of the return is each flow's
+/// offering window — the evidence [`OfferMode::Concurrent`] is asserted on and
+/// the serialized arm has no use for.
+async fn run_frame_delivery_multi_interactive_with_offer(
     label: &str,
     c2s: NetemConfig,
     s2c: NetemConfig,
     flows: usize,
-    config: FrameDeliveryProbeConfig,
-) -> (Vec<HolSummary>, HolSummary) {
+    config: MultiInteractiveProbeConfig,
+) -> (Vec<HolSummary>, HolSummary, Vec<OfferSpan>) {
     assert!(
         (1..=7).contains(&flows),
         "{label}: flows {flows} out of the A..H (b'B' reserved) tag range"
     );
+    let MultiInteractiveProbeConfig { offer, traffic } = config;
     let FrameDeliveryProbeConfig {
         fec,
         traffic:
@@ -2344,7 +2449,7 @@ async fn run_frame_delivery_multi_interactive(
                 run_for,
                 grace,
             },
-    } = config;
+    } = traffic;
     let base = Instant::now();
     let mut tasks = netem_test::kit::TestScope::new();
     let task_tx = tasks.submitter(netem_test::kit::TEST_TASK_QUEUE_BOUND);
@@ -2399,21 +2504,68 @@ async fn run_frame_delivery_multi_interactive(
             }
 
             let mut sent_per_flow = vec![0u64; flows];
+            let mut spans = vec![
+                OfferSpan {
+                    start: 0.0,
+                    end: 0.0,
+                };
+                flows
+            ];
             let mut writes = Vec::with_capacity(flows);
             for (tag, write) in streams.iter_mut() {
                 let _ = write.write_all(&[*tag]).await;
                 writes.push(&mut *write);
             }
 
-            // All flows offered concurrently, joined before shutdown.
-            let mut futs = Vec::with_capacity(flows);
-            for write in writes {
-                futs.push(send_timestamped_messages(
-                    write, base, msg_bytes, cadence, run_for,
-                ));
+            // The two offer modes differ only here — in when each flow's
+            // offering future is polled — so the injected faults, which live
+            // inside the futures, are consulted by both arms. Unset in every
+            // real run; the serialization fault is satisfied trivially by the
+            // sequential mode when it is set, because a later flow is polled
+            // only after flow 0's future has already released the gate.
+            let fault = offer_fault();
+            if let Some(fault) = fault {
+                eprintln!("[hol {label}] FAULT {fault:?} installed");
             }
-            for (i, fut) in futs.into_iter().enumerate() {
-                sent_per_flow[i] = fut.await;
+            let gate = Arc::new(OfferGate::new());
+            let mut futs = Vec::with_capacity(flows);
+            for (index, write) in writes.into_iter().enumerate() {
+                let gate = Arc::clone(&gate);
+                let offer_cadence = if fault == Some(OfferFault::Throttle) && index > 0 {
+                    cadence * THROTTLED_CADENCE_FACTOR
+                } else {
+                    cadence
+                };
+                futs.push(async move {
+                    gate.admit(index, fault == Some(OfferFault::Serialize))
+                        .await;
+                    let start = base.elapsed().as_secs_f64();
+                    let sent =
+                        send_timestamped_messages(write, base, msg_bytes, offer_cadence, run_for)
+                            .await;
+                    let end = base.elapsed().as_secs_f64();
+                    gate.release(index);
+                    (OfferSpan { start, end }, sent)
+                });
+            }
+            match offer {
+                OfferMode::Sequential => {
+                    // One flow's window closes before the next flow's first
+                    // message: `flows` sweeps offered one after another.
+                    for (i, fut) in futs.into_iter().enumerate() {
+                        let (span, sent) = fut.await;
+                        sent_per_flow[i] = sent;
+                        spans[i] = span;
+                    }
+                }
+                OfferMode::Concurrent => {
+                    // All flows' offering futures polled together, so every
+                    // flow's window is open while the others' are.
+                    for (i, (span, sent)) in join_all(futs).await.into_iter().enumerate() {
+                        sent_per_flow[i] = sent;
+                        spans[i] = span;
+                    }
+                }
             }
             for (_, write) in streams.iter_mut() {
                 let _ = write.shutdown();
@@ -2447,9 +2599,56 @@ async fn run_frame_delivery_multi_interactive(
             }
             print_hol_summary(&format!("{}_combined", label), &combined);
             pair.stop();
-            (summaries, combined)
+            (summaries, combined, spans)
         })
         .await
+}
+
+/// [`run_frame_delivery_multi_interactive_with_offer`] in
+/// [`OfferMode::Sequential`]: the family's original arm, whose per-flow
+/// numbers describe four sweeps offered one after another.
+async fn run_frame_delivery_multi_interactive(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    flows: usize,
+    config: FrameDeliveryProbeConfig,
+) -> (Vec<HolSummary>, HolSummary) {
+    let (summaries, combined, _spans) = run_frame_delivery_multi_interactive_with_offer(
+        label,
+        c2s,
+        s2c,
+        flows,
+        MultiInteractiveProbeConfig {
+            offer: OfferMode::Sequential,
+            traffic: config,
+        },
+    )
+    .await;
+    (summaries, combined)
+}
+
+/// [`run_frame_delivery_multi_interactive_with_offer`] in
+/// [`OfferMode::Concurrent`], returning the per-flow offering windows that
+/// carry the concurrency evidence.
+async fn run_frame_delivery_multi_interactive_concurrent(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    flows: usize,
+    config: FrameDeliveryProbeConfig,
+) -> (Vec<HolSummary>, HolSummary, Vec<OfferSpan>) {
+    run_frame_delivery_multi_interactive_with_offer(
+        label,
+        c2s,
+        s2c,
+        flows,
+        MultiInteractiveProbeConfig {
+            offer: OfferMode::Concurrent,
+            traffic: config,
+        },
+    )
+    .await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2573,6 +2772,11 @@ async fn hol_rtt100_ge5_two_interactive_frame_delivery() {
 /// two-interactive arm cover one and two flows; the inventory called
 /// multi-flow (4/8) scaling never-measured, and this arm closes the 4-flow
 /// rung.
+///
+/// The four flows are offered one after another, so the per-flow numbers this
+/// arm reports describe four serialized sweeps;
+/// [`hol_rtt100_ge5_four_interactive_concurrent_frame_delivery`] is the arm
+/// that offers them concurrently and asserts the overlap.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_ge5_four_interactive_frame_delivery() {
@@ -2618,6 +2822,115 @@ async fn hol_rtt100_ge5_four_interactive_frame_delivery() {
             solo_ref * 2.5,
         );
     }
+}
+
+/// The genuinely concurrent twin of
+/// [`hol_rtt100_ge5_four_interactive_frame_delivery`]: same four interactive
+/// streams on ONE frame-delivery connection, same GE5 seed pair
+/// (`rtt100_ge5(31)` / `rtt100_ge5(32)`), same 256 B message shape, same 25 ms
+/// cadence, same 16.5 s window, same 3 s grace and same 180 s bound — but the
+/// four offering futures are polled together instead of awaited one by one.
+/// The arm is additive: the serialized arm keeps its regime, bound, tier and
+/// assertions, and is this row's baseline in `GATE.md`.
+///
+/// On top of the family's per-flow outcome triad (delivery >= 0.90, p50 <=
+/// 125 ms, combined delivery >= 0.90) it asserts the concurrency its name
+/// claims, on the evidence the serialized arm cannot produce: every flow's
+/// offering window intersects every other's for at least half the window, and
+/// every flow offered at least 85% of its `run_for / cadence` message
+/// schedule. Those are what a scheduler that starves one flow while another
+/// is active violates — a starved flow's window moves off the shared window,
+/// and a throttled flow falls short of its schedule while its delivery ratio,
+/// which is `received / sent`, can still read 1.000.
+///
+/// Vacuity demonstrations: `HOL_PROBE_FAULT=serialize` installs a scheduler
+/// that lets flow 0's offering window close before any other flow may offer
+/// anything, and the overlap assertion fails naming the windows;
+/// `HOL_PROBE_FAULT=throttle` offers every other flow at an eighth of the
+/// cadence while its window still spans the run, and the offer floor fails
+/// naming the flow's count. Under either fault the serialized arm's flows are
+/// already disjoint and it asserts nothing about their schedule, so its
+/// numbers and assertions are unchanged.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn hol_rtt100_ge5_four_interactive_concurrent_frame_delivery() {
+    const FLOWS: usize = 4;
+    let label = "rtt100 GE5 four-interactive concurrent frame-delivery";
+    let (summaries, combined, spans) = with_timeout(
+        Duration::from_secs(180),
+        label,
+        run_frame_delivery_multi_interactive_concurrent(
+            label,
+            rtt100_ge5(31),
+            rtt100_ge5(32),
+            FLOWS,
+            FrameDeliveryProbeConfig {
+                fec: false,
+                traffic: TrafficConfig {
+                    msg_bytes: DEFAULT_MSG_BYTES,
+                    cadence: DEFAULT_CADENCE,
+                    run_for: DEFAULT_RUN_FOR,
+                    grace: DEFAULT_GRACE,
+                },
+            },
+        ),
+    )
+    .await;
+
+    let max_start = spans
+        .iter()
+        .map(|span| span.start)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_end = spans
+        .iter()
+        .map(|span| span.end)
+        .fold(f64::INFINITY, f64::min);
+    let overlap = min_end - max_start;
+    for (flow, span) in spans.iter().enumerate() {
+        eprintln!(
+            "[hol {label} flow {flow}] offered {:.3}s..{:.3}s window={:.3}s sent={}",
+            span.start,
+            span.end,
+            span.end - span.start,
+            summaries[flow].sent,
+        );
+    }
+    eprintln!(
+        "[hol {label}] all {FLOWS} flows offering at once for {overlap:.3}s of {:.3}s",
+        DEFAULT_RUN_FOR.as_secs_f64(),
+    );
+
+    let overlap_floor = DEFAULT_RUN_FOR.as_secs_f64() / 2.0;
+    assert!(
+        overlap >= overlap_floor,
+        "flows not offered concurrently: every flow was offering at once for only \
+         {overlap:.3}s < {overlap_floor:.3}s",
+    );
+    let nominal_sends = DEFAULT_RUN_FOR.as_millis() as f64 / DEFAULT_CADENCE.as_millis() as f64;
+    let send_floor = (nominal_sends * 0.85) as u64;
+    for (flow, summary) in summaries.iter().enumerate() {
+        let name = flow_tag(flow) as char;
+        assert!(
+            summary.delivery_pct >= 0.90,
+            "flow {name} delivery {:.3} < 0.90",
+            summary.delivery_pct
+        );
+        assert!(
+            summary.p50 <= 50.0 * 2.5,
+            "flow {name} p50 {:.1} > 125 ms",
+            summary.p50
+        );
+        assert!(
+            summary.sent >= send_floor,
+            "flow {name} offered {} of its {nominal_sends:.0} scheduled messages, below {send_floor}",
+            summary.sent,
+        );
+    }
+    assert!(
+        combined.delivery_pct >= 0.90,
+        "combined delivery {:.3} < 0.90",
+        combined.delivery_pct
+    );
 }
 
 // ───── diagnostics: frame‑delivery shared on various link profiles ─────
