@@ -752,6 +752,79 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
     }
 }
 
+// ──────────────────── the M1/M2 shared arm measurement ───────────────────────
+
+/// The arm runs M1 and M2 both read, measured once.
+///
+/// [`mandate_arms`] returns the **same** three arms for M1 and M2 — same names,
+/// impairment, seeds and windows — and the two mandates differ only in which
+/// fields of each [`ArmRun`] they assert on ([`m1_rows`] versus [`m2_rows`]), so
+/// measuring them twice is a duplicated run rather than extra coverage.
+/// Whichever test reaches this cache first measures the arms and stores them;
+/// the other reads the very same runs.
+///
+/// The state is keyed by [`fault`]'s selection, the one input that changes the
+/// arms. A fault perturbs an arm's *input* (impairment or offered load), which
+/// makes it a different measurement, so a fault run is **never** stored and
+/// never served: only the clean `MANDATE_SMOKE_FAULT`-unset run — fault key
+/// `""` — is cacheable. At most one mandate matches a given fault value
+/// ([`fault`] returns `Some` only for the mandate whose prefix the value
+/// carries), so a single slot is a complete cache. That is what keeps the
+/// deliberate-fault isolation intact: `MANDATE_SMOKE_FAULT=M2_delivery` moves
+/// M2 alone, and a clean M1 can never inherit it.
+static ARM_RUNS: std::sync::Mutex<Option<(String, Arc<Vec<ArmRun>>)>> = std::sync::Mutex::new(None);
+
+/// The three [`mandate_arms`] runs, measured unless already cached under
+/// `mandate`'s fault key. The arms themselves are untouched: the same specs,
+/// seeds, windows, cadence and `GRACE` as before, driven through the same
+/// [`run_arm`] and [`with_timeout`]; only the duplicated execution is gone.
+/// The cache lock is never held across an `await` — [`SERIAL`] already serialises
+/// the callers, so the critical sections are two plain field reads.
+async fn mandate_runs(mandate: &str) -> Arc<Vec<ArmRun>> {
+    let key = fault(mandate).unwrap_or_default();
+    let cached = ARM_RUNS
+        .lock()
+        .expect("the arm-run cache mutex is never poisoned")
+        .clone();
+    if let Some((cached_key, runs)) = cached
+        && cached_key == key
+    {
+        eprintln!(
+            "[mandate-smoke] {mandate} reads the arm runs already measured under the {cached_key:?} fault key"
+        );
+        // Both mandates report the arms they assert on: `tools/mandate-check`
+        // attributes every arm line to the mandate whose `MANDATE` line follows
+        // it and refuses a mandate with no arm line (`M2/clean`, `M2/hostile`
+        // and `M2/lone_tail` are declared cells in `tools/mandate-arms.json`).
+        // These rows are the measurement the mandate reads, reprinted under
+        // the reading mandate's attribution; they are not a second run.
+        for run in runs.iter() {
+            print_arm(run);
+        }
+        return runs;
+    }
+    let runs = Arc::new(measure_arms(mandate).await);
+    if key.is_empty() {
+        *ARM_RUNS
+            .lock()
+            .expect("the arm-run cache mutex is never poisoned") = Some((key, Arc::clone(&runs)));
+    }
+    runs
+}
+
+/// Measure the [`mandate_arms`] set in order, printing each arm's row, exactly
+/// as the M1 and M2 runner loops used to before the measurement was shared.
+async fn measure_arms(mandate: &str) -> Vec<ArmRun> {
+    let mut runs = Vec::new();
+    for spec in mandate_arms(mandate) {
+        let label = format!("{}/{}", mandate.to_lowercase(), spec.name);
+        let run = with_timeout(Duration::from_secs(120), &label, run_arm(spec)).await;
+        print_arm(&run);
+        runs.push(run);
+    }
+    runs
+}
+
 fn over250_count(samples: &[f64]) -> usize {
     samples.iter().filter(|x| **x > M1_CEILING_MS).count()
 }
@@ -783,10 +856,10 @@ fn cdf_points(samples: &[f64], points: usize) -> Vec<(f64, f64)> {
 
 fn print_arm(run: &ArmRun) {
     let s = &run.summary;
-    eprintln!(
+    let row = format!(
         "[mandate-smoke {name:<9}] sent={sent:>5} recv={recv:>5} delivery={del:.3} \
          p50={p50:7.1} p90={p90:7.1} p99={p99:7.1} p999={p999:7.1} max={max:8.1} \
-         over250={o25:>4} wire={w:>10}B x={x:.2} bulk_sink={bs:>10}B bulk_wire={bw:>10}B wall={wall:.1}s window={win:?}",
+         over250={o25:>4} wire={w:>10}B x={x:.2} bulk_sink={bs:>10}B bulk_wire={bw:>10}B wall={wall:.1}s window={win:?}\n",
         name = run.name,
         sent = s.sent,
         recv = s.received,
@@ -804,6 +877,13 @@ fn print_arm(run: &ArmRun) {
         wall = run.wall.as_secs_f64(),
         win = run.window,
     );
+    // One locked `write_all` of a whole row: `eprintln!` issues one write per
+    // format segment, and the four smoke tests share one merged stdout/stderr
+    // stream, so a row printed while another test finishes can be split
+    // mid-field and become unparseable for `tools/mandate-check`'s arm-line
+    // reader. A single write under `PIPE_BUF` cannot interleave.
+    let mut stderr = std::io::stderr().lock();
+    let _ = std::io::Write::write_all(&mut stderr, row.as_bytes());
 }
 
 // ───────────────────────────── evidence writing ──────────────────────────────
@@ -859,14 +939,7 @@ fn m1_rows(runs: &[ArmRun]) -> Vec<(String, String, f64, f64)> {
 async fn m1_interactive_tail_latency() {
     let _serial = SERIAL.lock().await;
     let dir = out_dir();
-    let arms = mandate_arms("M1");
-    let mut runs = Vec::new();
-    for spec in arms {
-        let label = format!("m1/{}", spec.name);
-        let run = with_timeout(Duration::from_secs(120), &label, run_arm(spec)).await;
-        print_arm(&run);
-        runs.push(run);
-    }
+    let runs = mandate_runs("M1").await;
     write_evidence(&dir, "M1", &m1_declaration(), &m1_rows(&runs));
 
     let clean = &runs[0];
@@ -1046,14 +1119,7 @@ fn m2_rows(runs: &[ArmRun]) -> Vec<(String, String, f64, f64)> {
 async fn m2_interactive_delivery_and_wire() {
     let _serial = SERIAL.lock().await;
     let dir = out_dir();
-    let arms = mandate_arms("M2");
-    let mut runs = Vec::new();
-    for spec in arms {
-        let label = format!("m2/{}", spec.name);
-        let run = with_timeout(Duration::from_secs(120), &label, run_arm(spec)).await;
-        print_arm(&run);
-        runs.push(run);
-    }
+    let runs = mandate_runs("M2").await;
     write_evidence(&dir, "M2", &m2_declaration(), &m2_rows(&runs));
 
     let clean = &runs[0];
