@@ -195,8 +195,8 @@ sibling arm states.
 
 Every member below is stated against the baseline of its own family, and the
 label is the checker's derivation from the row's own cells rather than a
-judgement call: of the 81 declared rows, 26 are a family's own reference,
-29 vary exactly one dimension from it (`orthogonal`) and 26 vary several
+judgement call: of the 82 declared rows, 26 are a family's own reference,
+29 vary exactly one dimension from it (`orthogonal`) and 27 vary several
 (`composite(…)`), which name the dimensions they vary. No row is a
 `re-measurement` — the two `hol_probe` seed-variant rows and their shared-bulk
 siblings declare a `seeds` dimension instead, because their arms differ from
@@ -235,6 +235,7 @@ rtp_mux_jitter::jitter_request_response_arms = perf | 1170 | baseline@lone-tail 
 mandate_smoke::m1_lone_tail_field_rtt = full | 20 | composite(depth,impairment)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd100-ge5pct-jitter100ms+metric=p99-and-over250-share
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep = full | 38 | orthogonal@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1-and-2+impairment=owd100-ge5pct-jitter100ms+metric=p99-and-over250-share
 mandate_smoke::m1_lone_tail_rung_distribution = full | 75 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-ge5pct-jitter100ms+metric=rung-count-vs-burst-law
+mandate_smoke::m1_lone_tail_loss_model = full | 150 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-iid5pct-vs-ge5pct-mean8-jitter100ms+metric=rung-count-and-wire-vs-loss-model
 hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
 hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
 hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
@@ -293,7 +294,7 @@ spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable = standard 
 spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect = standard | 9 | orthogonal@spike-survival | spike-survival@spike=field-3205ms-round-trip+lanes=dual+impairment=owd95-floor+metric=delay-and-session-identity
 ```
 
-Declared sums are `default` 149 s, `standard` 41 s, `full` 1721 s and `perf`
+Declared sums are `default` 149 s, `standard` 41 s, `full` 1871 s and `perf`
 3471 s of the 300 s, 600 s, 1800 s and 3500 s budgets. `full` and `perf` are
 raised as a declared change (200 → 300 and 1000 → 3000), and `full` again
 (300 → 1200) for the 34 `full`-tier `hol` rows this revision adds, which cost
@@ -317,7 +318,14 @@ declared change (1700 → 1800) for a row whose cost is *measured* rather than
 read (74.40 s real, `cargo test --release -p rtp_mux --test mandate_smoke
 -- --ignored --exact m1_lone_tail_rung_distribution --nocapture
 --test-threads=1`), and the 1800 s ceiling admits the sum with 79 s of room for
-the tier's still-undeclared rows. On the runner's
+the tier's still-undeclared rows. The lone-tail loss-model probe adds 150 s
+(1721 + 150 = 1871 s), which that 79 s of room does not admit, so `full` is
+raised again as a declared change (1800 → 1900) for a row whose cost is
+*measured* rather than read: 149.32 s of libtest's own time for eight ~19 s
+windows (`RUSTC_BOOTSTRAP=1 cargo test --release -p rtp_mux --test mandate_smoke
+-- --ignored --exact m1_lone_tail_loss_model --nocapture --test-threads=1
+-Z unstable-options --report-time`, real 152.99 s), declared 150 s, and the
+1900 s ceiling admits the sum with 29 s of room. On the runner's
 own scale the `default` sum is 149 s (the M3 smoke row's 108 s plus the
 constitution gate's 40 s and the lossy smoke's 1 s), inside its
 300 s ceiling: no raise. The `standard`
@@ -565,7 +573,7 @@ it — it does, on an absent id).
 ```gate-budgets
 default = 300
 standard = 600
-full = 1800
+full = 1900
 perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.constitution = rtp_mux_jitter::jitter_duallane_constitution_gate
@@ -996,6 +1004,145 @@ records include 1 s-floor ladders up to 5315 ms). The `field_rtt` arm above
 covers the field's round-trip *scale*; it carries the same jitter, so it does
 not cover the field's floor either.
 
+**The loss model, as a dimension: `m1_lone_tail_loss_model`.** The rung probe
+above reads the law at **one** impairment — the four-state Gilbert-Elliott model
+at a 5 % long-run rate with a mean burst of 8 — and the law's `burst` term is
+the quantity that sets the ladder, so a law about burst length was measured with
+a burst and never with its absence. That is a **coverage** gap of the kind the
+dual mandate names: a regime the family claims, in the quantity the declaration
+is about. `mandate_smoke::m1_lone_tail_loss_model` is the second point. It is
+`full` tier and `#[ignore]`d, **150 s** measured (149.32 s of libtest's own time
+for eight ~19 s windows; run command and stamp in the budget arithmetic above),
+and its vacuity failure is produced by the measurement path.
+
+*What it varies, and only that.* The sibling
+`mandate_smoke::m1_lone_tail_rung_distribution` is its reference pair: from it
+this arm is **one dimension** — the **loss model** — and it is one dimension from
+the family's reference in the *same* three ways the sibling is
+(`composite(depth,impairment,metric)@lone-tail`, the label the checker derives
+for both, because a relation is derived against a family's own reference row and
+not against a sibling). Everything else is the sibling's: the dual lane, the
+request/response shape at `depth = 1`, both seeds (41 and 42), `owd25` with
+100 ms jitter, the 15 s window, the 256 B message and no bulk lane. Both models
+run **in the same test, alternately, per window**, so a difference between them
+is attributable to the loss model and not to host drift between two tests. The
+instrument is the sibling's own: `loss_shape`, `ladder_inputs`,
+`corrected_rung_counts`, `rung_threshold_ms`, `RUNG_DIST_THRESHOLDS`,
+`RUNG_DIST_BINS` and the `RUNG_DIST_BAND_LOW`/`_HIGH` band.
+
+*The comparability, as arithmetic.* `gilbert_elliott_loss(pct, mean_burst)`
+builds the two-state model `p14 = p23 = p32 = 0`, whose mean burst is `1 / p31`
+and whose steady-state loss share is `p13 / (p13 + p31)`; the preset chooses
+`p31 = 1 / mean_burst` and `p13 = pct / (mean_burst * (1 - pct))` so that share
+is `pct`. At `pct = 5`, `mean_burst = 8` the scaled integers the link carries are
+`p31 = 536870912` and `p13 = 28256364`, so the model's long-run rate is
+`28256364 / 565127276 = 0.0500000004`. The independent twin's threshold is
+`loss_pct(5) = 214748360` of `u32::MAX`, i.e. `0.0500000` — the two agree to
+`~4e-9`, a relative difference of `~8e-8`. The arm does not take that on trust:
+it re-reads each model's rate from the configuration the link carries
+(`loss_shape`) and asserts the loss its own counters measured against it (in the
+runs below, `4.9 %` applied where `5.0 %` is declared on the independent arm and
+`6.6–6.8 %` on the correlated one, both inside the `[0.5×, 2×]` check the
+sibling probe uses).
+
+*What it gates.* Four assertions, the first three of them properties of the
+law: the correlated arm's first-rung count sits inside its own law's band (the
+sibling's check, so this arm carries the same law); the independent arm reaches
+the **second** rung **never**, because its burst is one datagram and
+`floor(1 / 6) = 0` while the correlated arm's own law puts `5.4–5.6` such rounds
+in the same pool; the independent arm's first-rung count stays under the *upper*
+band of the correlated model's law, so a collapsed cover (which would put ~70
+rounds a window there) cannot pass as independence; and both arms' own-wire
+multiple stays inside the M2 lone-tail guard `[1×, 14×]`.
+
+*What it measures and does not gate.* Three clean runs of this revision (four
+windows per model each; libtest stamps 149.32 s and 149.81 s — the latter is the
+run the whole `--ignored` target shares, `finished in 280.91s` with the field
+and sibling probes):
+
+| reading | correlated (GE 5 %, mean 8) | independent (iid 5 %) |
+| --- | --- | --- |
+| rounds (pooled) | 3894 / 3783 / 3747 | 5987 / 5084 / 5687 |
+| `> 250 ms` — one rung or more | 13 / 8 / 12 | 8 / 10 / 5 |
+| `> 550 ms` — two rungs or more | 2 / 3 / 3 | 0 / 0 / 0 |
+| `> 1150 ms` — four rungs or more | 1 / 1 / 2 | 0 / 0 / 0 |
+| deepest ladder | 1612.0 ms (5.37 rungs) / 1688.6 (5.63) / 1850.7 (6.17) | 430.0 ms (1.43) / 507.8 (1.69) / 426.2 (1.42) |
+| p99 | 180.1 / 163.3 / 168.8 ms | 117.9 / 122.0 / 121.5 ms |
+| p99.9 | 412.5 / 413.5 / 367.4 ms | 250.6 / 275.2 / 237.8 ms |
+| loss applied (of 5.0 % declared) | 6.60 / 6.62 / 6.65 % | 4.88 / 4.94 / 4.87 % |
+| own-wire multiple | 6.078× / 6.092× / 6.228× | 6.425× / 6.080× / 5.959× |
+
+(The same instrument on the sibling's own four GE windows reads `> 250 ms` 8
+pooled and `> 550 ms` 4 pooled, the four events the section above lists at
+1510.5, 1037.2, 996.6 and one of 276.1–578.3 ms.)
+
+The **direction**, stated plainly: **yes on depth, no on frequency, and not at
+all on the wire.** The correlated process produces a longer ladder — it reaches
+the second rung in every run (`2`, `3` and `3` of `3894`, `3783` and `3747`
+rounds) where the independent one reaches it in none (`0` of `5987`, `5084` and
+`5687`), its deepest excursion is `3.3–3.9×` deeper (`1612.0`, `1688.6` and
+`1850.7` ms against `430.0`, `507.8` and `426.2`), and its tail percentiles move
+with it (`p99` `1.34–1.53×`, `p99.9` `1.33–1.65×`). Its *first-rung* count does
+**not** order the two models — `13` against `8`, `8` against `10` and `12`
+against `5` — i.e. the independent arm produced *more* rounds above the floor in
+one of the three runs — and the wire does not move (`−0.35×`, `+0.01×`,
+`+0.27×`): the six-datagram cover a lone tail sends per message is the same on
+both arms, so the repair traffic a burst adds is a rounding error against it.
+The trade a correlated process raises — fewer loss events, more repair per event
+— is therefore **not visible in the wire at this mean rate**, and the honest
+reading is that a burst buys ladder depth, not wire.
+
+*The negative, and what it costs the law.* The independent arm's `> 250 ms`
+rounds are not zero, which is what the law's `burst = 1` branch predicts
+(`floor(1 / 6) = 0`): they are `8`, `10` and `5`, in `250.2–430.0`,
+`265.7–507.8` and `267.1–426.2` ms. So the first threshold is **not** a
+burst-frequency instrument — an independent loss process produces rounds above
+the derived floor too — and the count the sibling probe asserts is a burst
+component *plus* a non-burst one. The first run's eight independent values are
+`262.1 250.6 269.3 430.0 262.1 258.4 253.9 250.2`, a body sitting within
+`0.2–20 ms` of the floor `sample_delay`'s clamp derives (`2 × (25 + 100) = 250
+ms`) with one at `430.0`; the correlated arm's thirteen are the same body
+(`253.3–523.1`) plus those that are plainly ladders (`956.0`, `1612.0`). Two
+consequences are recorded rather than papered over: the law explains the
+ladder's **height**, not the first-rung frequency, and the first threshold's
+derivation (`any round above the floor waited for a repair`) holds as an upper
+bound on what a repair-free round can reach rather than as a tight boundary — a
+handful of rounds in the `250–270 ms` band may have waited for nothing, which is
+the same unattributed component the `field_rtt` paragraph above records. That is
+why the arm gates the *depth* side, where the law makes a hard statement, and
+reports the frequency side with both arms' numbers. The maximum is asserted on
+no arm here, for the reason the section above gives.
+
+*Its vacuity pair, and the runs.* Both faults perturb the arm's **input** — the
+impairment — and both are visible in the log *before* the verdict, because the
+arm prints each model's `mean_burst` and declared rate before it measures a
+window (this is the mutation-applied evidence, not an inference from the
+verdict):
+
+```
+# MANDATE_SMOKE_FAULT=M1_LOSS_MODEL_uncorrelated
+[loss-model] arm=lone_tail_iid mean_burst=1.0000 datagrams_per_transmission=6 declared_loss=0.049999999
+[loss-model] arm=lone_tail_ge mean_burst=1.0000 datagrams_per_transmission=6 declared_loss=0.050000000
+[loss-model] check=correlated-law observed=8 corrected=0.0 band=[0.00,0.00] verdict=FAIL
+FAILED ... finished in 148.66s
+
+# MANDATE_SMOKE_FAULT=M1_LOSS_MODEL_correlated
+[loss-model] arm=lone_tail_iid mean_burst=8.0000 datagrams_per_transmission=6 declared_loss=0.050000000
+[loss-model] arm=lone_tail_ge mean_burst=8.0000 datagrams_per_transmission=6 declared_loss=0.050000000
+[loss-model] check=independent-cannot-climb iid_ge2=2 correlated_ge2=5 (the law's own rate over this pool is 5.68 correlated, 0.00 independent) verdict=FAIL
+FAILED ... finished in 149.87s
+```
+
+The first forces the correlated model's mean burst to one datagram —
+independent loss wearing the four-state model's name — so the law's own
+prediction collapses to zero while the arm's shallow rounds do not, and the
+band assertion fails. The second hands the control arm the correlated model, so
+it climbs the second rung twice and the discrimination assertion fails. An arm
+whose reference pair collapsed onto one loss model, or whose control lost its
+independence, is red on the run that changed it, and each fault's own
+`mean_burst` line is what shows the fault was applied before its verdict is
+read.
+
 **The instrument, and its vacuity pair.** `censoring` reads the per-sample
 series for the conjunction of two facts, and both are needed. *The series ends
 on a climb*: the final sample is the series maximum and either holds a whole
@@ -1245,6 +1392,7 @@ mux_stream_fairness::mux_stream_fairness_longrun = full
 mux_stream_fairness::mux_stream_fairness_sweep = full
 mandate_smoke::m1_lone_tail_field_rtt = full
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep = full
+mandate_smoke::m1_lone_tail_loss_model = full
 mandate_smoke::m1_lone_tail_rung_distribution = full
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
@@ -1372,6 +1520,7 @@ mux_stream_fairness::mux_stream_fairness_longrun
 mux_stream_fairness::mux_stream_fairness_sweep
 mandate_smoke::m1_lone_tail_field_rtt
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep
+mandate_smoke::m1_lone_tail_loss_model
 rtp_and_mux::mux_over_rtp_over_netem_clean_link_echoes
 rtp_and_mux::rtp_over_netem_clean_link_delivers_data
 rtp_and_mux::rtp_over_netem_reliability_survives_mild_loss

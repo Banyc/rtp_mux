@@ -262,8 +262,9 @@ fn out_dir() -> PathBuf {
 }
 
 /// The deliberate-fault selector used only by the vacuity demonstrations:
-/// `M1_latency`, `M2_wire`, `M2_delivery`, `M3_starve`, `M4_starve` or
-/// `M4_drop`. Unset in every real
+/// `M1_latency`, `M1_FIELD_RTT_slow`, `M1_LOSS_MODEL_uncorrelated`,
+/// `M1_LOSS_MODEL_correlated`, `M2_wire`, `M2_delivery`, `M3_starve`,
+/// `M4_starve` or `M4_drop`. Unset in every real
 /// run (the runner never sets it). Faults perturb an arm's *input* — the
 /// impairment or the offered payload — never the assertion, so the failure is
 /// produced by the measurement path.
@@ -1956,6 +1957,496 @@ fn rung_burst(inputs: &LadderInputs, k: usize) -> f64 {
 fn corrected_rung_counts(inputs: &LadderInputs, rounds: u64) -> [f64; RUNG_DIST_THRESHOLDS.len()] {
     let aligned = rounds as f64 * inputs.loss / inputs.mean_burst;
     RUNG_DIST_THRESHOLDS.map(|k| aligned * burst_tail_probability(inputs, rung_burst(inputs, k)))
+}
+
+// ────────────── the loss model, as one attributable dimension ───────────────
+
+/// The mean per-datagram loss rate both arms of the loss-model probe run at:
+/// the `gilbert_elliott_loss(5.0, 8.0)` preset's steady-state share. The
+/// independent twin is given this threshold, and the probe re-reads both arms'
+/// rates out of the configuration the link actually carries
+/// ([`loss_shape`]) rather than trusting this constant.
+const LOSS_MODEL_PCT: u32 = 5;
+
+/// Windows **per model** in the loss-model probe. The two models run inside one
+/// test, alternately, at the same seeds on the same host, so the pairing — not
+/// a longer sample — is what makes the dimension attributable. Four windows is
+/// the sibling probe's own sample size, which is what the correlated arm's
+/// first-rung band assertion needs to carry the same exposure it carries
+/// there: the law predicts `~930 * 0.05/8 * (7/8)^5 = 2.99` rungs a window, so
+/// four windows put its pooled count at ~12 against a band's low side of
+/// ~3, and the deeper reading the discrimination rests on is the *second*
+/// rung (`floor + one step`), which the law puts at `~930 * 0.05/8 *
+/// (7/8)^11 = 1.34` a window — a pooled ~5.4, whose probability of a zero draw
+/// is `0.4 %`.
+const LOSS_MODEL_RUNS: usize = 4;
+
+/// One loss model's pooled reading in the loss-model probe, every number read
+/// from that arm's own runs and its own configured impairment.
+struct LossModelArm {
+    label: &'static str,
+    /// The model's mean loss-burst length, in forwarded datagrams.
+    mean_burst: f64,
+    /// The model's long-run loss probability.
+    loss: f64,
+    runs: usize,
+    rounds: u64,
+    /// Rounds over each [`RUNG_DIST_THRESHOLDS`] threshold, pooled.
+    threshold: [usize; RUNG_DIST_THRESHOLDS.len()],
+    /// The law's aligned-burst prediction for the same pooled windows.
+    corrected: [f64; RUNG_DIST_THRESHOLDS.len()],
+    /// The law without the alignment term, printed beside it.
+    uncorrected: [f64; RUNG_DIST_THRESHOLDS.len()],
+    /// Rounds per rung bin, pooled.
+    bins: Vec<usize>,
+    /// The deepest ladder any sample reached, in rungs.
+    max_rungs: f64,
+    /// The pooled round trips, for the tail summary.
+    samples: Vec<f64>,
+    sent: u64,
+    received: u64,
+    wire_bytes: u64,
+    offered_bytes: u64,
+    /// The widest own-wire multiple of any single window.
+    worst_wire_x: f64,
+    /// Mean loss the link applied, and the share its model declares.
+    applied: f64,
+    declared: f64,
+}
+
+impl LossModelArm {
+    fn new(spec: &ArmSpec) -> Self {
+        let (mean_burst, loss) = loss_shape(spec);
+        Self {
+            label: spec.name,
+            mean_burst,
+            loss,
+            runs: 0,
+            rounds: 0,
+            threshold: [0; RUNG_DIST_THRESHOLDS.len()],
+            corrected: [0.0; RUNG_DIST_THRESHOLDS.len()],
+            uncorrected: [0.0; RUNG_DIST_THRESHOLDS.len()],
+            bins: vec![0; RUNG_DIST_BINS],
+            max_rungs: 0.0,
+            samples: Vec::new(),
+            sent: 0,
+            received: 0,
+            wire_bytes: 0,
+            offered_bytes: 0,
+            worst_wire_x: 0.0,
+            applied: 0.0,
+            declared: 0.0,
+        }
+    }
+
+    /// The pooled own-wire multiple: the interactive c2s wire the impairment
+    /// proxy forwarded over the offered payload, both summed over the pool.
+    fn wire_x(&self) -> f64 {
+        if self.offered_bytes == 0 {
+            f64::INFINITY
+        } else {
+            self.wire_bytes as f64 / self.offered_bytes as f64
+        }
+    }
+
+    /// Pooled `> 250 ms` rounds: the rigorous rung indicator, since a round
+    /// trip on this arm is at most `2 * (OWD + HOSTILE_JITTER)` unless it
+    /// waited for a repair.
+    fn over250(&self) -> usize {
+        self.threshold[0]
+    }
+}
+
+/// The loss model as a **dimension** of the lone-tail regime: the `lone_tail`
+/// arm's lane, request/response shape, depth, window, seeds, one-way delay,
+/// jitter and message size held fixed, with the impairment's loss model
+/// replaced — the four-state Gilbert-Elliott burst model against independent
+/// loss at the same mean rate — and the rung distribution, the tail and the
+/// own-wire multiple read off both.
+///
+/// **Comparability, by arithmetic rather than assertion.**
+/// `gilbert_elliott_loss(pct, mean_burst)` builds the two-state model
+/// `p14 = p23 = p32 = 0`: a delivered packet leaves the gap state with `p13`, a
+/// lost packet returns to it with `p31`, so the mean burst is `1 / p31` and the
+/// steady-state loss share is `p13 / (p13 + p31)`. The preset chooses
+/// `p31 = 1 / mean_burst` and `p13 = pct / (mean_burst * (1 - pct))`, which
+/// makes that share exactly `pct`; at `pct = 5`, `mean_burst = 8` the scaled
+/// integers are `p31 = 536870912` and `p13 = 28256364`, so the model's rate is
+/// `28256364 / 565127276 = 0.0500000004`. The independent twin's threshold is
+/// `loss_pct(5) = 214748360` of `u32::MAX`, i.e. `0.0500000` — the two agree
+/// to `~4e-9`, a relative difference of `~8e-8`. The probe prints both rates
+/// beside the loss each link's own counters measured, so the pair is shown to
+/// be comparable rather than declared so.
+///
+/// **What it varies.** The loss model, and only the loss model: every other
+/// setting is the sibling `mandate_smoke::m1_lone_tail_rung_distribution`'s
+/// (itself the `lone_tail` arm's), so the two rows differ in exactly one
+/// declared cell dimension, `loss-model=`.
+///
+/// **What it gates, and what it only measures.** The law the declaration
+/// carries is `n = floor(burst / m)` — a statement about *burst length*, so at
+/// one mean rate the correlated model's `mean_burst` sets the ladder and the
+/// independent model's cannot. These quantities are asserted:
+///
+/// * the correlated arm's first-rung count sits inside its own law's band (the
+///   sibling probe's check, so this arm carries the same law);
+/// * the independent arm reaches the **second** rung **never** — its burst is
+///   one datagram, `floor(1 / 6) = 0`, and the six-datagram cover consumes it
+///   whole, while the correlated arm's own law puts `~5.4` such rounds in the
+///   same pool;
+/// * the independent arm's first-rung count stays below the *upper* band of the
+///   correlated model's law, so a collapsed cover (which would put ~70 rounds a
+///   window there) cannot pass as independence;
+/// * both arms' own-wire multiple stays inside the M2 lone-tail guard and above
+///   the payload.
+///
+/// The tail's *level* (max, p99, p999), the ladder's **depth** and the
+/// **wire's direction** are printed and not asserted. A maximum is one draw of
+/// a geometric burst — `GATE.md` records why no M1 arm asserts one — and a
+/// lower bound on the correlated arm's second-rung count would be a guard with
+/// no margin over the one or two events four windows produce, which is the
+/// family of check that fails on its own noise. What the arm asserts on the
+/// direction is the side the law makes a hard statement about: an independent
+/// burst cannot climb a rung. The wire is the same six datagrams of cover per
+/// message on both arms, so whether repair traffic moves it is a measurement
+/// the arm reports rather than a bound it invents.
+///
+/// It is a **new** arm: `clean`, `hostile`, `lone_tail`, the field-RTT arms and
+/// the rung-distribution probe keep their impairment, windows, cadence, seeds,
+/// tiers and assertions. Its vacuity demonstrations are input faults —
+/// `MANDATE_SMOKE_FAULT=M1_LOSS_MODEL_uncorrelated` breaks the correlated
+/// model's burst state (a mean burst of one datagram is independent loss
+/// wearing the four-state model's name) and
+/// `MANDATE_SMOKE_FAULT=M1_LOSS_MODEL_correlated` gives the control arm the
+/// correlated model — so each failure is produced by the measurement path.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "lone-tail loss-model probe (the iid/GE pair at one mean loss); eight ~19 s windows; run with --ignored --nocapture"]
+async fn m1_lone_tail_loss_model() {
+    let _serial = SERIAL.lock().await;
+    let base = mandate_arms("M1")
+        .into_iter()
+        .find(|spec| spec.name == "lone_tail")
+        .expect("[loss-model] the M1 arm set must carry the lone_tail arm");
+
+    // The same regime, independent loss at the correlated model's own mean
+    // rate: only `loss_model` (and the threshold it reads) moves.
+    let mut iid_c2s = base.int_c2s.clone();
+    let mut iid_s2c = base.int_s2c.clone();
+    iid_c2s.loss_model = LossModel::Random;
+    iid_c2s.loss = loss_pct(LOSS_MODEL_PCT);
+    iid_s2c.loss_model = LossModel::Random;
+    iid_s2c.loss = loss_pct(LOSS_MODEL_PCT);
+    let mut ge_c2s = base.int_c2s.clone();
+    let mut ge_s2c = base.int_s2c.clone();
+    match fault("M1_LOSS_MODEL").as_deref() {
+        // Break the correlation: the four-state model with a mean burst of one
+        // datagram has no burst state to consume the cover, so the correlated
+        // arm collapses onto the independent one and fails its own law's band.
+        Some("M1_LOSS_MODEL_uncorrelated") => {
+            ge_c2s.loss_model = gilbert_elliott_loss(5.0, 1.0);
+            ge_s2c.loss_model = gilbert_elliott_loss(5.0, 1.0);
+        }
+        // Break the independence: the control arm is handed the correlated
+        // model, so it leaves the region the law says an independent model must
+        // stay in and the discrimination assertion fails.
+        Some("M1_LOSS_MODEL_correlated") => {
+            iid_c2s.loss_model = gilbert_elliott_loss(5.0, 8.0);
+            iid_s2c.loss_model = gilbert_elliott_loss(5.0, 8.0);
+        }
+        _ => {}
+    }
+    let specs = [
+        ArmSpec {
+            name: "lone_tail_iid",
+            int_c2s: iid_c2s,
+            int_s2c: iid_s2c,
+            ..base.clone()
+        },
+        ArmSpec {
+            name: "lone_tail_ge",
+            int_c2s: ge_c2s,
+            int_s2c: ge_s2c,
+            ..base.clone()
+        },
+    ];
+
+    eprintln!(
+        "[loss-model] regime lane=dual shape=request-response depth=1 link=owd{}ms-jitter{}ms, seeds {} and {}, no bulk lane",
+        base.int_c2s.latency.as_millis(),
+        base.int_c2s.jitter.as_millis(),
+        base.int_c2s.seed,
+        base.int_s2c.seed,
+    );
+    let mut arms: Vec<LossModelArm> = specs.iter().map(LossModelArm::new).collect();
+    for arm in &arms {
+        eprintln!(
+            "[loss-model] arm={} mean_burst={:.4} datagrams_per_transmission={} declared_loss={:.9}",
+            arm.label, arm.mean_burst, TAIL_DATAGRAMS_PER_TRANSMISSION, arm.loss,
+        );
+    }
+
+    for rep in 0..LOSS_MODEL_RUNS {
+        for (index, spec) in specs.iter().enumerate() {
+            let run =
+                with_timeout(ARM_DEADLINE, "loss-model/lone_tail", run_arm(spec.clone())).await;
+            let inputs = ladder_inputs(spec, run.int_c2s_packets, run.window);
+            let arm = &mut arms[index];
+            assert_eq!(
+                spec.name, run.name,
+                "[loss-model] run {rep} of {} is not the arm the probe asked for",
+                spec.name,
+            );
+            assert!(
+                run.samples.len() >= CENSORING_MIN_SAMPLES,
+                "[loss-model] {} run {rep} produced {} rounds, too few for a rung histogram: the probe measured nothing",
+                spec.name,
+                run.samples.len(),
+            );
+            // The loss the link *applied*, counted by the link, against the
+            // share its own model declares: the two models' comparability is a
+            // measurement, not a claim.
+            let applied = run.int_c2s_counters.dropped as f64 / run.int_c2s_packets as f64;
+            assert!(
+                applied >= 0.5 * inputs.loss && applied <= 2.0 * inputs.loss,
+                "[loss-model] {} run {rep} applied {:.4} loss on {} c2s datagrams but its impairment declares {:.4}: the law's `loss` term is not this link's",
+                spec.name,
+                applied,
+                run.int_c2s_packets,
+                inputs.loss,
+            );
+
+            let floor_ms = LONE_TAIL_LADDER_FLOOR_MS;
+            let run_floor_ms = run.samples.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mut by_threshold = [0usize; RUNG_DIST_THRESHOLDS.len()];
+            let mut bins = vec![0usize; RUNG_DIST_BINS];
+            let mut max_rungs = 0.0f64;
+            for rtt in &run.samples {
+                max_rungs = max_rungs.max((rtt - run_floor_ms) / inputs.step_ms);
+                for (slot, threshold) in by_threshold.iter_mut().zip(RUNG_DIST_THRESHOLDS) {
+                    if *rtt > rung_threshold_ms(threshold) {
+                        *slot += 1;
+                    }
+                }
+                let bin = if *rtt <= floor_ms {
+                    0
+                } else {
+                    1 + (((rtt - floor_ms) / inputs.step_ms) as usize).min(RUNG_DIST_BINS - 2)
+                };
+                bins[bin] += 1;
+            }
+            let corrected = corrected_rung_counts(&inputs, run.samples.len() as u64);
+            let uncorrected = law_rung_counts(&inputs);
+            eprintln!(
+                "[loss-model] arm={} run={rep} rounds={} c2s={} dropped={} applied={:.4} declared={:.4} E={:.1} max_rungs={:.2} over250={} wire_x={:.3} p50={:.1} p99={:.1} p999={:.1} max={:.1}",
+                arm.label,
+                run.samples.len(),
+                run.int_c2s_packets,
+                run.int_c2s_counters.dropped,
+                applied,
+                inputs.loss,
+                expected_bursts(&inputs),
+                max_rungs,
+                by_threshold[0],
+                run.wire_x,
+                run.summary.p50,
+                run.summary.p99,
+                run.summary.p999,
+                run.summary.max,
+            );
+            eprintln!(
+                "[loss-model] arm={} run={rep} measured {} corrected {} uncorrected {} rounds_per_rung_bin(0..{RUNG_DIST_BINS})={bins:?}",
+                arm.label,
+                rung_count_row(&by_threshold),
+                predicted_row(&corrected),
+                predicted_row(&uncorrected),
+            );
+
+            arm.runs += 1;
+            arm.rounds += run.samples.len() as u64;
+            for (slot, value) in arm.threshold.iter_mut().zip(by_threshold) {
+                *slot += value;
+            }
+            for (slot, value) in arm.bins.iter_mut().zip(bins) {
+                *slot += value;
+            }
+            for (slot, value) in arm.corrected.iter_mut().zip(corrected) {
+                *slot += value;
+            }
+            for (slot, value) in arm.uncorrected.iter_mut().zip(uncorrected) {
+                *slot += value;
+            }
+            arm.max_rungs = arm.max_rungs.max(max_rungs);
+            arm.samples.extend(run.samples.iter().copied());
+            arm.sent += run.summary.sent;
+            arm.received += run.summary.received;
+            arm.wire_bytes += run.int_c2s_wire_bytes;
+            arm.offered_bytes += run.offered_bytes;
+            arm.worst_wire_x = arm.worst_wire_x.max(run.wire_x);
+            arm.applied += applied;
+            arm.declared += inputs.loss;
+        }
+    }
+
+    let runs = LOSS_MODEL_RUNS as f64;
+    for arm in &arms {
+        let tail = summarize(arm.samples.clone(), arm.sent, arm.received, 0, 0.0);
+        eprintln!(
+            "[loss-model] pooled arm={} runs={} rounds={} applied={:.4} declared={:.4} measured {} corrected {} uncorrected {} rounds_per_rung_bin(0..{RUNG_DIST_BINS})={:?}",
+            arm.label,
+            arm.runs,
+            arm.rounds,
+            arm.applied / runs,
+            arm.declared / runs,
+            rung_count_row(&arm.threshold),
+            predicted_row(&arm.corrected),
+            predicted_row(&arm.uncorrected),
+            arm.bins,
+        );
+        eprintln!(
+            "[loss-model] pooled arm={} max_rungs={:.2} over250={} ({:.3}%) p50={:.1} p99={:.1} p999={:.1} max={:.1} wire_x={:.3} worst_run_wire_x={:.3}",
+            arm.label,
+            arm.max_rungs,
+            arm.over250(),
+            tail.over250_pct * 100.0,
+            tail.p50,
+            tail.p99,
+            tail.p999,
+            tail.max,
+            arm.wire_x(),
+            arm.worst_wire_x,
+        );
+        let waited: Vec<String> = arm
+            .samples
+            .iter()
+            .filter(|rtt| **rtt > LONE_TAIL_LADDER_FLOOR_MS)
+            .map(|rtt| format!("{rtt:.1}"))
+            .collect();
+        eprintln!(
+            "[loss-model] pooled arm={} rounds_above_the_{LONE_TAIL_LADDER_FLOOR_MS:.0}ms_floor=[{}] (the rung each waited is that value less the floor, over the {LADDER_STEP_MS:.0} ms step)",
+            arm.label,
+            waited.join(" "),
+        );
+    }
+
+    let iid = &arms[0];
+    let ge = &arms[1];
+    // The correlated arm's own law, at the first rung, on its own windows: the
+    // sibling probe's check, so this arm carries the same law the declaration
+    // states.
+    let ge_band_ok = ge.over250() as f64 >= RUNG_DIST_BAND_LOW * ge.corrected[0]
+        && ge.over250() as f64 <= RUNG_DIST_BAND_HIGH * ge.corrected[0];
+    // The law's discrimination, stated at the depth it is a statement about.
+    // `RUNG_DIST_THRESHOLDS[1]` is the second rung (`floor + one step`), and
+    // `n = floor(burst / m) = 2` needs a 12-datagram aligned burst: the
+    // correlated model's own aligned-burst rate puts ~5.4 such windows in the
+    // pool, while the independent model's `floor(1 / 6) = 0` forbids one
+    // outright. Only the independent side is *gated*: its bound is a property
+    // of the law's burst term, whereas a lower bound on the correlated side
+    // would be a guard with no margin over the one-to-two events four windows
+    // produce, so the measured direction is reported beside it instead.
+    let iid_shallow_only = iid.threshold[1] == 0;
+    // Independence must not be *worse* than the correlated model's own upper
+    // band: a cover that collapsed would put ~70 first-rung rounds a window on
+    // the independent arm, far above the band the law budgets for bursts.
+    let iid_within_the_ge_band = iid.over250() as f64 <= RUNG_DIST_BAND_HIGH * ge.corrected[0];
+    eprintln!(
+        "[loss-model] check=correlated-law observed={} corrected={:.1} band=[{:.2},{:.2}] verdict={}",
+        ge.over250(),
+        ge.corrected[0],
+        RUNG_DIST_BAND_LOW * ge.corrected[0],
+        RUNG_DIST_BAND_HIGH * ge.corrected[0],
+        verdict(ge_band_ok),
+    );
+    eprintln!(
+        "[loss-model] check=independent-cannot-climb iid_ge2={} correlated_ge2={} (the law's own rate over this pool is {:.2} correlated, 0.00 independent) verdict={}",
+        iid.threshold[1],
+        ge.threshold[1],
+        ge.corrected[1],
+        verdict(iid_shallow_only),
+    );
+    eprintln!(
+        "[loss-model] check=independence-not-worse iid_ge1={} allowance=<= {:.1} (band-high {RUNG_DIST_BAND_HIGH} x the correlated law's own first-rung prediction {:.2}) verdict={}",
+        iid.over250(),
+        RUNG_DIST_BAND_HIGH * ge.corrected[0],
+        ge.corrected[0],
+        verdict(iid_within_the_ge_band),
+    );
+    let ge_tail = summarize(ge.samples.clone(), ge.sent, ge.received, 0, 0.0);
+    let iid_tail = summarize(iid.samples.clone(), iid.sent, iid.received, 0, 0.0);
+    eprintln!(
+        "[loss-model] measured_direction max_rungs ge={:.2} iid={:.2} | deepest_ladder_ms ge={:.1} iid={:.1} | p99 ge={:.1} iid={:.1} | p999 ge={:.1} iid={:.1} | max ge={:.1} iid={:.1} | over250 ge={} iid={} | ge2 ge={} iid={} (the depth is where the correlated arm is longer; the first-rung count is not far apart and the arm reports it rather than claiming it)",
+        ge.max_rungs,
+        iid.max_rungs,
+        ge_tail.max,
+        iid_tail.max,
+        ge_tail.p99,
+        iid_tail.p99,
+        ge_tail.p999,
+        iid_tail.p999,
+        ge_tail.max,
+        iid_tail.max,
+        ge.over250(),
+        iid.over250(),
+        ge.threshold[1],
+        iid.threshold[1],
+    );
+    eprintln!(
+        "[loss-model] measured_direction wire_x ge={:.3} iid={:.3} difference={:+.3}x (the cover is the same six datagrams per message on both arms, so the repair traffic the correlated arm adds is what this difference measures)",
+        ge.wire_x(),
+        iid.wire_x(),
+        ge.wire_x() - iid.wire_x(),
+    );
+
+    assert!(
+        ge_band_ok,
+        "[loss-model] the correlated arm's {} rounds over {LONE_TAIL_LADDER_FLOOR_MS:.0} ms over {} windows sit outside the [{:.2}, {:.2}] its own law predicts ({:.2}), so the ladder the declaration's `n = floor(burst / m)` names is not what this arm measured",
+        ge.over250(),
+        ge.runs,
+        RUNG_DIST_BAND_LOW * ge.corrected[0],
+        RUNG_DIST_BAND_HIGH * ge.corrected[0],
+        ge.corrected[0],
+    );
+    assert!(
+        iid_shallow_only,
+        "[loss-model] at {:.4} mean loss the independent arm reached the second rung {} time(s); the correlated arm reached it {} (its own law puts {:.2} in the pool over {} windows), so `n = floor(burst / m)` says a 12-datagram aligned burst is what climbs a second rung, and the independent model's burst is one datagram that the six-datagram cover consumes whole",
+        iid.declared / runs,
+        iid.threshold[1],
+        ge.threshold[1],
+        ge.corrected[1],
+        ge.runs,
+    );
+    assert!(
+        iid_within_the_ge_band,
+        "[loss-model] the independent arm's {} rounds over {LONE_TAIL_LADDER_FLOOR_MS:.0} ms exceeds the {:.1} the correlated model's own upper band allows: independent loss must not be worse than the law already budgets for a burst model, and a cover that had collapsed would sit an order of magnitude above this",
+        iid.over250(),
+        RUNG_DIST_BAND_HIGH * ge.corrected[0],
+    );
+    for arm in [iid, ge] {
+        assert!(
+            arm.wire_x() <= M2_LONE_WIRE_GUARD_X,
+            "[loss-model] the {} arm's own-wire multiple {:.3}x exceeds the {M2_LONE_WIRE_GUARD_X}x lone-tail guard",
+            arm.label,
+            arm.wire_x(),
+        );
+        assert!(
+            arm.wire_x() >= 1.0,
+            "[loss-model] the {} arm's own-wire multiple {:.3}x is below 1.0, i.e. under the payload it delivered: an observation that was never taken, not a low-redundancy arm",
+            arm.label,
+            arm.wire_x(),
+        );
+    }
+    println!(
+        "LOSS_MODEL PASS runs_per_model={LOSS_MODEL_RUNS} rounds_ge={} rounds_iid={} ge_over250={} (corrected {:.2}) ge_ge2={} iid_over250={} iid_ge2={} ge_wire_x={:.3} iid_wire_x={:.3}",
+        ge.rounds,
+        iid.rounds,
+        ge.over250(),
+        ge.corrected[0],
+        ge.threshold[1],
+        iid.over250(),
+        iid.threshold[1],
+        ge.wire_x(),
+        iid.wire_x(),
+    );
 }
 
 // ───────────────────── M1 at the field's RTT scale ─────────────────────────
