@@ -535,7 +535,7 @@ dependencies = [
 [[package]]
 name = "mux"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/mux.git?tag=v0.0.31#bdabe4a2745b4527c68dbe9256e8709f57f090fc"
+source = "git+https://github.com/Banyc/mux.git?tag=v0.0.32#d78900ef0dc3a26cd59c94f24a988fad4fa56917"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
