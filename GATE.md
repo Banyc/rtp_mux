@@ -195,8 +195,8 @@ sibling arm states.
 
 Every member below is stated against the baseline of its own family, and the
 label is the checker's derivation from the row's own cells rather than a
-judgement call: of the 78 declared rows, 25 are a family's own reference,
-28 vary exactly one dimension from it (`orthogonal`) and 25 vary several
+judgement call: of the 79 declared rows, 25 are a family's own reference,
+28 vary exactly one dimension from it (`orthogonal`) and 26 vary several
 (`composite(…)`), which name the dimensions they vary. No row is a
 `re-measurement` — the two `hol_probe` seed-variant rows and their shared-bulk
 siblings declare a `seeds` dimension instead, because their arms differ from
@@ -234,6 +234,7 @@ rtp_mux_jitter::jitter_shared_bottleneck_arms = perf | 157 | orthogonal@latency-
 rtp_mux_jitter::jitter_request_response_arms = perf | 1170 | baseline@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1-and-2+impairment=owd25-iid2pct-iid6pct-ge5pct-jitter5-100-200ms+metric=p99-and-over250-share
 mandate_smoke::m1_lone_tail_field_rtt = full | 20 | composite(depth,impairment)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd100-ge5pct-jitter100ms+metric=p99-and-over250-share
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep = full | 38 | orthogonal@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1-and-2+impairment=owd100-ge5pct-jitter100ms+metric=p99-and-over250-share
+mandate_smoke::m1_lone_tail_rung_distribution = full | 75 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-ge5pct-jitter100ms+metric=rung-count-vs-burst-law
 hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
 hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
 hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
@@ -290,8 +291,8 @@ rtp_mux_jitter::jitter_nonloss_impairments = perf | 210 | baseline@non-loss-impa
 rtp_mux_jitter::jitter_cellular_timeline_arms = perf | 70 | composite(impairment,lane,report)@non-loss-impairment | non-loss-impairment@lane=dual+layer=rtp-frame+shape=cadence+flows=1+loss=none+rate=none+load=none+impairment=owd25-jitter100-and-200ms+report=liveness+metric=p99
 ```
 
-Declared sums are `default` 149 s, `standard` 41 s, `full` 1646 s and `perf`
-3471 s of the 300 s, 600 s, 1700 s and 3500 s budgets. `full` and `perf` are
+Declared sums are `default` 149 s, `standard` 41 s, `full` 1721 s and `perf`
+3471 s of the 300 s, 600 s, 1800 s and 3500 s budgets. `full` and `perf` are
 raised as a declared change (200 → 300 and 1000 → 3000), and `full` again
 (300 → 1200) for the 34 `full`-tier `hol` rows this revision adds, which cost
 777 s; a tier's declared sum must fit its ceiling, and the sums are the
@@ -308,7 +309,13 @@ family's two `perf` rows, 3191 + 210 + 70 = 3471 s. Each raise is the smallest
 ceiling that admits the measured sum with room for the tier's other,
 still-undeclared rows, and the checker prints both the sum and the ceiling.
 The new field-depth arm adds 38 s to `full` (1608 + 38 = 1646 s), which the
-1700 s ceiling already admits, so no further raise is needed. On the runner's
+1700 s ceiling already admits, and the lone-tail rung-distribution probe adds
+75 s (1646 + 75 = 1721 s), which does not — so `full` is raised again as a
+declared change (1700 → 1800) for a row whose cost is *measured* rather than
+read (74.40 s real, `cargo test --release -p rtp_mux --test mandate_smoke
+-- --ignored --exact m1_lone_tail_rung_distribution --nocapture
+--test-threads=1`), and the 1800 s ceiling admits the sum with 79 s of room for
+the tier's still-undeclared rows. On the runner's
 own scale the `default` sum is 149 s (the M3 smoke row's 108 s plus the
 constitution gate's 40 s and the lossy smoke's 1 s), inside its
 300 s ceiling: no raise. The `standard`
@@ -341,6 +348,9 @@ dimension arms` → 385 s; `jitter_request_response_arms` is `eighteen ~65 s
 request/response (lone-tail) arms` → 1170 s;
 `bulk_lane_goodput_stays_above_capacity_fraction` is `three 15 s dual-lane
 saturated runs` → 45 s; and `m1_lone_tail_field_rtt` states its own `~20 s`.
+The lone-tail rung-distribution probe is the third measured rather than read:
+74.40 s of real time for its four windows (its libtest stamp reads 74.30 s),
+declared 75 s.
 Two are **measured** for this declaration rather than read:
 `mandate_smoke::m3_bulk_goodput_fraction` and
 `jitter_shared_bottleneck_arms`. `jitter_shared_bottleneck_arms` ran in
@@ -513,7 +523,7 @@ critical path, which must fail the gate.
 ```gate-budgets
 default = 300
 standard = 600
-full = 1700
+full = 1800
 perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.constitution = rtp_mux_jitter::jitter_duallane_constitution_gate
@@ -1116,6 +1126,7 @@ mux_stream_fairness::mux_stream_fairness_longrun = full
 mux_stream_fairness::mux_stream_fairness_sweep = full
 mandate_smoke::m1_lone_tail_field_rtt = full
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep = full
+mandate_smoke::m1_lone_tail_rung_distribution = full
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
 rtp_mux::rtp_mux_explorer_relays_onto_better_path = full
@@ -1258,6 +1269,7 @@ perf_probe::probe_rtp_echo_4mib_mss8k
 rtp_mux_jitter::jitter_duallane_constitution_gate
 rtp_mux_jitter::jitter_duallane_constitution_gate_p99
 mandate_smoke::m1_interactive_tail_latency
+mandate_smoke::m1_lone_tail_rung_distribution
 mandate_smoke::m2_interactive_delivery_and_wire
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness

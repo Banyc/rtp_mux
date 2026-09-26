@@ -442,6 +442,14 @@ struct ArmRun {
     /// impairment, i.e. the datagrams its own link offered to the loss
     /// process over the window ([`LadderInputs::datagrams`]).
     int_c2s_packets: u64,
+    /// The same direction's full counter snapshot: the loss the link *applied*
+    /// (`dropped / received`, with no rate shaper and no queue limit on this
+    /// link to mix an overflow drop in) and the impairment it actually ran
+    /// (`delayed`). The loss a model names is a claim about the link, and this
+    /// is the link confirming or contradicting it.
+    int_c2s_counters: netem_test::Counters,
+    /// The s2c direction's counters, for the same reading on the return path.
+    int_s2c_counters: netem_test::Counters,
     offered_bytes: u64,
     wire_x: f64,
     bulk_sink_bytes: u64,
@@ -720,6 +728,7 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
                     (samples, rtts)
                 }
             };
+            let int_s2c = int_pair.stats_s2c();
             int_pair.stop();
             bulk_pair.stop();
             (
@@ -728,6 +737,8 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
                 timeline,
                 int_c2s_wire_bytes,
                 int_c2s_packets,
+                int_c2s,
+                int_s2c,
                 bulk_sink_bytes,
                 bulk_wire_bytes,
             )
@@ -739,6 +750,8 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
         timeline,
         int_c2s_wire_bytes,
         int_c2s_packets,
+        int_c2s_counters,
+        int_s2c_counters,
         bulk_sink_bytes,
         bulk_wire_bytes,
     ) = outcome;
@@ -763,6 +776,8 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
         timeline,
         int_c2s_wire_bytes,
         int_c2s_packets,
+        int_c2s_counters,
+        int_s2c_counters,
         offered_bytes,
         wire_x: if offered_bytes == 0 {
             f64::INFINITY
@@ -1103,11 +1118,27 @@ fn ladder_inputs(spec: &ArmSpec, datagrams: u64, window: Duration) -> LadderInpu
 /// the distribution. What the arm's window must do is contain the worst ladder
 /// it will plausibly show; the margin the derivation leaves to that burst is
 /// reported beside it.
+fn expected_bursts(inputs: &LadderInputs) -> f64 {
+    inputs.datagrams as f64 * inputs.loss / inputs.mean_burst
+}
+
+/// The probability that the arm's own impairment draws a burst of at least `l`
+/// forwarded datagrams: the burst state is geometric in the datagram that
+/// leaves it (`p31` is that per-datagram probability, so `mean_burst = 1 /
+/// p31` and `P(L >= l) = (1 - 1 / mean_burst)^(l - 1)`). Independent loss has
+/// burst length 1 exactly, which is the step function the armour cover needs.
+fn burst_tail_probability(inputs: &LadderInputs, l: f64) -> f64 {
+    if inputs.mean_burst <= 1.0 {
+        return if l <= 1.0 { 1.0 } else { 0.0 };
+    }
+    (1.0 - 1.0 / inputs.mean_burst).powf(l - 1.0)
+}
+
 fn worst_plannable_burst(inputs: &LadderInputs) -> f64 {
     if inputs.mean_burst <= 1.0 {
         return 1.0;
     }
-    let bursts = inputs.datagrams as f64 * inputs.loss / inputs.mean_burst;
+    let bursts = expected_bursts(inputs);
     if bursts <= 1.0 {
         return 1.0;
     }
@@ -1612,6 +1643,319 @@ async fn m1_latency_window_censoring() {
         LADDER_STEP_MS,
         CENSORING_MIN_SAMPLES,
     );
+}
+
+// ─────────── the lone tail's rung counts, measured against the law ───────────
+//
+// The window derivation below rests on two quantities that are not the same
+// kind of object. `E = datagrams * loss / mean_burst` is the number of loss
+// events the arm's own link applies, and it is *arithmetic on the link*: the
+// impairment advances one Markov step per datagram it receives, the steady
+// state makes `loss` the share of datagrams it drops, and `1 / p31` is the mean
+// run of drops, so `E` is exact for the datagrams the link saw. The rung count
+// is not. `floor(l / m)` is what one burst *costs in full transmissions* **when
+// it begins on a transmission's first datagram** — the case the deterministic
+// probe in `rtp`'s send space drives, and the only case it drives — and whether
+// a window's rounds show those rungs is a measurement of the arm.
+//
+// So the law is checked against the arm rather than against itself. This probe
+// measures the rung distribution of the arm's own rounds and prints the law's
+// prediction beside it, per run and pooled. It exists because the two numbers
+// had drifted apart by an order of magnitude in `GATE.md` with nothing in the
+// battery to notice.
+
+/// Runs of the `lone_tail` arm this probe measures. Four pooled windows are
+/// what the reading needs: the ladder is a rare event (`> 250 ms` rounds run at
+/// 2.5 per window) and a two-window sample cannot separate a law that predicts
+/// three such rounds per window from one that predicts thirty with any
+/// confidence. The cost is declared in `GATE.md` against the `full` tier's
+/// ceiling, which this row is the reason to raise.
+const RUNG_DIST_RUNS: usize = 4;
+/// Histogram bins, in rungs: one bin per 300 ms rung, wide enough to hold the
+/// deepest ladder the arm's recording holds.
+const RUNG_DIST_BINS: usize = 12;
+/// The rung thresholds the law is checked at, in rungs: `k` rungs is a ladder
+/// of `k` repair transmissions and `k * m` datagrams of burst.
+const RUNG_DIST_THRESHOLDS: [usize; 4] = [1, 2, 4, 6];
+/// How far the pooled count may sit below/above a law's prediction, as a
+/// ratio. The low side is what rejects a law that predicts *too many* rungs —
+/// the arm's own measurement is the smaller number — and it is also the
+/// instrument's sanity: a ladder frequency of zero means the probe measured
+/// nothing, and a count that cannot notice that is not coverage. The high side
+/// rejects a law that predicts too few.
+const RUNG_DIST_BAND_LOW: f64 = 0.25;
+const RUNG_DIST_BAND_HIGH: f64 = 3.0;
+/// A round trip that waited for no repair can reach `latency + jitter` per
+/// direction and no more, because `sample_delay` clamps at zero and nothing
+/// else on this arm delays a datagram; so **any** round trip above the
+/// two-direction sum waited for a repair, and the count of those rounds is a
+/// lower bound on the rounds with at least one rung — no assumption about the
+/// rung's duration enters. On `lone_tail` that bound is `2 * (25 + 100) = 250`
+/// ms, which is also the M1 ceiling; the two are the same number here rather
+/// than by construction, so the constant is derived from the arm's own
+/// impairment (`OWD` and `HOSTILE_JITTER`) and not reused from the ceiling.
+const LONE_TAIL_LADDER_FLOOR_MS: f64 = 2.0 * (25.0 + 100.0);
+/// The rung thresholds are read off that floor: `k` rungs is a ladder of `k`
+/// repair transmissions, the first of which waits the ladder's own step after
+/// the floor, so the `k`-th threshold is `floor + (k - 1) * step`. The floor
+/// term is the rigorous half (any rung at all lifts the round trip above it);
+/// the step term reads the rungs off the 300 ms grid the arm's own series
+/// shows, and under-counts if the first rung ever waits longer than one step.
+fn rung_threshold_ms(k: usize) -> f64 {
+    LONE_TAIL_LADDER_FLOOR_MS + (k - 1) as f64 * LADDER_STEP_MS
+}
+
+/// Read the `lone_tail` arm for its rung counts and its applied loss: the
+/// ground truth the window derivation is checked against.
+///
+/// Every input is the arm's own — the round-trip series it produced, the
+/// datagrams its c2s link carried and the datagrams that link actually dropped
+/// — so a discrepancy is a discrepancy in the law, not in a transcription.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "lone-tail rung-distribution probe; four ~19 s windows; run with --ignored --nocapture"]
+async fn m1_lone_tail_rung_distribution() {
+    let _serial = SERIAL.lock().await;
+    let spec = mandate_arms("M1")
+        .into_iter()
+        .find(|spec| spec.name == "lone_tail")
+        .expect("[rung-dist] the M1 arm set must carry the lone_tail arm");
+
+    let mut pooled_by_threshold = [0usize; RUNG_DIST_THRESHOLDS.len()];
+    let mut pooled_rounds = 0usize;
+    let mut pooled_bins = vec![0usize; RUNG_DIST_BINS];
+    let mut pooled_corrected = [0.0f64; RUNG_DIST_THRESHOLDS.len()];
+    let mut pooled_uncorrected = [0.0f64; RUNG_DIST_THRESHOLDS.len()];
+    let mut pooled_applied = 0.0f64;
+    let mut pooled_nominal = 0.0f64;
+
+    for rep in 0..RUNG_DIST_RUNS {
+        let run = with_timeout(ARM_DEADLINE, "rung-dist/lone_tail", run_arm(spec.clone())).await;
+        let inputs = ladder_inputs(&spec, run.int_c2s_packets, run.window);
+        assert_eq!(
+            spec.name, run.name,
+            "[rung-dist] run {rep} is not the arm the probe asked for",
+        );
+        assert!(
+            run.samples.len() >= CENSORING_MIN_SAMPLES,
+            "[rung-dist] run {rep} produced {} rounds, too few for a rung histogram: the probe measured nothing",
+            run.samples.len(),
+        );
+        // The loss the link *applied*, counted by the link, against the share
+        // its own impairment declares. The arm's link carries no rate shaper and
+        // no queue limit, so `dropped / received` is the loss model's own output
+        // with no overflow drop mixed in, and the two must agree: a mismatch is
+        // the loss model not being the one this law names.
+        let applied = run.int_c2s_counters.dropped as f64 / run.int_c2s_packets as f64;
+        assert!(
+            applied >= 0.5 * inputs.loss && applied <= 2.0 * inputs.loss,
+            "[rung-dist] run {rep} applied {:.4} loss on {} c2s datagrams but its impairment declares {:.4}: the law's `loss` term is not this link's",
+            applied,
+            run.int_c2s_packets,
+            inputs.loss,
+        );
+
+        let floor_ms = LONE_TAIL_LADDER_FLOOR_MS;
+        let run_floor_ms = run.samples.iter().cloned().fold(f64::INFINITY, f64::min);
+        let mut by_threshold = [0usize; RUNG_DIST_THRESHOLDS.len()];
+        let mut bins = vec![0usize; RUNG_DIST_BINS];
+        let mut max_rungs = 0.0f64;
+        for rtt in &run.samples {
+            let rungs = (rtt - run_floor_ms) / inputs.step_ms;
+            max_rungs = max_rungs.max(rungs);
+            for (slot, threshold) in by_threshold.iter_mut().zip(RUNG_DIST_THRESHOLDS) {
+                if *rtt > rung_threshold_ms(threshold) {
+                    *slot += 1;
+                }
+            }
+            // Bin 0 is the rounds that waited for nothing; bin k > 0 is the
+            // rounds a `k`-rung ladder explains, read on the same floor and
+            // step the thresholds use.
+            let bin = if *rtt <= floor_ms {
+                0
+            } else {
+                1 + (((rtt - floor_ms) / inputs.step_ms) as usize).min(RUNG_DIST_BINS - 2)
+            };
+            bins[bin] += 1;
+        }
+        let corrected = corrected_rung_counts(&inputs, run.samples.len() as u64);
+        let uncorrected = law_rung_counts(&inputs);
+        eprintln!(
+            "[rung-dist] run={rep} rounds={} c2s={} dropped={} forwarded={} delayed={} applied={:.4} nominal={:.4} floor_ms={:.0} step_ms={:.0} E={:.1} max_rungs={:.2}",
+            run.samples.len(),
+            run.int_c2s_packets,
+            run.int_c2s_counters.dropped,
+            run.int_c2s_counters.forwarded,
+            run.int_c2s_counters.delayed,
+            applied,
+            inputs.loss,
+            floor_ms,
+            inputs.step_ms,
+            expected_bursts(&inputs),
+            max_rungs,
+        );
+        eprintln!(
+            "[rung-dist] run={rep} s2c_recv={} s2c_dropped={} s2c_forwarded={} s2c_delayed={}",
+            run.int_s2c_counters.received,
+            run.int_s2c_counters.dropped,
+            run.int_s2c_counters.forwarded,
+            run.int_s2c_counters.delayed,
+        );
+        eprintln!(
+            "[rung-dist] run={rep} measured {} corrected {} uncorrected {}",
+            rung_count_row(&by_threshold),
+            predicted_row(&corrected),
+            predicted_row(&uncorrected),
+        );
+        eprintln!(
+            "[rung-dist] run={rep} rounds_per_rung_bin(0..{RUNG_DIST_BINS})={bins:?} run_floor_ms={run_floor_ms:.2}"
+        );
+        let waited: Vec<String> = run
+            .samples
+            .iter()
+            .filter(|rtt| **rtt > floor_ms)
+            .map(|rtt| format!("{rtt:.1}"))
+            .collect();
+        eprintln!(
+            "[rung-dist] run={rep} rounds_with_a_rung=[{}] (each is one round that waited; the rung it waited is that value less the floor, over the step)",
+            waited.join(" "),
+        );
+
+        pooled_rounds += run.samples.len();
+        for (slot, value) in pooled_by_threshold.iter_mut().zip(by_threshold) {
+            *slot += value;
+        }
+        for (slot, value) in pooled_bins.iter_mut().zip(bins) {
+            *slot += value;
+        }
+        for (slot, value) in pooled_corrected.iter_mut().zip(corrected) {
+            *slot += value;
+        }
+        for (slot, value) in pooled_uncorrected.iter_mut().zip(uncorrected) {
+            *slot += value;
+        }
+        pooled_applied += applied;
+        pooled_nominal += inputs.loss;
+    }
+
+    let runs = RUNG_DIST_RUNS as f64;
+    let measured = pooled_by_threshold.map(|n| n as f64);
+    eprintln!(
+        "[rung-dist] pooled runs={RUNG_DIST_RUNS} rounds={pooled_rounds} applied={:.4} nominal={:.4} rounds_per_rung_bin(0..{RUNG_DIST_BINS})={pooled_bins:?}",
+        pooled_applied / runs,
+        pooled_nominal / runs,
+    );
+    eprintln!(
+        "[rung-dist] pooled measured {} corrected {} uncorrected {}",
+        pooled_row(&measured, runs),
+        pooled_row(&pooled_corrected, runs),
+        pooled_row(&pooled_uncorrected, runs),
+    );
+
+    // The check, against the arm's own measurement, on pooled counts: the
+    // per-window counts are what the law predicts per window and four windows
+    // are what the arm offered. The low side is the instrument's sanity (a
+    // ladder frequency of zero means the probe measured nothing, and a count
+    // that cannot notice that is not coverage) and the discriminator against a
+    // law that predicts too much; the high side rejects a law that predicts too
+    // little, which is what a collapsed armour cover would produce.
+    let observed = measured[0];
+    let corrected = pooled_corrected[0];
+    let uncorrected = pooled_uncorrected[0];
+    let corrected_ok =
+        observed >= RUNG_DIST_BAND_LOW * corrected && observed <= RUNG_DIST_BAND_HIGH * corrected;
+    // The same measurement read against the law this file carried before the
+    // alignment correction, printed so the band is shown to be able to fail
+    // rather than asserted to be tight: the law the correction replaced is
+    // rejected by the very series it was derived from.
+    let uncorrected_ok = observed >= RUNG_DIST_BAND_LOW * uncorrected
+        && observed <= RUNG_DIST_BAND_HIGH * uncorrected;
+    eprintln!(
+        "[rung-dist] vacuity=uncorrected-law observed_ge1={observed:.0} law_ge1={uncorrected:.1} band=[{:.2},{:.2}] verdict={}",
+        RUNG_DIST_BAND_LOW * uncorrected,
+        RUNG_DIST_BAND_HIGH * uncorrected,
+        verdict(uncorrected_ok),
+    );
+    eprintln!(
+        "[rung-dist] check=corrected-law observed_ge1={observed:.0} law_ge1={corrected:.1} band=[{:.2},{:.2}] verdict={}",
+        RUNG_DIST_BAND_LOW * corrected,
+        RUNG_DIST_BAND_HIGH * corrected,
+        verdict(corrected_ok),
+    );
+    assert!(
+        observed >= RUNG_DIST_BAND_LOW * corrected && observed <= RUNG_DIST_BAND_HIGH * corrected,
+        "[rung-dist] the lone_tail arm's {RUNG_DIST_RUNS} windows hold {observed:.0} rounds that waited for a repair, outside the [{:.2}, {:.2}] the corrected law predicts over the same windows ({corrected:.2}): the transmission-boundary rate is not the arm's",
+        RUNG_DIST_BAND_LOW * corrected,
+        RUNG_DIST_BAND_HIGH * corrected,
+    );
+    assert!(
+        !uncorrected_ok,
+        "[rung-dist] the uncorrected law ({uncorrected:.2} rounds over the same windows) is now inside the band around the measured {observed:.0}: the alignment correction this file records is no longer what reconciles the arm, so the correction needs re-deriving rather than trusting",
+    );
+    println!(
+        "RUNG_DIST PASS runs={RUNG_DIST_RUNS} rounds={pooled_rounds} applied={:.4} observed_ge1={observed:.0} corrected_ge1={corrected:.2} uncorrected_ge1={uncorrected:.2}",
+        pooled_applied / runs,
+    );
+}
+
+/// A pooled count vector as `ge1=sum(mean) .. `, so the sum the band is applied
+/// to and the per-window mean a reader compares with the ten-run table are both
+/// on the line.
+fn pooled_row(counts: &[f64], runs: f64) -> String {
+    RUNG_DIST_THRESHOLDS
+        .iter()
+        .zip(counts)
+        .map(|(&k, n)| format!("ge{k}={n:.0}({:.2})", n / runs))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `ge1=.. ge2=.. .. ` for a measured rung-count vector.
+fn rung_count_row(counts: &[usize]) -> String {
+    RUNG_DIST_THRESHOLDS
+        .iter()
+        .zip(counts)
+        .map(|(&k, n)| format!("ge{k}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The same row for a predicted count vector, to two decimals.
+fn predicted_row(counts: &[f64]) -> String {
+    RUNG_DIST_THRESHOLDS
+        .iter()
+        .zip(counts)
+        .map(|(&k, n)| format!("ge{k}={n:.2}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The law as this file carried it: every burst is charged the rung cost of an
+/// *aligned* one, so the rung-producing rate is the all-datagram burst rate `E`.
+fn law_rung_counts(inputs: &LadderInputs) -> [f64; RUNG_DIST_THRESHOLDS.len()] {
+    let expected = expected_bursts(inputs);
+    RUNG_DIST_THRESHOLDS.map(|k| expected * burst_tail_probability(inputs, rung_burst(inputs, k)))
+}
+
+/// The rungs a burst of `k` swallowed transmissions needs, in datagrams.
+fn rung_burst(inputs: &LadderInputs, k: usize) -> f64 {
+    (k * inputs.datagrams_per_transmission as usize) as f64
+}
+
+/// The rounds a window can show at each rung threshold, from the arm's own
+/// numbers and the burst's **alignment**.
+///
+/// A burst costs `floor(l / m)` rungs only when it begins on a transmission's
+/// first datagram: a burst beginning `r` datagrams into a group leaves the
+/// other `m - r` copies delivered, the message arrives, and no rung fires at
+/// all — a case the deterministic probe does not exercise, because it drives the
+/// aligned burst only. The rung-producing events are therefore the bursts that
+/// start on a transmission boundary, and a request/response round starts exactly
+/// one of those. Their rate is `rounds * loss / mean_burst`, the per-datagram
+/// burst-start probability evaluated at the transmission starts rather than at
+/// every datagram the link carried.
+fn corrected_rung_counts(inputs: &LadderInputs, rounds: u64) -> [f64; RUNG_DIST_THRESHOLDS.len()] {
+    let aligned = rounds as f64 * inputs.loss / inputs.mean_burst;
+    RUNG_DIST_THRESHOLDS.map(|k| aligned * burst_tail_probability(inputs, rung_burst(inputs, k)))
 }
 
 // ───────────────────── M1 at the field's RTT scale ─────────────────────────
