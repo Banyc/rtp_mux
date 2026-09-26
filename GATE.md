@@ -159,6 +159,8 @@ recorded as gaps below, so the per-tier sum the checker reports is the declared
 subset.
 
 ```gate-perf-design
+cold_connection::cold_connection_decomposition = standard | 22 | baseline@establishment | cold-connection@lanes=dual+handshake=on+impairment=clean+scale=owd20-and-owd96+metric=min-round-trips-to-stream
+cold_connection::mux_lane_birth_is_one_round_trip = standard | 9 | orthogonal@establishment | cold-connection@lanes=dual+handshake=on+impairment=clean+scale=owd20-and-owd96+metric=mux-pairing-round-trips
 hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full | 66 | baseline | interactive-scaling@flows=4+offer=sequential
 hol_probe::hol_rtt100_ge5_four_interactive_concurrent_frame_delivery = full | 20 | orthogonal | interactive-scaling@flows=4+offer=concurrent
 rtp_mux_jitter::jitter_duallane_constitution_gate = default | 40 | baseline@constitution | M2@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=own-wire-budget
@@ -171,9 +173,10 @@ rtp_mux_jitter::jitter_reorder_direction = perf | 70 | baseline@reorder | reorde
 rtp_mux_jitter::jitter_reorder_rate_curve = perf | 140 | orthogonal@reorder | reorder-rate@impairment=reorder+rate=curve+metric=p99
 ```
 
-Declared sums are `default` 40 s, `full` 191 s and `perf` 910 s of the 300 s,
-200 s and 1000 s budgets; `standard` has no declared row and declares a 600 s
-ceiling so a later row cannot be added without one. The concurrent row is one
+Declared sums are `default` 40 s, `standard` 31 s, `full` 191 s and `perf`
+910 s of the 300 s, 600 s, 200 s and 1000 s budgets. The `standard` ceiling
+keeps its 600 s and now carries the two cold-connection rows, its only
+declared rows. The concurrent row is one
 dimension (`offer`) away from the default baseline: the same four flows, the
 same lane, the same seeds, the same offer, polled together instead of one
 after another. The two `interactive-scaling` rows keep the costs they already
@@ -193,6 +196,24 @@ wall-clock appears in no document is **not** given a number: it is recorded as
 a gap below, so an unmeasured cost is visibly pending rather than plausibly
 guessed.
 
+**The cold-connection rows** are the two `standard` rows of the
+`establishment` family. `cold_connection_decomposition` decomposes a cold
+dual-lane birth against rtp's own public API at two clean regimes (`owd20`
+and `owd96`, calibrated base RTTs ~41 ms and ~192 ms) — the bare rtp opening
+handshake on one lane, the same two lanes dialed sequentially and
+concurrently, and the production `RtpMuxConnector` cold connect — and gates
+the one part rtp_mux owns: the production birth must not pay two *serialized*
+rtp opening handshakes when both lanes are independent.
+`mux_lane_birth_is_one_round_trip` is its one-dimension-away member (the
+metric changes from round trips to the stream to the mux pairing's own round
+trips): on two already-established rtp sessions, the lane hello / pairing /
+first-frame readiness costs exactly one base RTT, which pins the mux-side
+share of the decomposition independently of rtp's handshake. Both costs are
+measured, not stated in an `#[ignore]` reason.
+`RTP_MUX_COLD_CONNECTION_FAULT=serialize` is the vacuity injection: it
+replaces the production arm with a reproduction of the two-serialized-dial
+critical path, which must fail the gate.
+
 ```gate-budgets
 default = 300
 standard = 600
@@ -200,10 +221,12 @@ full = 200
 perf = 1000
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.constitution = rtp_mux_jitter::jitter_duallane_constitution_gate
+baseline.establishment = cold_connection::cold_connection_decomposition
 baseline.fec = rtp_mux_jitter::jitter_fec_arms_2pct
 baseline.frame-reorder = rtp_mux_jitter::jitter_frame_reorder_fec_arms
 baseline.reorder = rtp_mux_jitter::jitter_reorder_direction
 members.constitution = M*
+members.establishment = cold-connection*
 members.fec = fec-tuning*
 members.frame-reorder = frame-reorder-fec
 members.reorder = reorder-*
@@ -222,6 +245,11 @@ inherits the same cell name and is equally misfiled, and it needs its own cost,
 the very thing missing — so no family here was closed by adding an arm.
 
 ```gate-coverage-gaps
+cold-connection@lanes=dual+handshake=on+impairment=loss-or-jitter-or-reorder = the cold birth is measured on clean links only; what loss does to a birth is rtp's opening handshake's own retry behaviour (its `OPENING_TIMEOUT`/`RETRY_INTERVAL`), which the `rtp` crate owns and which a clean-link decomposition cannot attribute to rtp_mux, so no impaired birth row is claimed here.
+cold-connection@lanes=dual+handshake=off = the same birth with the rtp opening handshake disabled is a *different* protocol configuration (the production server binds `handshake: true`); it is measured inside the row as the bare one-lane arm's no-handshake control (min 0.0-0.1 ms, i.e. the whole one-lane cost is the handshake), not as a separate row, because the deployed path never takes it.
+cold-connection@lanes=single+shape=proxy-chain = the row measures the rtp_mux birth on loopback with no proxy in the path; the deployed chain's cold total (and the proxy's share of it) is measured by the proxy-path iteration that owns those arms, and loopback cannot speak to a real path's delay distribution, so no field-scale claim is made here.
+cold-connection@metric=cpu = per-datagram CPU cost is measured by owning-symbol attribution (`tools/samply_hotspots.py`), not by a scenario in this crate.
+cold-connection@lanes=dual+handshake=on+scale=multipath = the multi-path UDP transport (rtp's `mpudp`) has no rtp_mux birth arm; a cell for it belongs to the layer that owns that transport.
 interactive-scaling@flows=2+offer=concurrent = the two-flow rung is the pre-existing serialized `hol_rtt100_ge5_two_interactive_frame_delivery` and stays as it is; the concurrent offer is declared at four flows, the rung this family and M4 name, so a two-flow concurrent row would repeat it at a smaller N without a new regime.
 interactive-scaling@flows=4+offer=concurrent+bulk=saturating = the family's bulk-sharing member (`hol_rtt100_ge5_shared_frame_delivery`) is single-flow with a saturating bulk stream; adding a saturating bulk stream to the concurrent row varies two dimensions from the baseline at once and would need its own derivation for what the shared bottleneck does to the offer floor, so it is left to its own row.
 interactive-scaling@flows=4+offer=concurrent+impairment=clean-or-GE1-or-hostile = the concurrent row is declared on the family's GE5 seed pair (31/32) only; the clean, GE1 and hostile rtt100 rows are single-flow arms, and a concurrent arm on those links would be stated against a different baseline family.
@@ -503,6 +531,8 @@ non-`support` tests reported by `cargo test -p rtp_mux --test <target> --
 --list --ignored`.
 
 ```gate-manifest
+cold_connection::cold_connection_decomposition = standard
+cold_connection::mux_lane_birth_is_one_round_trip = standard
 contested_latency::contested_capped_clean = full
 contested_latency::contested_capped_jitter_loss = perf
 contested_latency::contested_hostile = perf
@@ -621,6 +651,8 @@ own body: a `perf` scenario containing `assert!`/`assert_eq!`/`assert_ne!`/
 (an asserting check filed under the report-only tier would never run).
 
 ```gate-asserting
+cold_connection::cold_connection_decomposition
+cold_connection::mux_lane_birth_is_one_round_trip
 contested_latency::contested_capped_clean
 dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction
 dynamic_contested::dyn_dual_auto_big_first
