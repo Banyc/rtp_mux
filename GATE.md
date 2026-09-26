@@ -744,6 +744,116 @@ latency, inflate the wire, drop a delivery, starve the bulk lane — and the
 gate fails naming the mandate); the harness must not restate this
 constitution.
 
+### M1's observation window: the ladder an arm's own drain can hold
+
+M1's arms report a maximum latency, and a maximum is a measurement only if the
+arm could observe the climb it came from. The M1-latency panel cannot settle
+that on its own: its x range is the data's own extent, so the lone tail's
+largest sample sits exactly at the frame's right edge, and the panel draws the
+gap a long round trip leaves between samples as a straight line — the lane's
+1892.3 ms lone-tail record, after a 1.89 s silence equal to that record's own
+round, is drawn as a near-vertical wall although it is one completed round.
+`mandate_smoke::m1_latency_window_censoring` (`default` tier, not `#[ignore]`d)
+is the instrument that answers it. It is a **new test with no arm retuned**:
+the `clean`, `hostile` and `lone_tail` arms keep their impairment, seeds,
+windows, cadence, tier, guards and `#[ignore]` reasons, and it reads the series
+they already produce through the same arm-run cache M2 reads, so a whole-target
+run pays for no measurement twice and it is the one declared row here with no
+cost of its own: the `mandate_smoke` target's wall over the runs this revision
+measured is 142.48 s with the new test skipped, 142.59 s and 143.18 s with it,
+and 142.60 s on the parent revision — a 0.7 s band the increment does not
+exceed — while its `--exact` invocation alone pays the one M1 measurement
+(49.88 s, its own libtest stamp). The two `#[ignore]`d field-RTT arms print
+their own reading and gain nothing else.
+
+**The window each arm needs, from the ladder's own law.** The lone tail is the
+only source on its direction, so a loss burst is consumed one forwarded
+datagram per datagram the lane sends; one tail transmission emits `m = 6`
+datagrams (mandate 2's "primary + 5 copies", corroborated by the M2 lone-tail
+arm's `lone_wire_x` of 5.91–7.42×); and each rung past the probe budget waits
+rtp's `TAIL_PROBED_MIN_RTO = 300 ms`, the floor that binds on every M1 arm
+because the corroborated term `srtt + max(rttvar, srtt / 4)` is 250 ms even at
+the field arm's 190 ms round trip. A burst of `l` datagrams therefore costs
+`floor(l / m)` rungs and `floor(l / m) * 300 ms`, so the window an arm needs is
+`rungs * step + rtt`. Every input is the arm's own — the burst distribution
+from its `NetemConfig.loss_model` (`1 / p31` and `p13 / (p13 + p31)`), the
+round trip from its one-way delay, the burst budget from the datagrams its own
+c2s link accepted (`Counters::received`, the instrument's one addition to
+`ArmRun`), and the room from its own drain: `GRACE` for a cadence arm, whose
+sample must reach the collector snapshot, and the arm deadline less the offer
+window for a request/response arm, whose round is awaited inside the offer
+loop. The burst is the one the window is expected to contain once — `E` bursts
+occur in it, and the burst exceeded with probability `1 / E` is
+`1 + ln(E) / ln(1 / (1 - 1 / burst))`. That is a design point and not a
+ceiling; the geometric tail is unbounded, and the margin beside it absorbs the
+difference.
+
+| arm | drain | datagrams | burst model | bursts `E` | burst | rungs | needs | room | margin |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `clean` | sink + `GRACE` | 4320 | iid 2 % (no burst) | — | 1 | 0 | 50 ms | 2000 ms | 40× |
+| `hostile` | sink + `GRACE` | 10281 | GE 5 %, mean 8 | 64.3 | 32.2 | 5 | 1550 ms | 2000 ms | 1.29× |
+| `lone_tail` | round awaited in loop | 7950 | GE 5 %, mean 8 | 49.7 | 30.2 | 5 | 1550 ms | 105000 ms | 68× |
+| `field_rtt` | round awaited in loop | 2730 | GE 5 %, mean 8 | 17.1 | 22.2 | 3 | 1100 ms | 105000 ms | 95× |
+| `field_rtt` d2 | round awaited in loop | 2881 | GE 5 %, mean 8 | 18.0 | 22.6 | 3 | 1100 ms | 105000 ms | 95× |
+
+Every window holds. The tightest is the **hostile cadence arm at 1.29×**: its
+sample must reach the collector snapshot, so its room is `GRACE` = 2 s = 6
+rungs, and its own burst budget (5 rungs = 1550 ms) leaves one rung of
+headroom. That is the one M1 place where a longer impairment burst, a shorter
+`GRACE` or a shorter ladder step would begin to truncate a report, and it is
+recorded here as the reading that would move first. The request/response arms
+are not close: the field's own observed 3.2 s ladder is 12 rungs (3.8 s with
+its round trip) against the `lone_tail` arm's 105 s room, 27× inside it, and a
+12-rung ladder needs a burst of at least 72 consecutive datagrams, which
+`gilbert_elliott_loss(5, 8)` produces with probability `(7/8)^71 = 7.7e-5` per
+burst — about once in 220 windows at the arm's own ~50 bursts per window. A
+**cadence** arm could not observe that ladder at all (2 s = 6 rungs); the
+request/response shape is the one that can, and it does.
+
+The derivation is corroborated by the arms' own ceilings. The `field_rtt`
+arm's required 1100 ms sits at the top of the band its runs measure (max 358.3
+/ 434.6 / 581.5 / 1043.6 / 1255.3 ms over six runs on `rtp v0.0.96`), and the
+`lone_tail` arm's 1250–1550 ms requirement is bracketed by its own observed
+records (1469.4 / 1871.3 / 1892.3 ms). The prediction under-states the observed
+ceiling by up to one rung — it is the burst expected once per window, not the
+largest the model can draw — and the room it is compared against is 15–95× the
+requirement, so the under-statement costs no coverage.
+
+**The instrument, and its vacuity pair.** `censoring` reads the per-sample
+series for the conjunction of two facts, and both are needed. *The series ends
+on a climb*: the final sample is the series maximum and either holds a whole
+rung above every earlier sample, or closes a strictly-increasing run whose
+steps are within one rung of each other. The record alone is not evidence —
+with only a handful of extreme samples per run, the largest of them being last
+is common: across the 52 M1 lone-tail runs on record the final sample is the
+series maximum in 15 of them (29 %) — so the shape alone is a screen with a
+measured false-positive rate, not a verdict. *The climb is wider than the
+arm's room*: the final sample exceeds every value that drain could have
+observed. A record the arm's room can contain was observed to completion and
+is a maximum however it sits in the panel; a record past that room was cut off
+at the room's edge and is a lower bound. The five vacuity cases are printed by
+the test, so the demonstration is evidence in the log and not only an
+assertion that passed:
+
+```
+[m1-censoring] vacuity=truncated-climb    final=  1460.0 rungs_at_edge= 1.00 rise_run=5   edge_gap_ms=   250.0 room=   1200.0 verdict=Censored
+[m1-censoring] vacuity=contained-climb    final=  1460.0 rungs_at_edge= 1.00 rise_run=5   edge_gap_ms=   250.0 room=   4000.0 verdict=EdgeRecordContained
+[m1-censoring] vacuity=decayed-peak       final=    24.0 rungs_at_edge=-4.79 rise_run=1   edge_gap_ms=   250.0 room=   1200.0 verdict=Clear
+[m1-censoring] vacuity=widened-rungs      final=   800.0 rungs_at_edge= 0.80 rise_run=1   edge_gap_ms=  1000.0 room=   1200.0 verdict=Clear
+[m1-censoring] vacuity=outrun-window      mean_burst=400.0    required=  7850.0 room=  2000.0 verdict=RED
+```
+
+All five M1 arms report green. `clean` and `hostile` do not end on a climb;
+`lone_tail`, `field_rtt` and the depth sweep classify as `Clear` or
+`EdgeRecordContained` depending on where the run's own record landed, and never
+`Censored`. The run whose lone-tail record does reach the frame's edge —
+1871.3 ms, `rungs_at_edge=4.14`, one sample with an 1871.3 ms gap before it,
+which is the round waiting on the ladder while the offer loop is blocked in its
+read — reports `EdgeRecordContained`: the ladder completed inside the arm's own
+room, and its position at the edge is the offer window closing rather than the
+ladder being cut off. No arm was retuned and no arm was added, because none was
+needed: **the windows were already sufficient, and the battery could not tell.**
+
 ### M4: the interactive lane's split across several flows
 
 M1 and M2 each measure **one** interactive flow, so a mandate result obtained
