@@ -138,15 +138,16 @@ move them.
 
 ### Declared perf rows
 
-The rows below declare nineteen families in the `gate-perf-design` grammar:
+The rows below declare twenty-one families in the `gate-perf-design` grammar:
 `<row> = <tier> | <cost_s> | <relation> | <cell>[,<cell>…]`, each cell
 `<property>@<dimension>=<value>[+…]`. The **default** family is the residual —
 every cell name no `members.<family>` claims — and holds the pre-existing
 `interactive-scaling` rows plus the two-flow rung declared alongside them; the
-eighteen named families (`constitution`, `dual-lane`, `establishment`, `fec`,
-`frame-reorder`, `hol-cap400`, `hol-fec`, `hol-frame`, `hol-hostile`,
-`hol-paced`, `hol-rtt100-clean`, `hol-rtt100-ge5`, `hol-rtt40-ge1`,
-`interactive`, `latency-sweep`, `lone-tail`, `m3-bulk`, `reorder`) each carry
+twenty named families (`constitution`, `dual-lane`, `establishment`, `fec`,
+`fec-instrument-sanity`, `frame-reorder`, `hol-cap400`, `hol-fec`, `hol-frame`,
+`hol-hostile`, `hol-paced`, `hol-rtt100-clean`, `hol-rtt100-ge5`,
+`hol-rtt40-ge1`, `instrument-sanity`, `interactive`, `latency-sweep`,
+`lone-tail`, `m3-bulk`, `reorder`) each carry
 their own baseline and their own cell-name namespace in `gate-budgets`, so a
 row's cells decide whether it belongs to the family its relation names.
 Keeping only the rows whose cells actually carry that name is what turns
@@ -192,8 +193,8 @@ sibling arm states.
 
 Every member below is stated against the baseline of its own family, and the
 label is the checker's derivation from the row's own cells rather than a
-judgement call: of the 65 declared rows, 19 are a family's own reference,
-25 vary exactly one dimension from it (`orthogonal`) and 21 vary several
+judgement call: of the 69 declared rows, 21 are a family's own reference,
+26 vary exactly one dimension from it (`orthogonal`) and 22 vary several
 (`composite(…)`), which name the dimensions they vary. No row is a
 `re-measurement` — the two `hol_probe` seed-variant rows and their shared-bulk
 siblings declare a `seeds` dimension instead, because their arms differ from
@@ -272,6 +273,10 @@ hol_probe::hol_rtt100_ge5_shared_dual_lane_frame_delivery = full | 17 | composit
 hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_frame_diag = full | 20 | composite(flows,metric)@dual-lane | hol-dual-lane@lane=dual+impairment=rtt100-ge5+interactive=rtp-frame+bulk=stock+flows=2+metric=delivery-liveness
 hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_stock_diag = full | 20 | composite(flows,interactive,metric)@dual-lane | hol-dual-lane@lane=dual+impairment=rtt100-ge5+interactive=stock+bulk=stock+flows=2+metric=delivery-liveness
 rtp_mux_jitter::jitter_duallane_arms = perf | 280 | composite(impairment,metric,reorder)@dual-lane | hol-dual-lane-matched-load@lane=dual+impairment=owd25-jitter5-loss2pct-or-bulk-matched+interactive=rtp-frame+bulk=stock+flows=1+reorder=fast-forward-and-strict+metric=latency-and-bulk-goodput
+hol_probe::fec_gaming_treatment_has_bad_path_and_large_capacity_headroom = default | 0 | baseline@fec-instrument-sanity | fec-instrument-sanity@layer=rtp-fec+metric=path-and-headroom
+hol_probe::fec_saturated_pair_keys_loss_to_the_same_rtp_sequence = default | 0 | orthogonal@fec-instrument-sanity | fec-instrument-sanity@layer=rtp-fec+metric=sequence-keying
+perf_probe::controller_fat_pipe_has_only_fixed_shaping = default | 0 | baseline@instrument-sanity | instrument-sanity@lane=controller-fat-pipe+metric=shaping-determinism
+perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss = default | 0 | composite(lane,metric)@instrument-sanity | instrument-sanity@lane=deterministic-iid-loss-fat-pipe+metric=loss-determinism
 ```
 
 Declared sums are `default` 102 s, `standard` 41 s, `full` 1130 s and
@@ -342,11 +347,12 @@ the two already-declared rows on their own stamps and matched the costs they
 already declared (`hol_rtt100_ge5_four_interactive_frame_delivery` 69.019 s
 against 66 s, `..._four_interactive_concurrent_...` 19.524 s against 20 s),
 which is the check that the stamps and the declaration are on one scale. The
-seven rows of the target that this revision found undeclared are now six
-declared members of the `dual-lane` family plus the two default-tier FEC
-instrument arms (0.000 s each, below the one-second resolution the declaration
-rounds to), which stay undeclared for the `instrument-sanity` reason recorded
-below. The five dual-lane topology rows the declaration was blocked on are
+seven rows of the target that this revision found undeclared are declared
+below: five as the `dual-lane` family's topology rows and two as the
+`fec-instrument-sanity` family's, with the `perf_probe` pair and
+`jitter_duallane_arms` declared beside them.
+The five dual-lane topology rows the declaration was blocked
+on are
 declared here on their own stamps (20 s for 19.574 s, 20 s for 19.553 s, 20 s
 for 19.542 s, 20 s for 19.535 s, 17 s for 16.925 s), and the family's sixth
 member is `jitter_duallane_arms`, whose cost is the `eight ~35 s dual-lane
@@ -369,6 +375,24 @@ the `metric` each one asserts is stated too. One member is one declared
 dimension from the reference (`..._asym_frame_diag`, whose metric is liveness
 rather than delivery-and-teardown); the other four vary two or three, and are
 recorded as composites below rather than presented as attributable.
+
+**The two instrument-sanity families.** `hol_probe`'s FEC pair and
+`perf_probe`'s determinism pair carried one cell name, `instrument-sanity`, so
+neither could be filed: a cell name belongs to exactly one family and the two
+pairs are not one family. The repair is a name split, not an arm change — the
+FEC pair's cell is now `fec-instrument-sanity@…`, which is the namespace it is
+declared against, and `instrument-sanity` names only the `perf_probe` pair.
+All four costs are measured, none is stated in an `#[ignore]` reason, and all
+four are 0 s: each is a `#[test]` that builds two preset configs and compares
+their fields, and libtest's own stamp for each is `0.000s`
+(`--exact fec_gaming_treatment_has_bad_path_and_large_capacity_headroom`,
+`--exact fec_saturated_pair_keys_loss_to_the_same_rtp_sequence`,
+`--exact controller_fat_pipe_has_only_fixed_shaping`,
+`--exact deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss`, each run
+in release with `-Z unstable-options --report-time`). Zero is below the
+one-second resolution the other costs round to, and it is the honest figure
+rather than a rounded-up one: the four are declared so the tier that runs on
+every commit accounts for them, not because they cost anything.
 
 **The cold-connection rows** are the two `standard` rows of the
 `establishment` family. `cold_connection_decomposition` decomposes a cold
@@ -409,6 +433,7 @@ baseline.constitution = rtp_mux_jitter::jitter_duallane_constitution_gate
 baseline.dual-lane = hol_probe::dual_lane_asym_frame_delivers_and_tears_down
 baseline.establishment = cold_connection::cold_connection_decomposition
 baseline.fec = rtp_mux_jitter::jitter_fec_arms_2pct
+baseline.fec-instrument-sanity = hol_probe::fec_gaming_treatment_has_bad_path_and_large_capacity_headroom
 baseline.frame-reorder = rtp_mux_jitter::jitter_frame_reorder_fec_arms
 baseline.hol-cap400 = hol_probe::hol_cap400_solo
 baseline.hol-fec = hol_probe::hol_cap400_fec_solo
@@ -418,6 +443,7 @@ baseline.hol-paced = hol_probe::hol_paced_bulk_median_p99_regression
 baseline.hol-rtt100-clean = hol_probe::hol_rtt100_clean_solo
 baseline.hol-rtt100-ge5 = hol_probe::hol_rtt100_ge5_solo
 baseline.hol-rtt40-ge1 = hol_probe::hol_rtt40_ge1_solo
+baseline.instrument-sanity = perf_probe::controller_fat_pipe_has_only_fixed_shaping
 baseline.interactive = rtp_mux_jitter::jitter_interactive_solo
 baseline.latency-sweep = rtp_mux_jitter::jitter_latency_dimension_arms
 baseline.lone-tail = rtp_mux_jitter::jitter_request_response_arms
@@ -427,6 +453,7 @@ members.constitution = M*
 members.dual-lane = hol-dual-lane*
 members.establishment = cold-connection*
 members.fec = fec-tuning*
+members.fec-instrument-sanity = fec-instrument-sanity*
 members.frame-reorder = frame-reorder-fec
 members.hol-cap400 = hol-cap400*
 members.hol-fec = hol-fec*
@@ -436,6 +463,7 @@ members.hol-paced = hol-paced*
 members.hol-rtt100-clean = hol-rtt100-clean*
 members.hol-rtt100-ge5 = hol-rtt100-ge5*
 members.hol-rtt40-ge1 = hol-rtt40-ge1*
+members.instrument-sanity = instrument-sanity*
 members.interactive = interactive-cadence*
 members.latency-sweep = latency-sweep*
 members.lone-tail = lone-tail*
@@ -476,11 +504,11 @@ attribution@baseline-family=lone-tail = the family is now declared (its cells re
 attribution@baseline-family=decomposition = `jitter_frame_reorder_decomposition` carries `frame-reorder` and `jitter_decomposition` carries `loss-vs-queue`, so the family spans two names; the repair is to rename `jitter_decomposition`'s cell `frame-reorder@…` or to split the family, and because `jitter_decomposition` is two declared dimensions (arms, jitter) from its sibling, a single-axis decomposition arm beside it is the other half of the repair.
 attribution@baseline-family=dual-lane = the family is now declared: all six of its rows carry `hol-dual-lane*` cells, the rename moved `jitter_duallane_arms`'s cell into that namespace with no change to the arm, and the five `hol_probe` dual-lane topology rows are declared on their own libtest stamps (20/20/20/20/17 s). Four of the six vary several declared dimensions from the reference `hol_probe::dual_lane_asym_frame_delivers_and_tears_down`, so no existing arm attributes them: `hol_rtt100_ge5_shared_dual_lane_frame_delivery` varies bulk, metric; `hol_rtt100_ge5_dual_lane_two_interactive_frame_diag` flows, metric; `hol_rtt100_ge5_dual_lane_two_interactive_stock_diag` flows, interactive, metric; and `jitter_duallane_arms` impairment, metric, reorder. A single-axis dual-lane arm beside the reference (the second interactive stream alone, or the interactive lane's frame mode alone, or the sixth row's matched bulk load on the reference's own link) is what closes this. The one-dimensional member is `hol_rtt100_ge5_shared_dual_lane_asym_frame_diag`, which is the `hol-dual-lane` arm already carrying the reference's whole config: the two differ only in the metric each asserts (liveness versus delivery-and-teardown), which is why it is the family's orthogonal member rather than a fifth gap.
 attribution@baseline-family=fairness = the proposed family spans five cell names (`M4`, `fairness-sweep`, `fairness-longrun`, `dual-lane-longrun`, `multi-flow-longrun`) across two tiers; the repair is to split it into the three contexts it measures (`fairness-sweep`, `fairness-longrun`, `dual-lane-longrun`) and to rename the M4 arm's cell `fairness-m4@…`, since the M4 arm is a four-flow fairness arm and the longruns are multi-minute measurements, not the same reference's members.
-attribution@baseline-family=hol-regimes = the eight regimes the pending declaration proposed are now eight declared families with their own cell names (`hol-cap400`, `hol-rtt100-ge5`, `hol-rtt40-ge1`, `hol-rtt100-clean`, `hol-hostile`, `hol-frame`, `hol-paced`, `hol-fec`), and 36 of the target's 43 ignored rows are declared against them with measured costs, so the collision that blocked them is closed. The seven rows that stayed undeclared when this family split were the five dual-lane topology rows and the target's two default-tier FEC instrument arms: the five are now the `dual-lane` family declared above, with their own measured costs, and the two stay undeclared for the `instrument-sanity` name the `perf_probe` pair also carries (recorded on that line below) — neither is a cost, and neither is a regime. The `dual-lane` family's own attribution residue is on that line.
+attribution@baseline-family=hol-regimes = the eight regimes the pending declaration proposed are now eight declared families with their own cell names (`hol-cap400`, `hol-rtt100-ge5`, `hol-rtt40-ge1`, `hol-rtt100-clean`, `hol-hostile`, `hol-frame`, `hol-paced`, `hol-fec`), and 36 of the target's 43 ignored rows are declared against them with measured costs, so the collision that blocked them is closed. The seven rows that stayed undeclared when this family split were the five dual-lane topology rows and the target's two default-tier FEC instrument arms: the five are now the `dual-lane` family declared above and the two are now the `fec-instrument-sanity` family, each with its own measured cost. The `dual-lane` family's own attribution residue is on that line.
 attribution@baseline-family=hostile-probes = the proposed family spans three cell names (`ceiling`, `contested`, `mux-over-rtp`) and two tiers; the repair is to keep only `probe_hostile_goodput_30s` and `probe_hostile_message_latency` in it and to state `contested_latency::contested_hostile` and `mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf` against their own families, which also needs their costs.
 attribution@baseline-family=rtp-ceiling = `perf_probe::probe_rtp_echo_4mib_direct` and `_mss8k` share the cell name `ceiling` with the hostile probes; the repair is to narrow one of the two names (the hostile pair to `hostile-probe@…`) so the families are separable, and to record both costs, which no `#[ignore]` reason states.
 attribution@baseline-family=mux-ceiling = `mux_ceiling_probe`'s echo and sink pairs all carry `loopback-ceiling`, so the proposed echo and sink families cannot both claim it; the repair is to split the name (`mux-ceiling-echo@…`, `mux-ceiling-sink@…`) and to record the four costs.
-attribution@baseline-family=instrument-sanity = `hol_probe`'s FEC pair and `perf_probe`'s determinism pair all carry `instrument-sanity`; the repair is to narrow the name to one target and to record all four costs, which the `#[ignore]` reasons do not state.
+attribution@baseline-family=instrument-sanity = the name collision is closed: the `hol_probe` FEC pair's cell is now `fec-instrument-sanity@…` and it is declared as its own family, `instrument-sanity` names only `perf_probe`'s determinism pair, and all four rows are declared on their measured 0.000 s stamps. The residue is attribution rather than a name: `perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss` varies two declared dimensions (lane, metric) from its family's reference `perf_probe::controller_fat_pipe_has_only_fixed_shaping`, so no existing arm attributes it; a lane-only arm on either preset (or a metric-only arm beside one of them) is what closes this. The `fec-instrument-sanity` family carries no such residue: its two rows differ in the metric alone, which is the instrument property each asserts.
 attribution@baseline-family=mux-over-rtp = `mux_over_rtp_perf`'s lossy pair carries `mux-over-rtp` while `mux_over_rtp_small_stream_while_bulk_perf` carries `small-stream-while-bulk`; the repair is to rename the third cell so all three carry one name and to record the three wall-clocks, none of which appears in a document.
 attribution@baseline-family=hol-verify4 = `hol_verify4::v4_clean_muxbulk` and `v4_ge5_muxbulk` are internally coherent (`bulk-lane-ab`) and one dimension apart, so only their costs are missing — the `#[ignore]` reason states no wall-clock; one measurement per row declares the family with no cell change.
 attribution@baseline-family=fec-recovery = `hol_probe::hol_rtp_mux_fec_default_on_recovery` is now declared, in the `hol-fec` family and five declared dimensions from that family's reference (bulk, fec, impairment, layer, metric), so it is a composite no existing arm attributes: its context is the `rtp-mux` layer on the fec-gaming fat pipe at 20 % loss with a controller-retention bulk lane, while the reference is the cap400 shaper with FEC on. A single-axis FEC-recovery arm beside either end is what closes this. Its cost is now measured (38 s, its own libtest stamp) — and the family is a two-row family rather than a one-row namespace, which the checker refuses, because a baseline no sibling row states against is a stale reference.
