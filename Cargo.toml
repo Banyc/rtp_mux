@@ -16,7 +16,7 @@ mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.31" }
 netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.2", features = ["test-kit"], optional = true }
 # netem-test = { path = "../netem_test/netem-test", features = ["test-kit"], optional = true }
 rand = "0.10"
-rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.94" }
+rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.95" }
 # rtp = { path = "../rtp" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
@@ -39,7 +39,7 @@ mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.31", features = ["
 # mux = { path = "../mux", features = ["testing"] }
 netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.2", features = ["test-kit"] }
 # netem-test = { path = "../netem_test/netem-test", features = ["test-kit"] }
-rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.94", features = ["testing"] }
+rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.95", features = ["testing"] }
 # rtp = { path = "../rtp", features = ["testing"] }
 rtp_mux = { path = ".", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
