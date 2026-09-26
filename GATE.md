@@ -720,6 +720,7 @@ bounds above (measured X, bound Y, so a change that at least doubles it fails):
 | M1 lone-tail p99 | field 1053–1542 ms (60 s) | `3200 ms` (~2×) |
 | M1 lone-tail p99.9 | 797–1636 ms (15 s arm); field ladder 5315 ms | `8000 ms` (~1.5× the field ladder) |
 | M1 lone-tail `> 250 ms` share | field 2.7 %, smoke 0–0.7 % | `8 %` |
+| M1 lone-tail max | 256.0–1863.7 ms over ten runs of one revision (7.28×) | not asserted (the window's largest GE burst; see *M1's observation window*) |
 | M1 field-RTT lone-tail p99 | `rtp v0.0.94`: 427–719 ms; landed `rtp` `bdacf5c0`: 293–432 ms | `1500 ms` (~2.1× the pinned band) |
 | M1 field-RTT lone-tail `> 250 ms` share | `v0.0.94` 3.3–5.6 %; landed 2.6–5.3 % | `15 %` (~2.7×) |
 | M1 field-RTT lone-tail max | `v0.0.94`: 1015–3868 ms; landed: 386–529 ms | not asserted (one sample at n≈200) |
@@ -802,22 +803,69 @@ rungs, and its own burst budget (5 rungs = 1550 ms) leaves one rung of
 headroom. That is the one M1 place where a longer impairment burst, a shorter
 `GRACE` or a shorter ladder step would begin to truncate a report, and it is
 recorded here as the reading that would move first. The request/response arms
-are not close: the field's own observed 3.2 s ladder is 12 rungs (3.8 s with
-its round trip) against the `lone_tail` arm's 105 s room, 27× inside it, and a
-12-rung ladder needs a burst of at least 72 consecutive datagrams, which
-`gilbert_elliott_loss(5, 8)` produces with probability `(7/8)^71 = 7.7e-5` per
-burst — about once in 220 windows at the arm's own ~50 bursts per window. A
-**cadence** arm could not observe that ladder at all (2 s = 6 rungs); the
-request/response shape is the one that can, and it does.
+are not close: the field's own observed 3.2 s ladder is 10 rungs at this
+instrument's 300 ms step (3.0 s of rung plus its round trip, and the arm's own
+25 samples over 250 ms across the ten runs below place on that rung) against
+the `lone_tail` arm's 105 s room, 33× inside it, and a 10-rung ladder needs a
+burst of at least 60 consecutive datagrams, which `gilbert_elliott_loss(5, 8)`
+produces with probability `(7/8)^59 = 3.8e-4` per burst — about once in 49
+windows at the arm's own ~54 bursts per window. A **cadence** arm could not
+observe that ladder at all (2 s = 6 rungs); the request/response shape is the
+one that can, and it does. The rung is the 300 ms floor and not the 1 s
+retransmission floor on this arm, and the arm's own record is the second
+witness: at the 1 s floor, 3.2 s would be 3 rungs — an 18-datagram burst, `E`
+times `(7/8)^17` = 5.6 drawings per window — and a 3.2 s maximum would appear
+in most windows, where the sixteen `lone_tail` runs on record hold exactly
+one maximum above 2.7 s.
 
-The derivation is corroborated by the arms' own ceilings. The `field_rtt`
-arm's required 1100 ms sits at the top of the band its runs measure (max 358.3
-/ 434.6 / 581.5 / 1043.6 / 1255.3 ms over six runs on `rtp v0.0.96`), and the
-`lone_tail` arm's 1250–1550 ms requirement is bracketed by its own observed
-records (1469.4 / 1871.3 / 1892.3 ms). The prediction under-states the observed
-ceiling by up to one rung — it is the burst expected once per window, not the
-largest the model can draw — and the room it is compared against is 15–95× the
-requirement, so the under-statement costs no coverage.
+**The derivation is corroborated by the arm's scale, not by its maximum.**
+Ten runs of the `lone_tail` arm on one revision and configuration (`rtp
+v0.0.96`, `mux v0.0.33`, the arms above unchanged) read:
+
+| reading | min | max | spread | mean | cv |
+| --- | --- | --- | --- | --- | --- |
+| maximum | 256.0 ms | 1863.7 ms | 7.28× | 874.7 ms | 0.63 |
+| p99 | 145.3 ms | 179.3 ms | 1.23× | 160.3 ms | 0.07 |
+| `> 250 ms` samples | 1 | 5 | 5.0× | 2.5 | 0.51 |
+| samples | 792 | 1048 | 1.32× | 964 | 0.07 |
+| drain (c2s datagrams) | 7189 | 9380 | 1.30× | 8610 | 0.07 |
+
+The maximum tracks neither the drain nor the run: its correlation with the
+drain is `r = -0.005` over those ten, and its spread is 5.6× the drain's. It
+is a **draw**, and the arm sets its *scale* rather than its value: at each
+run's own drain the arithmetic above gives a 29.5–31.5-datagram
+once-per-window burst and a **4–5 rung ladder, 1250–1550 ms (1.24× across
+the ten)** — the ladder's height is the window's largest GE burst, geometric
+in the burst length (`P(L >= 6k) = (7/8)^(6k-1)` per burst over that window's
+own `E` = 45–59 bursts), plus the round trip. That design point is an *upper*
+estimate of a typical window's maximum, measured rather than assumed: 7 of
+the ten windows peaked below it at a median of 2.6 rungs and one exceeded it
+at 6.05 rungs. The `field_rtt` arm reads the same way: its required 1100 ms
+sits at the top of the band its runs measure (max 358.3 / 434.6 / 581.5 /
+1043.6 / 1255.3 ms over six runs on `rtp v0.0.96`), five of those six below
+the requirement and one above it. The readings that repeat are therefore the
+**guards** — the p99 band at 1.23× and the `> 250 ms` count against its 8 %
+guard (1–5 samples of ~960, under 0.6 %) — which is why the maximum is
+asserted on no M1 arm; the room the requirement is compared against is 15–95×
+it, so a conservative design point costs no coverage.
+
+**The field's two recorded round trips, against this distribution.** The
+field's 1063 ms is inside it: four of the ten windows peaked above it (1205.7,
+1257.9, 1411.6, 1863.7 ms). The field's 3205 ms is not: no window here reached
+it, and the highest `lone_tail` maximum on record is 2651.7 ms. The arithmetic
+above says why — a 3205 ms maximum is a ≥ 60-datagram burst, about one drawing
+in 49 windows — so a single 15 s window reproduces the field's worst case
+roughly once in fifty runs. Three parts of the field's regime are outside this
+arm and are claimed by nothing here: its **floor** (the arm's link is
+`latency: 25 ms` with `jitter: 100 ms`, the impairment draws `latency +
+U(-jitter, +jitter)` clamped at zero, and one run's own c2s one-way readings
+were 80 % under 1 ms with a body p50 near 0.3 ms, where the field's *minimum*
+round trip is 190 ms), its **shape** (no bulk lane, no proxy chain, an
+in-process modelled link rather than the field's real path) and its **step**
+(the rung here is the 300 ms `TAIL_PROBED_MIN_RTO` floor, where the field's
+records include 1 s-floor ladders up to 5315 ms). The `field_rtt` arm above
+covers the field's round-trip *scale*; it carries the same jitter, so it does
+not cover the field's floor either.
 
 **The instrument, and its vacuity pair.** `censoring` reads the per-sample
 series for the conjunction of two facts, and both are needed. *The series ends
