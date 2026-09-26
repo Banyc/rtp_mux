@@ -90,7 +90,7 @@ use netem_test::kit::payload::{cyclic_payload, with_timeout};
 use netem_test::kit::presets::gilbert_elliott_loss;
 use netem_test::kit::stats::{HolSummary, summarize};
 use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
-use netem_test::{NetemConfig, NetemPair};
+use netem_test::{LossModel, NetemConfig, NetemPair};
 use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
@@ -219,6 +219,13 @@ const M2_LONE_WIRE_GUARD_X: f64 = 14.0;
 /// held across `.await` without parking a runtime worker.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// The per-arm deadline every smoke arm is measured under: a ladder that starts
+/// at the arm's last offer must be awaited within it. It bounds the
+/// request/response arms' observation room, which no shorter timer does, and
+/// the value is the one the arms were already run under — naming it is what
+/// keeps the censoring instrument's room input from being a second authority.
+const ARM_DEADLINE: Duration = Duration::from_secs(120);
+
 fn quick() -> bool {
     matches!(std::env::var("MANDATE_SMOKE_QUICK").as_deref(), Ok("1"))
 }
@@ -284,6 +291,7 @@ enum Load {
     RequestResponse { depth: usize },
 }
 
+#[derive(Clone)]
 struct ArmSpec {
     name: &'static str,
     int_c2s: NetemConfig,
@@ -430,6 +438,10 @@ struct ArmRun {
     /// `(elapsed seconds, latency ms)` per sample, in delivery order.
     timeline: Vec<(f64, f64)>,
     int_c2s_wire_bytes: u64,
+    /// Datagrams the interactive lane's c2s direction accepted before
+    /// impairment, i.e. the datagrams its own link offered to the loss
+    /// process over the window ([`LadderInputs::datagrams`]).
+    int_c2s_packets: u64,
     offered_bytes: u64,
     wire_x: f64,
     bulk_sink_bytes: u64,
@@ -688,7 +700,9 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
             let ((sent, rtts), _bulk_written) = tokio::join!(interactive, bulk_fut);
 
             tokio::time::sleep(GRACE).await;
-            let int_c2s_wire_bytes = int_pair.stats_c2s().forwarded_bytes;
+            let int_c2s = int_pair.stats_c2s();
+            let int_c2s_wire_bytes = int_c2s.forwarded_bytes;
+            let int_c2s_packets = int_c2s.received;
             let bulk_sink_bytes = bulk_counter.load(Ordering::Relaxed);
             let bulk_wire_bytes = bulk_pair.stats_c2s().forwarded_bytes;
             // The collector's sink: which rows become the arm's measured
@@ -713,12 +727,21 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
                 samples,
                 timeline,
                 int_c2s_wire_bytes,
+                int_c2s_packets,
                 bulk_sink_bytes,
                 bulk_wire_bytes,
             )
         })
         .await;
-    let (sent, samples, timeline, int_c2s_wire_bytes, bulk_sink_bytes, bulk_wire_bytes) = outcome;
+    let (
+        sent,
+        samples,
+        timeline,
+        int_c2s_wire_bytes,
+        int_c2s_packets,
+        bulk_sink_bytes,
+        bulk_wire_bytes,
+    ) = outcome;
     let received = samples.len() as u64;
     let bulk_active_secs = if bulk {
         (window.saturating_sub(BULK_RAMP)).as_secs_f64()
@@ -739,6 +762,7 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
         samples,
         timeline,
         int_c2s_wire_bytes,
+        int_c2s_packets,
         offered_bytes,
         wire_x: if offered_bytes == 0 {
             f64::INFINITY
@@ -781,6 +805,24 @@ static ARM_RUNS: std::sync::Mutex<Option<(String, Arc<Vec<ArmRun>>)>> = std::syn
 /// The cache lock is never held across an `await` — [`SERIAL`] already serialises
 /// the callers, so the critical sections are two plain field reads.
 async fn mandate_runs(mandate: &str) -> Arc<Vec<ArmRun>> {
+    mandate_runs_with(mandate, true).await
+}
+
+/// The same runs for a caller that does **not** own the arms' attribution.
+///
+/// `tools/mandate-check` attributes an arm row to the mandate whose `MANDATE`
+/// line follows it, so a reader that is not the mandate asserting on the arms
+/// must not print them: the rows would land in the next mandate's section and
+/// the runner refuses a cell an arm covers none of (measured: the censoring
+/// instrument's reprint of the M1 rows, finishing after the M1 and M2 verdict
+/// lines, was attributed to M4 as `M4/clean` — `M4/hostile`, `M4/lone_tail`).
+/// A quiet caller therefore prints no arm row on either path — cache hit or
+/// cache miss — and the mandate that does assert on them still prints its own.
+async fn mandate_runs_quiet(mandate: &str) -> Arc<Vec<ArmRun>> {
+    mandate_runs_with(mandate, false).await
+}
+
+async fn mandate_runs_with(mandate: &str, report_arms: bool) -> Arc<Vec<ArmRun>> {
     let key = fault(mandate).unwrap_or_default();
     let cached = ARM_RUNS
         .lock()
@@ -798,12 +840,14 @@ async fn mandate_runs(mandate: &str) -> Arc<Vec<ArmRun>> {
         // and `M2/lone_tail` are declared cells in `tools/mandate-arms.json`).
         // These rows are the measurement the mandate reads, reprinted under
         // the reading mandate's attribution; they are not a second run.
-        for run in runs.iter() {
-            print_arm(run);
+        if report_arms {
+            for run in runs.iter() {
+                print_arm(run);
+            }
         }
         return runs;
     }
-    let runs = Arc::new(measure_arms(mandate).await);
+    let runs = Arc::new(measure_arms(mandate, report_arms).await);
     if key.is_empty() {
         *ARM_RUNS
             .lock()
@@ -814,12 +858,16 @@ async fn mandate_runs(mandate: &str) -> Arc<Vec<ArmRun>> {
 
 /// Measure the [`mandate_arms`] set in order, printing each arm's row, exactly
 /// as the M1 and M2 runner loops used to before the measurement was shared.
-async fn measure_arms(mandate: &str) -> Vec<ArmRun> {
+/// `report_arms` is false for a caller that is not the mandate asserting on
+/// them, which owns none of the rows' attribution ([`mandate_runs_quiet`]).
+async fn measure_arms(mandate: &str, report_arms: bool) -> Vec<ArmRun> {
     let mut runs = Vec::new();
     for spec in mandate_arms(mandate) {
         let label = format!("{}/{}", mandate.to_lowercase(), spec.name);
-        let run = with_timeout(Duration::from_secs(120), &label, run_arm(spec)).await;
-        print_arm(&run);
+        let run = with_timeout(ARM_DEADLINE, &label, run_arm(spec)).await;
+        if report_arms {
+            print_arm(&run);
+        }
         runs.push(run);
     }
     runs
@@ -909,6 +957,367 @@ fn write_evidence(
 
 fn verdict(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
+}
+
+// ─────────────── the repair ladder and the window that must hold it ───────────
+//
+// The interactive lane repairs a lost lone tail with a ladder: one lost tail is
+// retransmitted as `TAIL_DATAGRAMS_PER_TRANSMISSION` datagrams carrying the
+// same message, and each further rung waits `LADDER_STEP_MS`. A loss burst is
+// consumed one forwarded datagram at a time (the lone tail is the only source
+// on its direction, so nothing else drains it), so a burst of `l` datagrams
+// yields `floor(l / m)` rungs and the ladder's wall clock is
+// `floor(l / m) * step` — a burst property, not a cadence property. An arm
+// therefore needs an observation window of `rungs * step + rtt`, and its own
+// drain decides how much of that it can see:
+//
+// * a **cadence** arm's samples come from the server sink, so a ladder still
+//   running when the offer window closes is observed only if it completes
+//   inside `GRACE` — the drain the summary is read after;
+// * a **request/response** arm awaits each round's echo inside the offer loop,
+//   so a ladder that starts at the last offer is observed whenever it
+//   finishes and the arm's own `with_timeout` is the only bound.
+//
+// A window that is shorter than one of those requirements truncates the climb
+// it reports: the reported maximum is then a *lower bound*, and the arm
+// under-reports by construction. [`censoring`] is the instrument that says so
+// from the arm's own per-sample series, and [`LadderInputs`] is the arithmetic
+// that says what the window had to be.
+
+/// Datagrams one interactive tail transmission emits: the primary plus its
+/// armour copies and the message-sized parity symbol. One authority for the
+/// value is `GATE.md` ("Performance", mandate 2: "a fully-armored lone
+/// interactive tail is `primary + 5 copies` = six datagrams"); it is
+/// corroborated by the M2 lone-tail arm's own `lone_wire_x`, which measures
+/// 5.91-7.42 x `MSG_BYTES` on this lane.
+const TAIL_DATAGRAMS_PER_TRANSMISSION: u64 = 6;
+
+/// The repair ladder's steady rung interval: rtp's post-probe repair-deadline
+/// floor, `TailLossProber::TAIL_PROBED_MIN_RTO` = 300 ms
+/// (`rtp/src/traffic_shaping/recovery/tlp.rs`). The competing term, the
+/// corroborated deadline `srtt + max(rttvar, srtt / 4)`, is below the floor on
+/// every M1 arm — at the field arm's `FIELD_RTT_OWD` it is
+/// `200 + max(50, 50) = 250 ms` — so the floor is the step on all of them, and
+/// rtp's own ladder probe measures the same 300 ms spacing at 50 ms and 190 ms
+/// round trips with and without jitter.
+const LADDER_STEP_MS: f64 = 300.0;
+
+/// The fewest samples a series needs before its tail is worth reading: a
+/// terminal ascent is a coincidence of the last order statistic, so a series
+/// short enough for one to be unremarkable is reported unclassifiable rather
+/// than clear.
+const CENSORING_MIN_SAMPLES: usize = 32;
+
+/// The longest gap between two consecutive samples that can still be one climb.
+/// A ladder's rungs are one `step` apart, so a pair further apart than that is
+/// two separate observations rather than a rising run — and the M1-latency
+/// panel draws the gap between them as a straight line, which is what makes a
+/// long round trip look like a wall: the final run's lone-tail record (1892.3 ms
+/// at 11.004 s) follows a 0.4 s silence and is drawn as a near-vertical climb
+/// even though it is a single completed round.
+const MAX_CLIMB_GAP_MS: f64 = LADDER_STEP_MS;
+
+/// The arm's own ladder inputs, every one read from the arm's configuration or
+/// from its own counters — none assumed and none tuned.
+struct LadderInputs {
+    /// Datagrams one tail transmission emits.
+    datagrams_per_transmission: u64,
+    /// The steady rung interval, ms.
+    step_ms: f64,
+    /// Mean loss-burst length of the arm's own impairment, in forwarded
+    /// datagrams; `1` for independent loss, which has no burst to consume.
+    mean_burst: f64,
+    /// Long-run loss probability of the arm's own impairment.
+    loss: f64,
+    /// Datagrams the arm's own c2s link accepted before impairment.
+    datagrams: u64,
+    /// Base round trip, ms, from the arm's own one-way delay.
+    rtt_ms: f64,
+    /// How long after the arm's last offer a ladder may still be observed.
+    observation_room_ms: f64,
+}
+
+/// Decode the arm's own impairment into a mean burst length and a long-run loss
+/// probability. A `FourState` model is geometric in the burst state (`p31` is
+/// the per-datagram probability of leaving it, so the mean burst is `1 / p31`),
+/// and its steady-state loss share is `p13 / (p13 + p31)`; independent loss has
+/// burst length 1 by definition, which is what makes `m = 6` armour copies
+/// consume it whole.
+fn loss_shape(spec: &ArmSpec) -> (f64, f64) {
+    match spec.int_c2s.loss_model {
+        LossModel::FourState(p) => {
+            let p13 = f64::from(p.p13) / f64::from(u32::MAX);
+            let p31 = f64::from(p.p31) / f64::from(u32::MAX);
+            (1.0 / p31, p13 / (p13 + p31))
+        }
+        _ => (1.0, f64::from(spec.int_c2s.loss) / f64::from(u32::MAX)),
+    }
+}
+
+/// The arm's ladder inputs, plus the room its own drain leaves a ladder.
+///
+/// `datagrams` and `window` are the arm's own measured inputs: the c2s
+/// datagram count its link accepted ([`ArmRun::int_c2s_packets`]) and the offer
+/// window it ran [`ArmRun::window`]. They are parameters rather than the
+/// `ArmRun` itself so the vacuity demonstrations can drive the same arithmetic
+/// from a perturbation of the arm's own configuration.
+///
+/// The rungs are computed for every interactive arm, including the cadence and
+/// depth-2 arms whose tracked tail is not lone: `m` is the lane's cover and the
+/// burst is the arm's own, so the same arithmetic can only *over*-estimate the
+/// rungs of a shape whose recovery is dupack-driven. That over-estimate is what
+/// the arm is then held to.
+///
+/// The room, by contrast, follows the **drain mechanism**, which is the load
+/// shape's and not the depth's: a round's `read_exact` is awaited inside the
+/// offer loop, so a request/response arm (at any depth) observes whatever
+/// ladder it is inside its own arm deadline, while a cadence arm's sample is
+/// read from the server sink and must therefore reach the collector snapshot
+/// `GRACE` past the last offer.
+fn ladder_inputs(spec: &ArmSpec, datagrams: u64, window: Duration) -> LadderInputs {
+    let (mean_burst, loss) = loss_shape(spec);
+    let requests_a_round = matches!(spec.load, Load::RequestResponse { .. });
+    LadderInputs {
+        datagrams_per_transmission: TAIL_DATAGRAMS_PER_TRANSMISSION,
+        step_ms: LADDER_STEP_MS,
+        mean_burst,
+        loss,
+        datagrams,
+        rtt_ms: 2.0 * spec.int_c2s.latency.as_secs_f64() * 1000.0,
+        observation_room_ms: if requests_a_round {
+            (ARM_DEADLINE - window).as_secs_f64() * 1000.0
+        } else {
+            GRACE.as_secs_f64() * 1000.0
+        },
+    }
+}
+
+/// The longest burst the arm's own window is expected to contain once: the
+/// window offers `datagrams` to a loss process that starts a burst every
+/// `mean_burst / loss` datagrams, so `E = datagrams * loss / mean_burst` bursts
+/// occur in it, and `P(L >= l) = (1 - 1 / mean_burst)^(l - 1)` inverts at
+/// `l = 1 + ln(E) / ln(1 / (1 - 1 / mean_burst))`.
+///
+/// This is a *design* burst, not a ceiling: the geometric tail is unbounded, so
+/// no finite window makes the observed maximum anything but a lower bound of
+/// the distribution. What the arm's window must do is contain the worst ladder
+/// it will plausibly show; the margin the derivation leaves to that burst is
+/// reported beside it.
+fn worst_plannable_burst(inputs: &LadderInputs) -> f64 {
+    if inputs.mean_burst <= 1.0 {
+        return 1.0;
+    }
+    let bursts = inputs.datagrams as f64 * inputs.loss / inputs.mean_burst;
+    if bursts <= 1.0 {
+        return 1.0;
+    }
+    let l = 1.0 + bursts.ln() / (1.0 / (1.0 - 1.0 / inputs.mean_burst)).ln();
+    l.min(inputs.datagrams as f64)
+}
+
+/// The rungs that burst costs: `floor(burst / datagrams_per_transmission)`.
+fn ladder_rungs(inputs: &LadderInputs) -> u64 {
+    (worst_plannable_burst(inputs) / inputs.datagrams_per_transmission as f64) as u64
+}
+
+/// The window the arm's own ladder needs: every rung waits `step`, and the
+/// climb starts one round trip after the offer.
+fn required_window_ms(inputs: &LadderInputs) -> f64 {
+    ladder_rungs(inputs) as f64 * inputs.step_ms + inputs.rtt_ms
+}
+
+/// What reading an arm's latency series for a truncated climb found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Censoring {
+    /// The series ends on a climb that is longer than the arm's own
+    /// observation room: the reported maximum is a censored lower bound.
+    Censored,
+    /// The series ends on a record, but the arm's room can contain the climb
+    /// that set it, so the record is a completed observation.
+    EdgeRecordContained,
+    /// The series does not end on a climb.
+    Clear,
+    /// Too few samples for the tail to mean anything.
+    Unclassifiable,
+}
+
+/// Whether an arm's latency series ends mid-climb, and what the numbers behind
+/// that answer are.
+struct CensorReading {
+    verdict: Censoring,
+    /// The last sample is the series maximum (last attainment of it).
+    record_at_edge: bool,
+    /// Rungs the last sample stands above every earlier sample.
+    rungs_at_edge: f64,
+    /// Length of the maximal terminal strictly-increasing run, counting only
+    /// steps taken within `MAX_CLIMB_GAP_MS`.
+    rise_run: usize,
+    /// The gap between the last two samples, ms.
+    edge_gap_ms: f64,
+    /// The last sample, ms.
+    final_ms: f64,
+}
+
+impl CensorReading {
+    /// Conjunct 1 of [`censoring`]'s criterion: the series ends on a climb.
+    fn ends_on_a_climb(&self) -> bool {
+        self.record_at_edge && (self.rungs_at_edge >= 1.0 || self.rise_run >= 2)
+    }
+}
+
+/// Read a latency series for a climb truncated by the arm's own observation.
+///
+/// The series is `(elapsed seconds, latency ms)` pairs, the shape every arm
+/// already hands the panel; the times matter because a rise is only a climb if
+/// its steps are one rung apart ([`MAX_CLIMB_GAP_MS`]).
+///
+/// The criterion is a conjunction of two facts about the arm's own series and
+/// the arm's own room:
+///
+/// 1. **the series ends on a climb** — the final sample is the series maximum
+///    (its last attainment), *and* it either stands at least one whole ladder
+///    rung above every earlier sample or closes a strictly-increasing run of
+///    two or more samples taken within a rung of each other. A genuine maximum
+///    is a *peak*: it is followed by samples that decay back to the series'
+///    body, so a series can only end on its own upward movement if observation
+///    stopped while it was still rising. The record alone is not evidence —
+///    with only a handful of extreme samples per run, the largest of them being
+///    the last is common: across the 52 M1 lone-tail runs on record the final
+///    sample is the series maximum in 15 of them (29 %) — which is why the
+///    climb has to hold a whole rung, or be a rising run, and not merely be the
+///    largest sample.
+/// 2. **the climb is wider than the arm's room** — the final sample exceeds
+///    every value the arm's drain could have observed (`observation_room_ms`).
+///    This is the part that makes the reading a statement about truncation and
+///    not about shape: a record the arm's own room can contain was observed to
+///    completion, so it is a maximum however it sits in the panel, while a
+///    record past that room was necessarily cut off at the room's edge and is a
+///    lower bound.
+///
+/// Both conjuncts are needed. The shape alone is a screen with a false-positive
+/// rate this test measures and prints; the room alone cannot see a climb.
+fn censoring(samples: &[(f64, f64)], step_ms: f64, room_ms: f64) -> CensorReading {
+    let (rise_run, edge_gap_ms) = {
+        let mut run = 1usize;
+        let mut gap = f64::INFINITY;
+        for pair in samples.windows(2).rev() {
+            let (previous_t, previous_ms) = pair[0];
+            let (next_t, next_ms) = pair[1];
+            let step = next_t - previous_t;
+            if run == 1 {
+                gap = step;
+            }
+            if next_ms > previous_ms && (0.0..=MAX_CLIMB_GAP_MS / 1000.0).contains(&step) {
+                run += 1;
+            } else {
+                break;
+            }
+        }
+        (run, gap)
+    };
+    if samples.len() < CENSORING_MIN_SAMPLES {
+        return CensorReading {
+            verdict: Censoring::Unclassifiable,
+            record_at_edge: false,
+            rungs_at_edge: 0.0,
+            rise_run,
+            edge_gap_ms,
+            final_ms: samples.last().map_or(0.0, |pair| pair.1),
+        };
+    }
+    let final_ms = samples.last().expect("a classified series is non-empty").1;
+    let earlier_max = samples[..samples.len() - 1]
+        .iter()
+        .map(|pair| pair.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let rungs_at_edge = (final_ms - earlier_max) / step_ms;
+    let record_at_edge = rungs_at_edge >= 0.0;
+    let ends_on_a_climb = record_at_edge && (rungs_at_edge >= 1.0 || rise_run >= 2);
+    let verdict = if !ends_on_a_climb {
+        Censoring::Clear
+    } else if final_ms > room_ms {
+        Censoring::Censored
+    } else {
+        Censoring::EdgeRecordContained
+    };
+    let reading = CensorReading {
+        verdict,
+        record_at_edge,
+        rungs_at_edge,
+        rise_run,
+        edge_gap_ms,
+        final_ms,
+    };
+    debug_assert_eq!(ends_on_a_climb, reading.ends_on_a_climb());
+    reading
+}
+
+/// One censoring line, written whole under one lock so it cannot interleave
+/// with another test's row.
+fn print_censoring_row(row: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = std::io::Write::write_all(&mut stderr, row.as_bytes());
+}
+
+/// One vacuity case's reading, printed so the demonstration is evidence in the
+/// run's log and not only an assertion that passed.
+fn print_censoring_vacuity(case: &str, reading: &CensorReading, room_ms: f64) {
+    print_censoring_row(&format!(
+        "[m1-censoring] vacuity={case:<18} final={final:8.1} rungs_at_edge={redge:5.2} \
+         rise_run={rise:<3} edge_gap_ms={gap:8.1} room={room:9.1} verdict={verdict:?}\n",
+        final = reading.final_ms,
+        redge = reading.rungs_at_edge,
+        rise = reading.rise_run,
+        gap = reading.edge_gap_ms * 1000.0,
+        room = room_ms,
+        verdict = reading.verdict,
+    ));
+}
+
+/// One arm's censoring line: the series reading, the ladder the arm's own link
+/// can produce, and whether its own room holds that ladder. Printed rather than
+/// asserted — a red reading is a finding about the arm, not a licence to retune
+/// it — but the instrument's own vacuity pair is asserted in
+/// `m1_latency_window_censoring`.
+fn report_censoring(arm: &str, spec: &ArmSpec, run: &ArmRun) {
+    let inputs = ladder_inputs(spec, run.int_c2s_packets, run.window);
+    let reading = censoring(&run.timeline, inputs.step_ms, inputs.observation_room_ms);
+    let required = required_window_ms(&inputs);
+    let window_holds = required <= inputs.observation_room_ms;
+    let lone = matches!(spec.load, Load::RequestResponse { depth: 1 });
+    let row = format!(
+        "[m1-censoring] arm={arm:<10} samples={n:<5} last={last:8.1} rungs_at_edge={redge:5.2} \
+         rise_run={rise:<3} edge_gap_ms={gap:8.1} screen={screen:<9} verdict={verdict:<21} \
+         max={max:8.1} burst={burst:8.1} rungs={rungs:>3} step={step:.0} rtt={rtt:.0} \
+         required={required:8.1} room={room:9.1} window_holds={holds:<5} lone_tail={lone} \
+         datagrams={datagrams}\n",
+        n = run.timeline.len(),
+        last = reading.final_ms,
+        redge = reading.rungs_at_edge,
+        rise = reading.rise_run,
+        gap = reading.edge_gap_ms * 1000.0,
+        screen = if reading.ends_on_a_climb() {
+            "climb"
+        } else {
+            "flat"
+        },
+        verdict = format!("{:?}", reading.verdict),
+        max = run.summary.max,
+        burst = worst_plannable_burst(&inputs),
+        rungs = ladder_rungs(&inputs),
+        step = inputs.step_ms,
+        rtt = inputs.rtt_ms,
+        required = required,
+        room = inputs.observation_room_ms,
+        holds = window_holds,
+        datagrams = inputs.datagrams,
+    );
+    // One locked write of the whole row, like [`print_arm`]'s, so a row cannot
+    // interleave with another test's line. The prefix is deliberately not
+    // `[mandate-smoke …]`: `tools/mandate-check` reads those as arm lines and
+    // attributes them to the mandate that follows, and this row is an
+    // instrument reading rather than an arm the declaration carries.
+    print_censoring_row(&row);
 }
 
 // ─────────────────────────────── M1: latency ─────────────────────────────────
@@ -1022,6 +1431,189 @@ async fn m1_interactive_tail_latency() {
     );
 }
 
+/// The M1 arms' observation windows, read for a climb the window truncated.
+///
+/// A **new instrument, with no arm retuned**: `clean`, `hostile` and
+/// `lone_tail` keep their impairment, seeds, windows, cadence, tier and guards
+/// exactly, and this test reads the latency series they already produce —
+/// through the same shared arm-run cache the M2 gate reads, so a full-target
+/// run measures nothing twice and an `--exact` run of this test alone pays the
+/// same one measurement the M1 gate pays.
+///
+/// It exists because the panel cannot answer the question it is read for. The
+/// M1-latency panel's x range is the data's own extent, so the lone tail's
+/// largest sample sits at the frame's right edge and a climb cut off there
+/// looks exactly like one that finished there — and the panel draws the gap a
+/// long round trip leaves as a straight line, so the same record reads as a
+/// near-vertical wall. [`censoring`] resolves both from the series and the
+/// arm's own room, and the five vacuity cases below prove the instrument can go
+/// red: a detector that cannot fail is not coverage.
+#[tokio::test(flavor = "multi_thread")]
+async fn m1_latency_window_censoring() {
+    // ── vacuity 1: a climb cut off before the arm's room ends is Censored.
+    // The series is a body of `CENSORING_MIN_SAMPLES` samples at the arm's own
+    // p50 and cadence with a terminal ladder of four consecutive rungs one
+    // `LADDER_STEP_MS` apart, its last sample past the 1200 ms room the sketch
+    // passes: the arm's room cannot contain the climb, so the reported maximum
+    // is a lower bound.
+    let mut truncated: Vec<(f64, f64)> = (0..CENSORING_MIN_SAMPLES)
+        .map(|index| (index as f64 * 0.005, 24.0))
+        .collect();
+    for (index, value) in [560.0, 860.0, 1160.0, 1460.0].into_iter().enumerate() {
+        truncated.push((0.16 + index as f64 * 0.25, value));
+    }
+    let cut_off = censoring(&truncated, LADDER_STEP_MS, 1200.0);
+    print_censoring_vacuity("truncated-climb", &cut_off, 1200.0);
+    assert_eq!(
+        cut_off.verdict,
+        Censoring::Censored,
+        "[M1-censoring] vacuity 1: the final sample {:.1} ms is a climb {:.2} rungs wide and past the 1200 ms room, so the red reading must be Censored; got {:?} (record_at_edge={} rise_run={} edge_gap_ms={:.1})",
+        cut_off.final_ms,
+        cut_off.rungs_at_edge,
+        cut_off.verdict,
+        cut_off.record_at_edge,
+        cut_off.rise_run,
+        cut_off.edge_gap_ms * 1000.0,
+    );
+
+    // ── vacuity 2: the same climb with the room to contain it is not censored.
+    // This is the case that separates "ends on a climb" from "truncated": the
+    // shape is identical and only the room moved, so a criterion that ignored
+    // the room would call a completed observation red.
+    let contained = censoring(&truncated, LADDER_STEP_MS, 4000.0);
+    print_censoring_vacuity("contained-climb", &contained, 4000.0);
+    assert_eq!(
+        contained.verdict,
+        Censoring::EdgeRecordContained,
+        "[M1-censoring] vacuity 2: a climb the room can contain is an observed maximum, not a censored one",
+    );
+
+    // ── vacuity 3: a record with its decay after it is Clear. A genuine
+    // maximum is a peak, so the series' last sample is below it and there is no
+    // terminal climb to read.
+    let mut completed = truncated[..CENSORING_MIN_SAMPLES].to_vec();
+    for (index, value) in [1460.0, 700.0, 240.0, 26.0, 24.0].into_iter().enumerate() {
+        completed.push((0.16 + index as f64 * 0.25, value));
+    }
+    let peak = censoring(&completed, LADDER_STEP_MS, 1200.0);
+    print_censoring_vacuity("decayed-peak", &peak, 1200.0);
+    assert_eq!(
+        peak.verdict,
+        Censoring::Clear,
+        "[M1-censoring] vacuity 3: a record followed by its decay is a peak, not a truncated climb",
+    );
+
+    // ── vacuity 4: a rise whose steps are further apart than one rung is not
+    // one climb. The last sample stands 0.8 of a rung above the previous record,
+    // so the rung test has nothing to bite on, and the gap bound leaves the
+    // terminal run one sample long: the reading is Clear, where a criterion
+    // counting adjacency alone would call those two samples a rising run.
+    let mut drawn_as_a_wall = truncated[..CENSORING_MIN_SAMPLES].to_vec();
+    drawn_as_a_wall.push((0.16, 560.0));
+    drawn_as_a_wall.push((1.16, 800.0));
+    let widened = censoring(&drawn_as_a_wall, LADDER_STEP_MS, 1200.0);
+    print_censoring_vacuity("widened-rungs", &widened, 1200.0);
+    assert_eq!(
+        widened.verdict,
+        Censoring::Clear,
+        "[M1-censoring] vacuity 4: steps {} ms apart are not a rising run, so the two samples are not a climb; got {:?} (rise_run={} rungs_at_edge={:.2})",
+        widened.edge_gap_ms * 1000.0,
+        widened.verdict,
+        widened.rise_run,
+        widened.rungs_at_edge,
+    );
+
+    // ── vacuity 5 (window side): the derived requirement must fail when the
+    // arm's own impairment can outrun its own room. The hostile arm's own
+    // config with a 400-datagram mean burst needs 26 rungs of the 300 ms step —
+    // 7.85 s — against the 2 s `GRACE` a cadence arm's sink snapshot leaves.
+    // The measurement (`int_c2s_packets`, `window`) is the hostile arm's own.
+    let hostile_spec = mandate_arms("M1")
+        .into_iter()
+        .nth(1)
+        .expect("the M1 arm set carries the hostile arm at index 1");
+    let mut outrunning = hostile_spec.clone();
+    outrunning.int_c2s.loss_model = gilbert_elliott_loss(5.0, 400.0);
+    let outrun = ladder_inputs(&outrunning, 11_950, Duration::from_secs(12));
+    print_censoring_row(&format!(
+        "[m1-censoring] vacuity={case:<18} mean_burst={burst:<8.1} required={required:8.1} \
+         room={room:8.1} verdict={verdict}\n",
+        case = "outrun-window",
+        burst = outrun.mean_burst,
+        required = required_window_ms(&outrun),
+        room = outrun.observation_room_ms,
+        verdict = if required_window_ms(&outrun) > outrun.observation_room_ms {
+            "RED"
+        } else {
+            "green"
+        },
+    ));
+    assert!(
+        required_window_ms(&outrun) > outrun.observation_room_ms,
+        "[M1-censoring] vacuity 5: a mean burst of {} datagrams needs {:.1} ms against the cadence arm's {:.1} ms room, so the window check must go red",
+        outrun.mean_burst,
+        required_window_ms(&outrun),
+        outrun.observation_room_ms,
+    );
+
+    // ── the real arms. The runs are the M1 gate's own (same cache key), so no
+    // arm is measured twice and no arm setting is touched; the quiet accessor
+    // is what keeps this reader from claiming the rows' attribution
+    // ([`mandate_runs_quiet`]).
+    let _serial = SERIAL.lock().await;
+    let specs = mandate_arms("M1");
+    let runs = mandate_runs_quiet("M1").await;
+    assert_eq!(
+        specs.len(),
+        runs.len(),
+        "[M1-censoring] the arm set and its runs must line up one for one",
+    );
+
+    let mut censored = 0usize;
+    let mut window_short = 0usize;
+    for (spec, run) in specs.iter().zip(runs.iter()) {
+        report_censoring(spec.name, spec, run);
+        let inputs = ladder_inputs(spec, run.int_c2s_packets, run.window);
+        let reading = censoring(&run.timeline, inputs.step_ms, inputs.observation_room_ms);
+        assert_ne!(
+            reading.verdict,
+            Censoring::Unclassifiable,
+            "[M1-censoring] the {} arm's {} samples cannot classify its tail; an arm this instrument cannot read is a finding, not a pass",
+            spec.name,
+            run.timeline.len(),
+        );
+        if reading.verdict == Censoring::Censored {
+            censored += 1;
+        }
+        if required_window_ms(&inputs) > inputs.observation_room_ms {
+            window_short += 1;
+        }
+        assert!(
+            required_window_ms(&inputs) <= inputs.observation_room_ms,
+            "[M1-censoring] the {} arm's own window is shorter than the ladder its own link's {} -datagram mean burst can build: {} rungs x {} ms + {} ms round trip = {:.1} ms against its {:.1} ms room",
+            spec.name,
+            inputs.mean_burst,
+            ladder_rungs(&inputs),
+            inputs.step_ms,
+            inputs.rtt_ms,
+            required_window_ms(&inputs),
+            inputs.observation_room_ms,
+        );
+    }
+    assert_eq!(
+        censored, 0,
+        "[M1-censoring] {censored} M1 arm(s) report a maximum past their own observation room: the window truncates the climb it asserts on",
+    );
+    println!(
+        "CENSORING M1 arms={} censored={} window_short={} step_ms={:.0} min_samples={} verdict=PASS",
+        specs.len(),
+        censored,
+        window_short,
+        LADDER_STEP_MS,
+        CENSORING_MIN_SAMPLES,
+    );
+}
+
 // ───────────────────── M1 at the field's RTT scale ─────────────────────────
 
 /// Mandate 1 at the deployed client's round-trip scale.
@@ -1045,13 +1637,19 @@ async fn m1_interactive_tail_latency() {
 #[ignore = "field-RTT lone-tail arm; ~20 s; run with --ignored --nocapture"]
 async fn m1_lone_tail_field_rtt() {
     let _serial = SERIAL.lock().await;
+    let spec = field_rtt_arm();
     let run = with_timeout(
-        Duration::from_secs(120),
+        ARM_DEADLINE,
         "m1-field-rtt/lone_tail",
-        run_arm(field_rtt_arm()),
+        run_arm(spec.clone()),
     )
     .await;
     print_arm(&run);
+    // The arm's own censoring reading: reported, never asserted here. The arm's
+    // window, cadence, seeds, guards and tier are unchanged, and the instrument
+    // that would turn this line into a gate is the default-tier
+    // `m1_latency_window_censoring` test.
+    report_censoring(spec.name, &spec, &run);
 
     let pass = run.summary.p99 <= M1_FIELD_RTT_P99_GUARD_MS
         && over250_pct(&run.samples) <= M1_FIELD_RTT_OVER250_GUARD_PCT;
@@ -1113,12 +1711,15 @@ async fn m1_lone_tail_field_rtt_depth_sweep() {
         spec.name = name;
         spec.load = Load::RequestResponse { depth };
         let run = with_timeout(
-            Duration::from_secs(120),
+            ARM_DEADLINE,
             "m1-field-rtt/depth_sweep",
-            run_arm(spec),
+            run_arm(spec.clone()),
         )
         .await;
         print_arm(&run);
+        // The arm's own censoring reading, reported and not asserted, for the
+        // same reason as [`m1_lone_tail_field_rtt`]'s.
+        report_censoring(spec.name, &spec, &run);
 
         let pass = run.summary.p99 <= M1_FIELD_RTT_P99_GUARD_MS
             && over250_pct(&run.samples) <= M1_FIELD_RTT_OVER250_GUARD_PCT;
@@ -1978,7 +2579,7 @@ async fn m4_interactive_lane_fairness() {
     let mut runs = Vec::new();
     for spec in arms {
         let label = format!("m4/{}", spec.name);
-        let run = with_timeout(Duration::from_secs(120), &label, run_fairness_arm(spec)).await;
+        let run = with_timeout(ARM_DEADLINE, &label, run_fairness_arm(spec)).await;
         print_fair_arm(&run);
         runs.push(run);
     }
