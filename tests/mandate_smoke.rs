@@ -2760,7 +2760,7 @@ fn cadence_offer_messages(window: Duration) -> f64 {
 
 fn m2_declaration() -> String {
     format!(
-        r#"{{"mandate":"M2","title":"M2 interactive delivery and latency under a known offer (1=clean 2=hostile 3=lone_tail)","x_label":"arm (1=clean 2=hostile 3=lone_tail)","y_label":"value","panels":[{{"id":"delivery","chart":"bar","series":[{{"name":"delivery"}}],"bounds":[{{"y":1.0,"label":"M2 delivery floor 1.000"}}]}},{{"id":"latency","chart":"bar","series":[{{"name":"p99_ms"}}],"bounds":[{{"y":{M2_NONDEGRADING_P99_MS},"label":"M2 non-degrading p99 bound (ms)"}}]}}]}}"#
+        r#"{{"mandate":"M2","title":"M2 interactive delivery and latency under a known offer (1=clean 2=hostile 3=lone_tail)","x_label":"arm (1=clean 2=hostile 3=lone_tail)","y_label":"value","panels":[{{"id":"delivery","chart":"bar","series":[{{"name":"delivery"}}],"bounds":[{{"y":1.0,"label":"M2 delivery floor 1.000"}}]}},{{"id":"latency","chart":"bar","series":[{{"name":"p99_ms"}}],"bounds":[{{"y":{M2_NONDEGRADING_P99_MS},"label":"M2 non-degrading p99 bound (ms)","x":[1]}}]}}]}}"#
     )
 }
 
