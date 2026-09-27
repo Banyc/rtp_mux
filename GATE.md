@@ -746,7 +746,7 @@ evidence files (`M1/M2/M3/M4.json`/`.csv`):
 
 ```sh
 cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture
-cd crates/netem_test && tools/mandate-check --rtp-mux ../rtp_mux
+cd crates/netem_test && tools/mandate-check --producer-path rtp_mux=../rtp_mux
 ```
 
 It is a smoke set **alongside** the gates above, not a replacement: it neither
@@ -1958,6 +1958,7 @@ perf_probe::probe_rtp_echo_4mib_direct
 perf_probe::probe_rtp_echo_4mib_mss8k
 rtp_mux_jitter::jitter_duallane_constitution_gate
 rtp_mux_jitter::jitter_duallane_constitution_gate_p99
+birth_liveness::a_birth_is_not_killed_by_a_spike_scale_gap_but_still_times_out_beyond_its_budget
 mandate_smoke::m1_interactive_tail_latency
 spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect
 spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable
