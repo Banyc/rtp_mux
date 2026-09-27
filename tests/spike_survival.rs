@@ -7,8 +7,7 @@
 //! dead path, so the property that matters is the positive one: the session
 //! and its streams **survive** the spike, a write in flight when the spike
 //! begins completes when it ends, and a **reconnect during the spike** —
-//! which pays the cold-establishment charge and, worse, runs rtp's 3 s opening
-//! handshake into a 3.2 s round trip — must not happen.
+//! which pays the cold-establishment charge — must not happen.
 //!
 //! The `establishment` family measures a *cold* birth on a clean link; nothing
 //! before this target holds a **live** session under the field's spike.
@@ -48,13 +47,14 @@
 //!   mechanism that keeps the stream alive — and there is **no max-retry or
 //!   give-up path** in the reliable layer (no `MAX_RETR`/retry-limit constant
 //!   exists in `rtp`). No threshold to fire.
-//! * **rtp opening handshake.** `OPENING_TIMEOUT = 3 s`
-//!   (`rtp/src/traffic_shaping/control/handshake/opening/mod.rs:13`). This is a
-//!   *birth* deadline: a session **re-established during a 3.2 s spike cannot
-//!   complete its handshake**. It is the mechanical reason a reconnect during a
-//!   spike is worse than the spike, and why the identity guard below is the
-//!   point of the unit. (The arm does not exercise birth-on-spike; it asserts
-//!   that birth does not happen. A birth-on-spike arm belongs to `rtp`.)
+//! * **rtp opening handshake.** `OPENING_LEG_TIMEOUT = 4 s`
+//!   (`rtp/src/traffic_shaping/control/handshake/opening/mod.rs`), the smallest
+//!   whole second above the field's worst 3205 ms sample, so it **does**
+//!   outlast the spike. The birth timer that did *not* was this crate's own
+//!   `BIRTH_LIVENESS_DEADLINE` (`src/shared.rs`), 2.5 s until it was raised to
+//!   the same 4 s; `tests/birth_liveness.rs` is its arm. A birth under a spike
+//!   belongs to `rtp_mux`, not to `rtp`, and the arm below still only asserts
+//!   that birth does not happen on a live session.
 //! * **rtp teardown.** `GRACEFUL_CLOSE_TIMEOUT = 675 s` and
 //!   `DRIVER_JOIN_TIMEOUT = 3 s` (`rtp/src/socket/session.rs:28,35`) run only
 //!   once a session is already closing, not on the live path.
@@ -464,8 +464,9 @@ async fn a_field_magnitude_latency_spike_is_survived_without_a_reconnect() {
     );
     // The inverse guard: the session identity must not move across the spike,
     // and there must be no interval with no session. A reconnect during a spike
-    // is worse than the spike: it pays the cold-establishment charge, and rtp's
-    // 3 s opening handshake cannot complete against a 3.2 s round trip.
+    // is worse than the spike: it pays the cold-establishment charge and it
+    // re-runs the whole dual-lane birth, which is why the identity guard is the
+    // point of this unit.
     assert_eq!(
         m.session_before, m.session_after,
         "the session identity changed across a latency spike: the stack reconnected \
