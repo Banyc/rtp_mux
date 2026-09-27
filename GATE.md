@@ -1246,17 +1246,59 @@ a candidate is worse on it.
 
 **The recorded baseline is the deployed `rtp v0.0.98` transport** (`rtp dev
 559fc2b3`: pacer seed `INIT_SEND_RATE = 1024` with the fresh-tail armour cover
-at 4/5 copies, `m = 6`), measured as **six full-window reps** of the very arms
-below on the rebased tree — same seeds, windows, cadence, impairment and bulk
-shape. `p99_ms`/`p999_ms` are those reps' **medians**; the bound is the same
-reps' **mean + three sample standard deviations**, rounded up to the next whole
-millisecond — a derived limit, not a round number, and one that the six
-baseline reps themselves all clear:
+at 4/5 copies, `m = 6`). Its **median** is that transport's own six full-window
+reps; its **limit** is `mean + four sample standard deviations` over the
+**thirty fault-free full-window reps now on record** — those six, the four
+runner-configuration reps recorded here, and the twenty healthy reps measured
+for this change — rounded up to the next whole millisecond. **`p99` is asserted;
+`p999` is reported, not enforced**, and an asserted `p99` must clear both the
+limit and the arm's own measured 40 % noise band:
 
-| arm | `p99` median | `p99` reps | `p99` bound (mean+3sd) | `p999` median | `p999` reps | `p999` bound |
+| arm | `p99` median (6 deployed reps) | 30-rep `p99` range | `p99` limit (mean+4sd, 30 reps) | band bound (median+40 %) | effective `p99` bound | `p999` limit (reported) |
 | --- | --- | --- | --- | --- | --- | --- |
-| `hostile` | 166.7 ms | 152.3–218.4 | **265 ms** | 235.2 ms | 208.7–306.3 | **348 ms** |
-| `lone_tail` | 159.0 ms | 151.2–177.1 | **199 ms** | 349.7 ms | 198.6–937.3 | **1321 ms** |
+| `hostile` | 166.7 ms | 126.0–275.0 | **298 ms** | 233.4 ms | **298 ms** | 405 ms |
+| `lone_tail` | 159.0 ms | 131.0–200.4 | **223 ms** | 222.6 ms | **223 ms** | 1324 ms |
+
+The 30 `p99` reps are, `hostile`: 218.4/156.7/210.7/168.6/164.7/152.3 (the six
+deployed), 221.8/156.9/128.0/127.8 (runner configuration), 162.4/170.6/158.1/
+140.2/168.2/200.1/163.8/185.2/173.7/130.7/195.0/153.0/178.9/275.0/126.0/154.7/
+175.8/180.9/155.4/162.3; `lone_tail`: 155.2/176.5/162.8/177.1/151.3/151.2,
+155.1/184.4/175.2/148.0, 173.0/159.6/166.4/200.4/154.4/177.8/180.5/178.9/
+174.1/160.0/170.3/154.4/163.2/144.0/131.0/164.6/150.9/181.7/162.7/169.3.
+
+**Why the limits changed: the six-rep `mean+3sd` bounds flaked, and the `p999`
+bound cannot be enforced at all.** The previous revision asserted `mean + 3sd`
+over the six deployed reps — `hostile p99` 265 ms, `lone_tail p99` 199 ms,
+`hostile p999` 348 ms, `lone_tail p999` 1321 ms — and over **20 healthy
+full-window runs of the deployed build it failed three times**: `lone_tail p99`
+200.4 ms against 199.0 (that run's clean arm read 37.5 ms against its usual
+26.5 ms), `hostile p99` 275.0 ms against 265.0, and the same run's `hostile
+p999` 375.5 ms against 348.0. Every failure was a contended window — the clean
+arm read 37.5, 52.5 and 78.0 ms in the three worst runs — and contention is the
+runner's **normal** configuration (libtest's default threading runs six tests at
+once). Three sigma is not a rejection rule at this sample size: over the 30-rep
+set `mean + 3sd` is **266.0 ms** `hostile` and 208.4 ms `lone_tail`, and the
+`hostile` arm has a healthy rep at **275.0 ms**, above it. Four sigma is the
+smallest standard margin that covers the observed healthy range (297.8 /
+222.8 ms), and 4 is also RFC 6298's `K`, the variance margin this transport's
+own RTO uses. The `p999` instability is worse and cannot be fixed by any margin
+worth calling a bound: the six deployed reps alone span 198.6-937.3 ms (4.7x),
+the 30-rep set spans 185.6-1015.9 ms, and the workspace has a healthy reading at
+**2723.3 ms** — a bound wide enough never to fire on that set would reject
+nothing. So `p999` is printed with the same comparison and a `REPORTED` verdict
+and asserted nowhere; what the gate still catches is the asserted `p99` and the
+`>250 ms` share guards below.
+
+**The limits are also the body of the change's measurement.** Six further
+healthy reps of the new build all pass: `hostile p99`
+214.1/190.6/193.3/152.0/138.9/133.7 ms (`lone_tail p99`
+164.0/158.5/169.9/145.6/140.0/185.8) with the `p999` rows reported at
+257.6/215.6/232.0/257.5/175.4/188.7 and 262.2/216.6/1095.3/222.9/354.9/317.7 ms
+— 6 of 6 green, where the old bounds would have been within 6 % of firing on the
+worst of them. The residual is stated rather than hidden: a systematic
+`hostile`-`p99` rise **under 79 %** (166.7 -> below 298 ms) is no longer
+rejected by this baseline assertion, because the healthy contended spread
+reaches +65 %; the `>250 ms` share guards bound that regime.
 
 The same six reps record the rest of the baseline for the reader, and are
 asserted nowhere because each mandate already owns its own bound: **clean
@@ -1292,21 +1334,21 @@ the bound cannot read as a probe of the mandate ceiling), and the arm then
 reads
 
 ```
-[m1-baseline] arm=hostile    metric=p99  observed=  1924.2 baseline_v0.0.98=   166.7 bound=   265.0 reps=6 baseline_reps_range=152.3..218.4 verdict=REGRESSED
-[m1-baseline] arm=hostile    metric=p999 observed=  1969.4 baseline_v0.0.98=   235.2 bound=   348.0 reps=6 baseline_reps_range=208.7..306.3 verdict=REGRESSED
-[m1-baseline] arm=lone_tail  metric=p99  observed=   720.4 baseline_v0.0.98=   159.0 bound=   199.0 reps=6 baseline_reps_range=151.2..177.1 verdict=REGRESSED
-[m1-baseline] arm=lone_tail  metric=p999 observed=   720.4 baseline_v0.0.98=   349.7 bound=  1321.0 reps=6 baseline_reps_range=198.6..937.3 verdict=OK
-[M1] the hostile arm's p99 is 1924.2 ms — WORSE than the deployed rtp v0.0.98 baseline (166.7 ms over 6 reps, whose range was 152.3-218.4 ms) beyond its derived bound 265.0 ms (those reps' mean + 3 sample standard deviations): +1054.3% against the recorded baseline. M1's impaired tail is a hard floor — it must not be traded for M2's offered-load latency or the clean arm, and a candidate that does is rejected here rather than absorbed inside a guard.
+[m1-baseline] arm=hostile    metric=p99  observed=  1891.4 baseline_v0.0.98=   166.7 limit=   298.0 banded_bound=   298.0 asserted=true  baseline_reps=6 limit_reps=30 limit_reps_range=126.0..275.0 verdict=REGRESSED
+[m1-baseline] arm=hostile    metric=p999 observed=  1962.0 baseline_v0.0.98=   235.2 limit=   405.0 banded_bound=   405.0 asserted=false baseline_reps=6 limit_reps=30 limit_reps_range=143.8..375.5 verdict=REPORTED
+[m1-baseline] arm=lone_tail  metric=p99  observed=  1512.2 baseline_v0.0.98=   159.0 limit=   223.0 banded_bound=   223.0 asserted=true  baseline_reps=6 limit_reps=30 limit_reps_range=131.0..200.4 verdict=REGRESSED
+[m1-baseline] arm=lone_tail  metric=p999 observed=  1512.2 baseline_v0.0.98=   349.7 limit=  1324.0 banded_bound=  1324.0 asserted=false baseline_reps=6 limit_reps=30 limit_reps_range=185.6..1015.9 verdict=REPORTED
+[M1] the hostile arm's p99 is 1891.4 ms — WORSE than the deployed rtp v0.0.98 baseline (166.7 ms, the deployed 6 reps' median) beyond its effective bound 298.0 ms (the 30 reps on record give a limit of 298.0 ms as their mean + 4 sample standard deviations, and the arm's own measured 40% noise band gives 233.4 ms; the wider of the two binds): +1034.6% against the recorded baseline. M1's impaired tail is a hard floor — it must not be traded for M2's offered-load latency or the clean arm, and a candidate that does is rejected here rather than absorbed inside a guard.
 ```
 
-and the test fails with three of the four baseline metrics `REGRESSED`. The
-fault is a *level* shift, so the message the run shows is the one the standing
-rule names; the assertion is placed first among M1's impaired-arm assertions
-for the same reason (265 ms is the tightest bound any of them carries), so a
-candidate that regressed is reported against the deployed baseline rather than
-inside a superseded tripwire. No existing guard is loosened, removed or
-reordered: they remain, and still fire for the failures that move a share or a
-count without moving these percentiles.
+and the test fails with both asserted `p99` metrics `REGRESSED` (the `p999` rows
+are reported). The fault is a *level* shift, so the message the run shows is the
+one the standing rule names; the assertion is placed first among M1's
+impaired-arm assertions for the same reason (298 ms is the tightest bound any of
+them carries), so a candidate that regressed is reported against the deployed
+baseline rather than inside a superseded tripwire. No existing guard is
+loosened, removed or reordered: they remain, and still fire for the failures
+that move a share or a count without moving these percentiles.
 
 **The honest counterpart — the production lever itself.** Two
 runs with the fresh-tail armour cover removed

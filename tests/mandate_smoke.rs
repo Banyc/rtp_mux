@@ -232,81 +232,181 @@ const M2_OFFER_TOLERANCE: f64 = 0.02;
 
 // ───────── the deployed baseline the impaired tail must not regress past ─────
 
+/// One metric of one impaired arm's recorded **deployed** baseline.
+///
+/// `median_ms` is the deployed `rtp v0.0.98` baseline's own median (six
+/// full-window reps) and `limit_ms` is `mean + 4 sample standard deviations`
+/// over the **wider** rep set [`M1_IMPAIRED_LIMIT_REPS`], rounded up to the next
+/// whole millisecond — a *derived* limit, not a round number. `reps_min`/
+/// `reps_max` carry that wider set's own range so the derivation is checkable
+/// beside the run that reads it. `band` is `Some` only for a metric the gate
+/// **asserts**.
+struct M1ImpairedBaselineMetric {
+    metric: &'static str,
+    median_ms: f64,
+    limit_ms: f64,
+    reps_min: f64,
+    reps_max: f64,
+    /// The noise band as a fraction of `median_ms` when the metric is asserted,
+    /// `None` when it is only reported. See [`M1_IMPAIRED_BASELINE`].
+    band: Option<f64>,
+}
+
 /// One impaired arm's recorded **deployed** baseline: the `rtp` `v0.0.98`
 /// source (`rtp` dev `559fc2b3` — pacer seed `INIT_SEND_RATE = 1024` with the
 /// fresh-tail armour cover at 4/5 copies, `m = 6`), measured as six full-window
 /// reps of the very arms below on this revision: same seeds, windows, cadence,
 /// impairment and bulk shape.
 ///
-/// `p99_ms`/`p999_ms` are the six reps' **medians**; `p99_bound_ms`/
-/// `p999_bound_ms` are the same reps' **mean plus three sample standard
-/// deviations**, rounded up to the next whole millisecond. The bound is a
-/// *derived* limit, not a round number: M1 is a hard floor, so an impaired arm
-/// whose tail exceeds the band its own baseline repeats showed is rejected
-/// rather than weighed against the clean arm. The reps'
-/// own ranges are carried beside the values so the derivation is checkable,
-/// and [`m1_impaired_baseline_rows`] prints the comparison with every run.
-///
 /// The clean arm is recorded with the same baseline in `rtp_mux/GATE.md`
 /// ("The deployed baseline the impaired tail must not regress past"): clean
 /// `p99` **26.5 ms** (median of the same six reps, bound 27 ms).
 struct M1ImpairedBaseline {
     arm: &'static str,
-    p99_ms: f64,
-    p99_bound_ms: f64,
-    p99_reps_min: f64,
-    p99_reps_max: f64,
-    p999_ms: f64,
-    p999_bound_ms: f64,
-    p999_reps_min: f64,
-    p999_reps_max: f64,
+    metrics: [M1ImpairedBaselineMetric; 2],
 }
 
-/// Reps behind every recorded value above.
+/// Reps behind the deployed baseline's own median (the six full-window reps of
+/// `rtp` `v0.0.98`).
 const M1_IMPAIRED_BASELINE_REPS: usize = 6;
 
-/// The deployed `rtp v0.0.98` impaired arms, six full-window reps each. The
-/// per-arm p99 reps are `hostile` 218.4/156.7/210.7/168.6/164.7/152.3 and
+/// Reps behind every `limit_ms`: the six deployed baseline reps, the four
+/// runner-configuration reps recorded in `rtp_mux/GATE.md`, and the twenty
+/// healthy reps measured for this change — 30 fault-free full-window runs of
+/// the very arms below, every one listed in `rtp_mux/GATE.md` beside the arms.
+const M1_IMPAIRED_LIMIT_REPS: usize = 30;
+
+/// The relative rise over the deployed median at which an asserted impaired
+/// percentile counts as a regression. It is the **settled band** of the
+/// perf-history rule (`netem-test/src/bin/perf-history.rs`, `noise_band`): an
+/// impaired arm's `p50`/`p90`/`p99` get `0.40`, because the *same* hostile p99
+/// has read 122.2 / 127.2 / 187.2 / 211.7 ms at fixed settings (1.7x) — a 10 %
+/// band there rejects a good run about half the time. The band is applied here
+/// against the deployed median rather than against the previous run's value, so
+/// the same tolerance that separates two consecutive runs separates a run from
+/// the recorded baseline.
+const M1_IMPAIRED_PERCENTILE_BAND: f64 = 0.40;
+
+/// The absolute rise an asserted metric must also clear, so that a percentage
+/// near zero cannot reject a run: the perf-history rule's `MINIMUM_DELTA_MS`
+/// (5 ms, 2 % of the M1 ceiling). For `lone_tail` the band's own absolute width
+/// (`0.40 x 159 ms` = 63.6 ms) already exceeds it, so this half of the rule
+/// binds on no arm here; it is kept because it is the rule, and it is the half
+/// that would bite first on a metric whose median is small.
+const M1_IMPAIRED_DELTA_FLOOR_MS: f64 = 5.0;
+
+/// The deployed `rtp v0.0.98` impaired arms. The per-arm p99 reps of the six
+/// deployed reps are `hostile` 218.4/156.7/210.7/168.6/164.7/152.3 and
 /// `lone_tail` 155.2/176.5/162.8/177.1/151.3/151.2; the p999 reps are
 /// `hostile` 306.3/226.9/255.2/225.2/208.7/243.4 and `lone_tail`
-/// 670.4/937.3/198.6/410.9/288.4/267.5. The `lone_tail` p999 bound is wide
-/// (1.3-4.4x its median) because that arm's heaviest recovery episode lands in
-/// a 15 s window or does not: the p99 bounds carry the teeth, and the p999
-/// bound still rejects a doubling of the ladder's height.
+/// 670.4/937.3/198.6/410.9/288.4/267.5. Over the wider 30-rep set the p99 range
+/// is `hostile` 126.0-275.0 and `lone_tail` 131.0-200.4; the p999 range is
+/// `hostile` 143.8-375.5 and `lone_tail` 185.6-1015.9.
+///
+/// # Which bound is asserted: the stable percentile, not the order statistic
+///
+/// **`p99` is asserted; `p999` is reported, not enforced.** A `p99` over a
+/// 15 s window is two dozen samples; a `p999` is **one** sample in a thousand —
+/// `lone_tail` yields ~975 samples a run, so its `p999` is a single draw from
+/// the ladder's tail — and it is therefore fixed by whether the arm's heaviest
+/// recovery episode happened to land inside the window. The six deployed reps
+/// alone span 198.6-937.3 ms (4.7x, coefficient of variation 0.63), the 30-rep
+/// set spans 185.6-1015.9 ms (cv 0.54), and the arm has read **2723.3 ms** on a
+/// healthy transport at the deployed baseline — past the `mean+3sd` limit the
+/// six reps give (1321.0 ms). Enforcing an order statistic rejects good runs at
+/// random, so the `p999` limit is printed with every run and asserted nowhere.
+/// This is the rule the perf-history tool already settled for M1
+/// (`netem-test/src/bin/perf-history.rs`, `M1_REJECTION_METRICS`:
+/// `p50`/`p90`/`p99` reject a run, `p999`/`max` are reported) after three false
+/// rejections (`lone_tail max`, `lone_tail p999`, and a `hostile p50` printed as
+/// `+54.2%`); the same reasoning decides the bound here.
+///
+/// # Why the limit is four sigma over 30 reps, and why a band on top
+///
+/// The previous revision's limits were `mean + 3sd` over **six** reps (265 ms
+/// hostile, 199 ms `lone_tail`) and they **flaked**: over 20 healthy
+/// full-window runs of the deployed build the gate failed twice — `lone_tail
+/// p99` 200.4 ms against 199.0, and `hostile p99` 275.0 ms against 265.0 (that
+/// run also read `hostile p999` 375.5 against 348.0). Both were contented
+/// windows (the same runs' clean arm read `p99` 37.5, 52.5 and 78.0 ms against
+/// its usual 26.5 ms), which is the runner's normal configuration — libtest's
+/// default threading runs six tests at once. Three sigma is not a rejection
+/// rule at this sample size: over the 30-rep set `mean + 3sd` is **266.0 ms**
+/// hostile and 208.4 ms `lone_tail`, and the hostile arm has a healthy rep at
+/// **275.0 ms** — above it. Four sigma is the smallest standard margin that
+/// covers the observed healthy range (297.8 ms hostile, 222.8 ms `lone_tail`),
+/// and 4 is also RFC 6298's `K`, the variance margin this transport's own RTO
+/// uses. On top of the limit the gate keeps the perf-history rule's second half:
+/// a rise is a regression only when it clears the limit **and** the arm's own
+/// measured 40 % noise band, so the effective bound is
+/// `max(limit_ms, median_ms * (1 + band))` and the log prints both halves.
+///
+/// What still catches a genuine impaired-tail regression: the asserted `p99`
+/// (a +300 ms one-way fault is +353 % on `lone_tail` and +1054 % on `hostile`,
+/// far past both halves of the rule), the `> 250 ms` **share** guards
+/// (`M1_HOSTILE_OVER250_GUARD_PCT` / `M1_LONE_OVER250_GUARD_PCT` — proportions
+/// of the whole sample, the statistic a taller ladder moves first, and the one
+/// the +300 ms fault drives to ~100 %), the coarse `p999` guards
+/// (`M1_HOSTILE_P999_GUARD_MS`, `M1_LONE_P999_GUARD_MS`), and the `p99` guards.
+/// The residual is stated rather than hidden: a systematic hostile-p99 rise
+/// **under 79 %** (166.7 -> below 298 ms) is no longer rejected by this baseline
+/// assertion, because the healthy contented spread reaches +65 %; the share
+/// guards are what bound that regime.
 const M1_IMPAIRED_BASELINE: [M1ImpairedBaseline; 2] = [
     M1ImpairedBaseline {
         arm: "hostile",
-        p99_ms: 166.7,
-        p99_bound_ms: 265.0,
-        p99_reps_min: 152.3,
-        p99_reps_max: 218.4,
-        p999_ms: 235.2,
-        p999_bound_ms: 348.0,
-        p999_reps_min: 208.7,
-        p999_reps_max: 306.3,
+        metrics: [
+            M1ImpairedBaselineMetric {
+                metric: "p99",
+                median_ms: 166.7,
+                limit_ms: 298.0,
+                reps_min: 126.0,
+                reps_max: 275.0,
+                band: Some(M1_IMPAIRED_PERCENTILE_BAND),
+            },
+            M1ImpairedBaselineMetric {
+                metric: "p999",
+                median_ms: 235.2,
+                limit_ms: 405.0,
+                reps_min: 143.8,
+                reps_max: 375.5,
+                band: None,
+            },
+        ],
     },
     M1ImpairedBaseline {
         arm: "lone_tail",
-        p99_ms: 159.0,
-        p99_bound_ms: 199.0,
-        p99_reps_min: 151.2,
-        p99_reps_max: 177.1,
-        p999_ms: 349.7,
-        p999_bound_ms: 1321.0,
-        p999_reps_min: 198.6,
-        p999_reps_max: 937.3,
+        metrics: [
+            M1ImpairedBaselineMetric {
+                metric: "p99",
+                median_ms: 159.0,
+                limit_ms: 223.0,
+                reps_min: 131.0,
+                reps_max: 200.4,
+                band: Some(M1_IMPAIRED_PERCENTILE_BAND),
+            },
+            M1ImpairedBaselineMetric {
+                metric: "p999",
+                median_ms: 349.7,
+                limit_ms: 1324.0,
+                reps_min: 185.6,
+                reps_max: 1015.9,
+                band: None,
+            },
+        ],
     },
 ];
 
 /// Read one impaired arm against its recorded deployed baseline: one
-/// `(row, failure)` pair per guarded metric (p99, p999). The row carries the
-/// observation, the recorded baseline, the bound, the reps and the direction,
-/// so the run's own log is the comparison; the failure is `Some` only when the
-/// arm regressed past the bound, and names the arm, the metric, the baseline
-/// value, the observed value and the direction the way the M2 owner gate names
-/// its own breach. `arm` is an arm of [`M1ImpairedBaseline`], so a caller that
-/// passes the clean arm gets no rows: the clean arm is recorded but not
-/// guarded here (M1's mandate bound already asserts it).
+/// `(row, failure)` pair per metric. The row carries the observation, the
+/// recorded median, the limit, the effective bound, whether the metric is
+/// asserted and the verdict, so the run's own log is the comparison. The
+/// failure is `Some` only for an **asserted** metric past its effective bound,
+/// and names the arm, the metric, the observed value, the baseline, the bound
+/// and the direction the way the M2 owner gate names its own breach. `arm` is
+/// an arm of [`M1ImpairedBaseline`], so a caller that passes the clean arm gets
+/// no rows: the clean arm is recorded but not guarded here (M1's mandate bound
+/// already asserts it).
 fn m1_impaired_baseline_rows(run: &ArmRun) -> Vec<(String, Option<String>)> {
     let Some(baseline) = M1_IMPAIRED_BASELINE
         .iter()
@@ -314,53 +414,66 @@ fn m1_impaired_baseline_rows(run: &ArmRun) -> Vec<(String, Option<String>)> {
     else {
         return Vec::new();
     };
-    let metrics = [
-        (
-            "p99",
-            run.summary.p99,
-            baseline.p99_ms,
-            baseline.p99_bound_ms,
-            baseline.p99_reps_min,
-            baseline.p99_reps_max,
-        ),
-        (
-            "p999",
-            run.summary.p999,
-            baseline.p999_ms,
-            baseline.p999_bound_ms,
-            baseline.p999_reps_min,
-            baseline.p999_reps_max,
-        ),
-    ];
     let mut out = Vec::new();
-    for (metric, observed, recorded, bound, reps_min, reps_max) in metrics {
+    for reading in &baseline.metrics {
+        let observed = match reading.metric {
+            "p99" => run.summary.p99,
+            "p999" => run.summary.p999,
+            other => unreachable!("M1ImpairedBaseline names an unknown metric {other}"),
+        };
+        // The effective bound: the recorded derived limit, and -- for an
+        // asserted percentile -- the arm's own measured noise band. A rise must
+        // clear both, and the absolute floor as well.
+        let band_bound = reading.band.map(|band| reading.median_ms * (1.0 + band));
+        let effective_bound = band_bound.map_or(reading.limit_ms, |band_bound| {
+            reading.limit_ms.max(band_bound)
+        });
+        let regressed = reading.band.is_some()
+            && observed > effective_bound
+            && observed - reading.median_ms > M1_IMPAIRED_DELTA_FLOOR_MS;
+        let verdict = if reading.band.is_none() {
+            "REPORTED"
+        } else if regressed {
+            "REGRESSED"
+        } else {
+            "OK"
+        };
         let row = format!(
             "[m1-baseline] arm={arm:<10} metric={metric:<4} observed={observed:8.1} \
-             baseline_v0.0.98={recorded:8.1} bound={bound:8.1} reps={reps} \
-             baseline_reps_range={lo:.1}..{hi:.1} verdict={verdict}\n",
+             baseline_v0.0.98={recorded:8.1} limit={limit:8.1} banded_bound={banded:8.1} \
+             asserted={asserted:<5} baseline_reps={baseline_reps} limit_reps={limit_reps} \
+             limit_reps_range={lo:.1}..{hi:.1} verdict={verdict}\n",
             arm = baseline.arm,
-            reps = M1_IMPAIRED_BASELINE_REPS,
-            lo = reps_min,
-            hi = reps_max,
-            verdict = if observed <= bound { "OK" } else { "REGRESSED" },
+            metric = reading.metric,
+            recorded = reading.median_ms,
+            limit = reading.limit_ms,
+            banded = effective_bound,
+            asserted = reading.band.is_some(),
+            baseline_reps = M1_IMPAIRED_BASELINE_REPS,
+            limit_reps = M1_IMPAIRED_LIMIT_REPS,
+            lo = reading.reps_min,
+            hi = reading.reps_max,
         );
-        let failure = (observed > bound).then(|| {
+        let failure = regressed.then(|| {
             format!(
                 "[M1] the {arm} arm's {metric} is {observed:.1} ms — WORSE than the deployed rtp v0.0.98 \
-                 baseline ({recorded:.1} ms over {reps} reps, whose range was {lo:.1}-{hi:.1} ms) beyond its \
-                 derived bound {bound:.1} ms (those reps' mean + 3 sample standard deviations): {pct:+.1}% \
-                 against the recorded baseline. M1's impaired tail is a hard floor — it must not be traded for \
-                 M2's offered-load latency or the clean arm, and a candidate that does is rejected here rather than \
-                 absorbed inside a guard.",
+                 baseline ({recorded:.1} ms, the deployed {baseline_reps} reps' median) beyond its effective \
+                 bound {bound:.1} ms (the {limit_reps} reps on record give a limit of {limit:.1} ms as their \
+                 mean + 4 sample standard deviations, and the arm's own measured {band:.0}% noise band gives \
+                 {banded:.1} ms; the wider of the two binds): {pct:+.1}% against the recorded baseline. M1's \
+                 impaired tail is a hard floor — it must not be traded for M2's offered-load latency or the clean \
+                 arm, and a candidate that does is rejected here rather than absorbed inside a guard.",
                 arm = baseline.arm,
-                metric = metric,
+                metric = reading.metric,
                 observed = observed,
-                recorded = recorded,
-                reps = M1_IMPAIRED_BASELINE_REPS,
-                lo = reps_min,
-                hi = reps_max,
-                bound = bound,
-                pct = 100.0 * (observed / recorded - 1.0),
+                recorded = reading.median_ms,
+                baseline_reps = M1_IMPAIRED_BASELINE_REPS,
+                limit_reps = M1_IMPAIRED_LIMIT_REPS,
+                bound = effective_bound,
+                limit = reading.limit_ms,
+                band = 100.0 * reading.band.unwrap_or(0.0),
+                banded = band_bound.unwrap_or(reading.limit_ms),
+                pct = 100.0 * (observed / reading.median_ms - 1.0),
             )
         });
         out.push((row, failure));
@@ -1562,10 +1675,14 @@ async fn m1_interactive_tail_latency() {
     let lone = &runs[2];
     // The deployed baseline the impaired tail must not regress past, read and
     // printed for every impaired arm before the guards below: a candidate that
-    // is worse on either arm's p99 or p999 is rejected here (the failure names
-    // the arm, the metric, the baseline value, the observed value and the
+    // is worse on either arm's asserted `p99` is rejected here (the failure
+    // names the arm, the metric, the baseline value, the observed value and the
     // direction) rather than weighed against M2's offered-load latency or the
-    // clean arm.
+    // clean arm. The `p999` rows are printed with the same comparison and a
+    // `REPORTED` verdict, and are asserted nowhere — a single order statistic of
+    // a heavy-tailed quantity rejects healthy runs at random (see
+    // [`M1_IMPAIRED_BASELINE`]); the rate-shaped guards below are what catch an
+    // extreme-tail regression.
     let mut impaired_regressions = Vec::new();
     for run in [hostile, lone] {
         for (row, failure) in m1_impaired_baseline_rows(run) {
