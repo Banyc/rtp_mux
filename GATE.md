@@ -722,8 +722,10 @@ multipath@impairment=multipath = the multi-path UDP transport (rtp's `mpudp`) ha
 rate-asymmetry@impairment=rate-asymmetry = only the asymmetric frame-delivery diag arm varies lane asymmetry; an asymmetric *rate* with symmetric latency is not covered.
 loaded-lone-tail@shape=request-response+load=bulk = the lone-tail arms run with the bulk lane idle; the request/response shape under a loaded bulk lane is not covered.
 m1-four-flow-clean@flows=4+impairment=clean+metric=p99-ceiling = **closed** by `mandate_smoke::m4_clean_lane_p99_ceiling` (default tier, 15.5 s, declared with its bound, its five coverage cells and its two vacuity probes in the M4 section above). What the line used to record was that M1's ceiling was asserted on M1's *one-flow* clean arm while the four-flow clean panel drew the same ceiling over four series without asserting it, and that a four-flow clean breach was therefore reported and drawn but asserted by no arm; and that it was reachable — raising `rtp`'s fresh-tail armour cover (4/5 to 8/9) left M1's one-flow clean arm untouched (`p99` 90.8 ms) while moving M4's four-flow clean arm to `clean_p50_max` 99.3-118.5 ms and `clean_p99_max` 253.4-265.0 ms, the last **above** the drawn ceiling. The new arm asserts the four-flow clean `clean_p99_max` against that same ceiling (`M1_CEILING_MS`, one authority), so the breach the cover sweep produced now fails a gate instead of only a panel. The gap's own text said what would close it — "a new arm asserting the four-flow clean p99 against the ceiling - declared beside M4, never by retuning it"; that is what this row records as done. The lever that would move the number rather than bound it is superseded by a **one-parameter change to `rtp`** — `INIT_SEND_RATE` 128 -> 1024, measured on this workspace's `rtp` revision (one-flow clean `p99` 90.8 -> 26.8 ms, four-flow clean p99 180.8 -> 176.1 ms). **That revision is not released and this crate's pin is unchanged** (`rtp` `v0.0.97`, whose arms still measure `clean_p99` 88.1 ms): the numbers above describe the local transport under test, and shipping them is the tag train's job — tag `rtp`, bump this crate's `rtp` pin, re-run this battery, tag this crate. The cover half of the pair was **swept and refused**: the two settings the sweep tried each break a safeguard (the ladder's monotone-non-increasing copy count at `m = 2`, the hostile arm's window-adequacy gate at `m = 4`). The frontier and both refusals are recorded in the M4-level section above and in `rtp/GATE.md`.
+m1-four-flow-hostile@flows=4+impairment=hostile+metric=p99-ceiling = **closed** by `mandate_smoke::m4_hostile_lane_p99_ceiling` (default tier, 15.5 s, declared with its bound, its derivation, its three coverage cells and its two vacuity probes in the section `The four-flow hostile level` above). What the line records is that the production flow count's **hostile** tail had no level arm: M1's 250 ms ceiling is asserted on M1's one-flow clean arm, M4's `hostile` arm guards each flow against M1's loose 900 ms per-flow regression guard, and M4 reports the aggregate `hostile_p99_max` without asserting it — so the four `hostile_p99` bars of a passing battery sat above the 250 ms ceiling drawn on `M4-latency` while no gate named their level. The new arm asserts the four-flow hostile `hostile_p99_max` against `M4_HOSTILE_P99_CEILING_MS` (452 ms), derived as `mean + 4 sd` over the twenty healthy observations on record rather than picked or mirrored above the ceiling: the four-flow hostile tail measures `274.9-423.0 ms`, `1.10-1.69x` the M1 ceiling, so the bound **exceeds** the 250 ms ceiling by `1.81x` and the arm says so — the honest closure here is a bound where the measurement supports it plus the named hole, not a 250 ms assertion that is false on every run. The bound is `1.99x` tighter than M4's own guard, and the red proof shows the arm bites in the region between them: `MANDATE_SMOKE_FAULT=M4_HOSTILE_LEVEL_double` reads per-flow p99 `731.2/848.2/883.8/785.4` ms — every flow **inside** the 900 ms guard M4 asserts and every flow **outside** this arm's 452 ms ceiling — with delivery still `1.000` (a later invocation of the same probe read up to 1314.6 ms, past both bounds). The residual panel gap (the bound is not drawn as a line on `M4-latency`) has its own line above.
 cellular-request-response@lane=cellular-timeline+shape=request-response = the cellular timeline arms use the cadence shape only.
 policer@impairment=policer = a token-bucket policer (as opposed to the shaper and queue the harness models) is not in the impairment instrument, so no arm can cover it.
+m1-four-flow-hostile-level@flows=4+impairment=hostile+metric=p99-ceiling-panel = **named, not drawn.** The four-flow hostile level bound (`M4_HOSTILE_P99_CEILING_MS`, 452 ms, asserted by `mandate_smoke::m4_hostile_lane_p99_ceiling`) is on the same `hostile_p99` series `M4-latency` draws, but it is not drawn as a line: this tool's `series_guard_bounds` draws a per-series guard line only under a **single** declared bound, and a second declared bound on that panel suppressed the run's own `hostile_p99_guard=900` line and made the render refuse itself (the trial bound was 455 ms; the tool reported `mandate_plot: error: panel 'latency': its label names the guard 900, but the artifact draws 2 bound line(s) at [249.9, 455.1] and none of them is that guard`), measured by rendering the panel with the bound added. So the level bound is carried by the arm's own `[m4-hostile-level]` line and the section `The four-flow hostile level`, while `M4-latency` keeps drawing the declaration's 250 ms ceiling and the run's own `900 ms` guard labelled `governs series hostile_p99` and attributes the crossing to that guard rather than implying a breach. The gap is the **panel reading**, not the assertion: relaxing the `series_guard_bounds` single-bound precondition lives in `netem_test/tools/mandate_plot.py`, outside this crate. A reader who needs the level gate has it in the verdict line and in this file; a reader of the panel alone sees `900 ms`, which is M4's own arm guard and not the level.
 ```
 
 The concurrent row's vacuity demonstrations are `HOL_PROBE_FAULT=serialize`
@@ -1526,9 +1528,11 @@ runs); the hostile arm keeps M1's absolute guard instead.
 M4 **reports** the absolute interactive ceiling rather than asserting it: the
 4-flow clean arm measures p99 174.8–188.9 ms — `0.70–0.76` of M1's ceiling —
 and it owns fairness and delivery, not the absolute level. M1 remains the
-authority for the ceiling on **one** flow, and the four-flow level is asserted
-by the separate arm below, which reads M4's own clean arm rather than
-restating it. The M4 latency panel draws the ceiling, and the `MANDATE M4` line
+authority for the ceiling on **one** flow, and the four-flow levels are asserted
+by the separate arms below -- the **clean** level against M1's 250 ms ceiling
+and the **hostile** level against the ceiling its own measured distribution
+supports -- which read M4's own arms rather than restating them. The M4 latency
+panel draws the ceiling and the run's own `hostile_p99_guard`, and the `MANDATE M4` line
 prints `clean_p50_max`/`clean_p99_max`/`hostile_p99_max`, so a multi-flow
 latency regression is visible in the evidence and in the verdict line. The arm's own
 cost is the queueing delay of four flows behind the shared interactive window
@@ -1683,6 +1687,123 @@ for it is `m = 5`, which the window-adequacy arithmetic admits (5 rungs,
 admitting it is a **new arm with a longer window**, declared here in `rtp_mux`,
 not a retune of an existing one, and it is not taken in this change.
 
+### The four-flow hostile level: `m4_hostile_lane_p99_ceiling`
+
+The four-flow **clean** level above closes the clean shape's ceiling gap, but
+the production shape's **hostile** tail had no level arm at all: M1's 250 ms
+ceiling is asserted on M1's one-flow clean arm, M4's `hostile` arm guards each
+flow against M1's loose `900 ms` per-flow regression guard, and M4 reports the
+aggregate `hostile_p99_max` without asserting it. So the four `hostile_p99`
+bars of the four-flow hostile arm sat **above** the 250 ms ceiling drawn on
+`M4-latency` on a passing battery, and no gate named their level — the
+`m1-four-flow-hostile@flows=4+impairment=hostile+metric=p99-ceiling` gap in
+this file. `mandate_smoke::m4_hostile_lane_p99_ceiling` closes it as a **new**
+arm beside M4 (M4 itself is untouched): it takes `fairness_arms("M4")`'s
+hostile arm — the same `hostile_link(41/42)` GE `5 %`/mean-8 + 100 ms-jitter
+link, the same four tagged flows at the same cadence and window, the same
+connected-but-unladen bulk lane — and asserts four things on it.
+
+| quantity | measured (this arm's derived runs) | bound (derived) |
+| --- | --- | --- |
+| aggregate four-flow hostile `p99` (`max_i p99_i`) | `274.9-423.0 ms` across the 18 fresh reps and 2 recorded observations | `<= 452 ms` (`M4_HOSTILE_P99_CEILING_MS`) |
+| per-flow delivery (`received_i / sent_i`) | `1.000` on every flow of every run (including both vacuity probes) | `>= 0.995` ([`M4_DELIVERY_FLOOR`], not restated) |
+| `samples > 0`, `p99` finite and positive | `9003` delivered in the recorded run | asserted (an instrument sanity, not a bound) |
+
+**Why 452 ms, and why it exceeds the M1 ceiling.** The clean-lane arm could
+reuse `M1_CEILING_MS` because that is what the product promises and the
+four-flow clean p99 meets it (`0.70-0.76` of it). The hostile shape does not:
+the same statistic measures `274.9-423.0 ms`, `1.10-1.69x` the ceiling, so a
+250 ms bound here would be false on every run. The bound is instead derived by
+the mechanism this file already uses for the impaired tail (*The deployed
+baseline the impaired tail must not regress past*): `mean + 4` sample standard
+deviations over the healthy reps on record, rounded up to the next whole
+millisecond. The reps are eighteen full-window reps of M4's own `hostile` arm
+measured on this crate's pinned `rtp v0.0.98` — `274.9`, `296.9`, `297.1`,
+`301.0`, `308.0`, `315.6`, `315.7`, `316.5`, `323.5`, `324.1`, `331.1`,
+`334.4`, `334.6`, `341.8`, `345.1`, `345.9`, `351.8`, `358.3` — plus the
+harness baseline's own recorded `hostile_p99_max=306.5`
+(`crates/netem_test/tools/mandate-baseline.json`) and the `<= 423 ms` worst
+per-flow p99 M4's own bounds table records above. Over those `n = 20`
+observations the mean is `327.3 ms` and the sample standard deviation `31.0 ms`,
+so the limit is `327.3 + 4 × 31.0 = 451.1`, rounded up to `452 ms`. It fires on
+a regression of `452 / 423 = 1.07x` over the recorded worst (`1.26x` over the
+worst fresh rep).
+
+The file's guard convention for a regression bound — a multiple of the worst
+measured, `2 × 423 = 846 ms` — is the `900 ms` guard M4's arm already asserts,
+so it would add no level of its own; the 452 ms limit is **1.99x tighter** than
+that guard. The honest content of the arm is therefore twofold: it bounds the
+production shape's hostile tail at the tightest level its own distribution
+supports, and it **names the hole** — `452 / 250 = 1.81x` above the M1
+ceiling, because the GE + 100 ms-jitter tail is the product's known hostile
+defect (the `1 s` `MIN_RTO` repair floor plus backoff) and not a scheduler
+artifact. A bound that hid that (a 250 ms assertion, or a 900 ms guard
+presented as the level) would be worse than the named hole.
+
+**Vacuity, at the magnitude the property names.** Two probes perturb the arm's
+own input (so the failure is produced by the measurement path, never by the
+assertion), each an extra one-way delay on the arm's hostile link.
+`MANDATE_SMOKE_FAULT=M4_HOSTILE_LEVEL_double` (`+100 ms`) drives the aggregate
+p99 past the bound and fails it by name, with the per-flow delivery floor still
+green at `1.000` — so the level bound is what fails, not a side effect. The
+probe's magnitude varies with the arm's own rate ramp under the added delay:
+one recorded run read p99 `883.8 ms` (`p99 883.8 ms exceeds its
+452.0 ms ceiling`) with per-flow p99 `731.2/848.2/883.8/785.4` — every flow
+**inside M4's own `900 ms` guard**, so M4's arm would pass while this arm
+fails, which is exactly the region between the old guard and the new ceiling —
+and a later invocation of the same probe read up to `1314.6 ms`, past both
+bounds. The pair of readings is the honest statement: the fault always fails
+this arm, and it can fail it in the guard-gap region no other gate names. `M4_HOSTILE_LEVEL_slow`
+(`+300 ms`) drives it to **2085.8 ms** (still delivery `1.000`); it is
+**composite** and declared as such: at `+300 ms` it lengthens the round trip
+enough to slow the arm's own rate ramp as well as the one-way hop, so its
+reading is a floor on what the probe costs and not an isolated measurement of
+the one-way delay.
+
+**The panel: why the new ceiling is not drawn on it, and what the panel
+says.** The new bound is on the same `hostile_p99` series the `M4-latency`
+panel draws, so the question is whether the panel owes it a line. It does not,
+and the decision is recorded rather than left implicit. The panel's drawn bound
+is still the declaration's 250 ms ceiling, and the tool draws the run's own
+`hostile_p99_guard=900` as a second line labelled `governs series
+hostile_p99`; the crossing of the 250 ms ceiling by the hostile bars is
+attributed to that guard, so the panel shows a pass under the arm's own guard
+rather than an unattributed breach. Drawing the level bound as a third
+line is not a one-line declaration change: this tool's `series_guard_bounds`
+draws a per-series guard line only under a **single** declared bound, and
+adding a second declared bound suppressed the 900 ms line and made the render refuse itself (the trial bound was 455 ms; the tool reported `its label names the guard 900, but the artifact draws 2 bound line(s) at [249.9, 455.1] and none of them is that guard`) — measured, by
+rendering `M4-latency` with the bound added. Relaxing that precondition lives
+in `netem_test/tools/mandate_plot.py`, outside this crate, and the M4 panel is
+M4's arm's evidence while the level bound belongs to a different arm; drawing
+it there would imply M4's run asserts it. The panel therefore keeps
+**attributing** the crossing (the brief's second branch) and the level gate is
+read from this arm's own `[m4-hostile-level]` line and this section. The
+discrepancy between the drawn `900 ms` guard and the asserted `452 ms` level is
+stated here so a reader cannot mistake one for the other.
+
+**Cost and coverage.** Default tier (not `#[ignore]`d) beside M4, and it takes
+the smoke set's shared `SERIAL` guard so its wall-clock measurement never
+overlaps another arm's. Measured cost **15.5 s** on the 12 s window (`15.52 s`
+by the two vacuity runs and the green run, `wall_s=15.5`), the window plus
+`GRACE` plus ~1.5 s of connection and stream setup; `--quick` selects the 8 s
+window. Cells provided:
+`M4-hostile-level@flows=4+impairment=hostile+metric=p99-ceiling`,
+`M4-hostile-level@flows=4+impairment=hostile+metric=no-starvation`,
+`M4-hostile-level@instrument=degenerate-percentile`. Each cell varies **one**
+declared dimension from a stated baseline, M4's own hostile arm
+(`M4@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share`
+in `tools/mandate-arms.json`): the flows, impairment, lanes, shape and load are
+held fixed and what the arm adds is the `p99-ceiling` level (and the
+`no-starvation` read that keeps a level met by starving a flow from counting);
+the `degenerate-percentile` cell is the instrument sanity, not a bound. Cells
+deliberately **not** covered, with the reason: the fair-latency spread (on the
+hostile link the per-flow p99 differences are a GE loss realization, not a
+scheduler property — M4's own arm records a spread up to `2.93x` and asserts
+M1's absolute guard there instead), the four-flow clean level (the separate
+clean arm above), and a flow count other than four (the sink attributes
+samples by first-byte tag, whose range caps at seven flows; four is the
+production shape).
+
 ## Tiers
 
 - **default** — not `#[ignore]`d, so a plain `cargo test -p rtp_mux` runs it.
@@ -1742,6 +1863,7 @@ mandate_smoke::m2_offered_load_latency
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness
 mandate_smoke::m4_clean_lane_p99_ceiling
+mandate_smoke::m4_hostile_lane_p99_ceiling
 mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
 mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
 mux_over_rtp::mux_over_rtp_over_netem_clean_link_echoes
@@ -1993,6 +2115,7 @@ mandate_smoke::m2_offered_load_latency
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness
 mandate_smoke::m4_clean_lane_p99_ceiling
+mandate_smoke::m4_hostile_lane_p99_ceiling
 ```
 
 ## Perf-tier reach into asserting helpers

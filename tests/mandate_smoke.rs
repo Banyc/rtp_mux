@@ -543,13 +543,15 @@ fn out_dir() -> PathBuf {
 /// `M1_latency`, `M1_IMPAIRED_slow`, `M1_FIELD_RTT_slow`,
 /// `M1_LOSS_MODEL_uncorrelated`,
 /// `M1_LOSS_MODEL_correlated`, `M2_delivery`, `M2_offer`, `M3_starve`,
-/// `M4_starve`, `M4_late`, `M4_drop`, `M4_CLEAN_LEVEL_double` or
-/// `M4_CLEAN_LEVEL_slow`. Unset in every real
+/// `M4_starve`, `M4_late`, `M4_drop`, `M4_CLEAN_LEVEL_double`,
+/// `M4_CLEAN_LEVEL_slow`, `M4_HOSTILE_LEVEL_double` or
+/// `M4_HOSTILE_LEVEL_slow`. Unset in every real
 /// run (the runner never sets it). Faults perturb an arm's *input* — the
 /// impairment or the offered payload — never the assertion, so the failure is
 /// produced by the measurement path. The two `M4_CLEAN_LEVEL_*` values name
-/// [`m4_clean_lane_p99_ceiling`]'s own namespace rather than M4's, so a probe
-/// of that arm's level assertion cannot read as a probe of M4's.
+/// [`m4_clean_lane_p99_ceiling`]'s own namespace rather than M4's, and the two
+/// `M4_HOSTILE_LEVEL_*` values name [`m4_hostile_lane_p99_ceiling`]'s, so a
+/// probe of either arm's level assertion cannot read as a probe of M4's.
 fn fault(mandate: &str) -> Option<String> {
     let value = std::env::var("MANDATE_SMOKE_FAULT").ok()?;
     let value = value.trim();
@@ -3477,6 +3479,38 @@ const M4_LATENCY_SPREAD_BOUND: f64 = 2.0;
 /// clean p99 doubles (2 x 178 = 356 ms) fails it with 106 ms to spare.
 const M4_CLEAN_P99_CEILING_MS: f64 = M1_CEILING_MS;
 
+/// The bound the four-flow **hostile level** arm asserts: the production flow
+/// count must meet a level of its own on the GE `5 %`/mean-8 + 100 ms-jitter
+/// link, where the one-flow mandate ceiling ([`M1_CEILING_MS`], 250 ms) is
+/// **currently false**.
+///
+/// Why not [`M1_CEILING_MS`]: the clean-lane arm could reuse the mandate's own
+/// number because the product promises it and the four-flow clean p99 meets it
+/// (`0.70-0.76` of it); on the hostile link the same statistic measures
+/// `274.9-423.0 ms`, i.e. `1.10-1.69x` the ceiling, so a 250 ms bound here would
+/// be false on every run. The arm therefore asserts the tightest level bound
+/// its own distribution supports, derived by the mechanism this file already
+/// uses for the impaired tail (`rtp_mux/GATE.md`, "The deployed baseline the
+/// impaired tail must not regress past"): `mean + 4` sample standard
+/// deviations over the healthy reps on record. The reps are the eighteen
+/// full-window reps of M4's own `hostile` arm measured on this crate's pinned
+/// `rtp v0.0.98` (`274.9`, `296.9`, `297.1`, `301.0`, `308.0`, `315.6`,
+/// `315.7`, `316.5`, `323.5`, `324.1`, `331.1`, `334.4`, `334.6`, `341.8`,
+/// `345.1`, `345.9`, `351.8`, `358.3`), the harness baseline's recorded
+/// `hostile_p99_max=306.5`
+/// (`crates/netem_test/tools/mandate-baseline.json`) and the `<= 423 ms`
+/// worst per-flow p99 M4's own bounds table records: `n = 20`, mean `327.3`,
+/// `sd 31.0`, limit `451.1`, rounded up to the next whole millisecond. The
+/// file's guard rule for a regression bound -- a multiple of the worst
+/// measured, `2 x 423 = 846 ms` -- is the `900 ms` guard `m4_interactive_lane_fairness`
+/// already asserts per flow, so it would add no level of its own; this bound is
+/// **1.99x tighter** than that guard and fires on a regression of `452 / 423 =
+/// 1.07x` over the recorded worst (`1.26x` over the worst fresh rep). It
+/// exceeds the M1 ceiling by `452 / 250 = 1.81x`, and the arm says so: the
+/// four-flow hostile tail is a **known, named hole**, not a bound that hides
+/// the product's 250 ms promise.
+const M4_HOSTILE_P99_CEILING_MS: f64 = 452.0;
+
 /// The per-flow tag byte, the same A/L/C/D convention the multi-flow scaling
 /// probe uses (`b'B'` is the reserved bulk-sink tag, so it is skipped). The
 /// server's tagged sink routes every interactive-lane stream through its
@@ -4317,6 +4351,144 @@ async fn m4_clean_lane_p99_ceiling() {
     assert!(
         p99_max <= M4_CLEAN_P99_CEILING_MS,
         "[M4 level] the four-flow clean lane's p99 {p99_max:.1} ms exceeds the {M4_CLEAN_P99_CEILING_MS} ms interactive ceiling (p50 {p50_max:.1}, per-flow p99 {:?}): the production shape runs {M4_FLOWS} flows on the one interactive lane, and it must meet the same ceiling M1 asserts for one -- a multi-flow tail breach is a product regression even though M1's one-flow arm cannot see it",
+        run.flows.iter().map(|f| f.summary.p99).collect::<Vec<_>>(),
+    );
+}
+
+// ────── M4 hostile level: the production flow count's hostile tail, bounded ──
+
+/// The arm the four-flow hostile **level** assertion reads: M4's own
+/// `hostile` arm -- the same `hostile_link(41/42)` GE `5 %`/mean-8 + 100 ms
+/// jitter link, the same `M4_FLOWS` tagged flows offering the same payload at
+/// the same `CADENCE` over the same window, and the same connected-but-unladen
+/// bulk lane -- taken from [`fairness_arms`] rather than restated, so the two
+/// cannot drift apart.
+///
+/// It carries its own fault namespace (`M4_HOSTILE_LEVEL_*`) rather than M4's,
+/// because the gap this arm closes is that M4's own hostile arm guards each
+/// flow against M1's loose `900 ms` regression guard while nothing bounds the
+/// production flow count's **level**: a probe of this assertion must not read
+/// as a probe of M4's.
+fn m4_hostile_level_arm() -> FairArmSpec {
+    let mut spec = fairness_arms("M4")
+        .into_iter()
+        .nth(1)
+        .expect("the M4 arm set always carries its hostile arm second");
+    if let Some(fault) = fault("M4_HOSTILE_LEVEL") {
+        // The level bound's own vacuity probes, as a further one-way delay on
+        // the arm's hostile link. `double` is sized so the aggregate p99 lands
+        // past the bound while the per-flow delivery floor stays green (the
+        // shift lengthens the round trip but does not starve the lane: every
+        // message is still observed inside the arm's `window + GRACE` cutoff),
+        // and `slow` is the deeper probe, which is also **composite**: at
+        // `+300 ms` it lengthens the round trip enough to slow the arm's own
+        // rate ramp as well as the one-way hop, so its reading is a floor on
+        // what the shift costs, not a measurement of one.
+        let extra_ms = match fault.as_str() {
+            "M4_HOSTILE_LEVEL_double" => Some(100),
+            "M4_HOSTILE_LEVEL_slow" => Some(300),
+            _ => None,
+        };
+        if let Some(extra_ms) = extra_ms {
+            spec.int_c2s.latency += Duration::from_millis(extra_ms);
+            spec.int_s2c.latency += Duration::from_millis(extra_ms);
+        }
+    }
+    spec
+}
+
+/// Mandate 4's **hostile level** arm: the four-flow hostile lane against a
+/// ceiling of its own.
+///
+/// M1 asserts its 250 ms ceiling on its **one-flow** clean arm; M4 reports the
+/// four-flow hostile p99 and guards each flow against M1's loose `900 ms`
+/// regression guard, so the production flow count's own hostile level was
+/// bounded by no arm -- the eleven `hostile_p99` bars of a passing battery sat
+/// **above** the 250 ms ceiling drawn on the panel while no gate named their
+/// level (the `m1-four-flow-hostile@flows=4+impairment=hostile+metric=p99-ceiling`
+/// gap in `GATE.md`). This arm closes that gap as a **new** arm beside M4 (M4
+/// itself is untouched): it takes `fairness_arms("M4")`'s hostile arm -- the
+/// same link, flows, cadence and window -- and asserts
+/// [`M4_HOSTILE_P99_CEILING_MS`] on the aggregated `hostile_p99_max`.
+///
+/// The bound exceeds the M1 ceiling and the arm says so in its own line: the
+/// four-flow hostile tail is the product's **known** hostile defect (the 1 s
+/// `MIN_RTO` repair floor plus backoff), and the honest closure is to bound it
+/// where the measurement supports it and name the hole, not to bound it at a
+/// ceiling that is currently false. The per-flow delivery floor is read *with*
+/// the level, so a lane that meets its p99 by starving a flow fails it; the
+/// clean level's fair-latency spread is deliberately **not** asserted here,
+/// because on the hostile link the per-flow p99 differences are a GE loss
+/// realization rather than a scheduler property (M4's own arm records a spread
+/// up to `2.93x` and asserts M1's absolute guard there instead).
+///
+/// Vacuity: `MANDATE_SMOKE_FAULT=M4_HOSTILE_LEVEL_double` perturbs the arm's
+/// own input and fails this bound by name.
+#[tokio::test(flavor = "multi_thread")]
+async fn m4_hostile_lane_p99_ceiling() {
+    let _serial = SERIAL.lock().await;
+    let run = with_timeout(
+        ARM_DEADLINE,
+        "m4/hostile_level",
+        run_fairness_arm(m4_hostile_level_arm()),
+    )
+    .await;
+    let p99_max = run.flows.iter().map(|f| f.summary.p99).fold(0.0, f64::max);
+    let p99_min = run
+        .flows
+        .iter()
+        .map(|f| f.summary.p99)
+        .fold(f64::INFINITY, f64::min);
+    let p50_max = run.flows.iter().map(|f| f.summary.p50).fold(0.0, f64::max);
+    let delivery_min = run
+        .flows
+        .iter()
+        .map(|f| f.summary.delivery_pct)
+        .fold(f64::INFINITY, f64::min);
+    let samples: u64 = run.flows.iter().map(|f| f.summary.received).sum();
+    let guard_tighter = M1_HOSTILE_P99_GUARD_MS / M4_HOSTILE_P99_CEILING_MS;
+    let pass = samples > 0
+        && delivery_min >= M4_DELIVERY_FLOOR
+        && p99_max.is_finite()
+        && p99_max > 0.0
+        && p99_max <= M4_HOSTILE_P99_CEILING_MS;
+    // Deliberately not a `MANDATE` line and deliberately not an
+    // `[mandate-smoke …]` arm row: `tools/mandate-check` owns the M1-M4 id set
+    // and attributes every arm row to the mandate whose `MANDATE` line follows
+    // it, so a row or an id printed here would be read as M4's own measurement
+    // (or refused as a second declaration of one). This arm's verdict is its
+    // own line and its exit status.
+    println!(
+        "[m4-hostile-level] {} flows={} p99_max={:.1} p99_min={:.1} p50_max={:.1} \
+         delivery_min={:.3} samples={} ceiling={:.1} ceiling_over_m1={:.3} \
+         fire_ratio={:.3} delivery_floor={:.3} window_s={:.1} wall_s={:.1}",
+        if pass { "PASS" } else { "FAIL" },
+        M4_FLOWS,
+        p99_max,
+        p99_min,
+        p50_max,
+        delivery_min,
+        samples,
+        M4_HOSTILE_P99_CEILING_MS,
+        M4_HOSTILE_P99_CEILING_MS / M1_CEILING_MS,
+        M4_HOSTILE_P99_CEILING_MS / p99_max,
+        M4_DELIVERY_FLOOR,
+        run.window.as_secs_f64(),
+        run.wall.as_secs_f64(),
+    );
+    assert!(
+        samples > 0 && p99_max.is_finite() && p99_max > 0.0,
+        "[M4 hostile level] the arm measured {samples} delivered message(s) and an aggregate p99 of {p99_max} ms: a lane with no samples, no percentile or a zero percentile is an instrument failure, not a level that passes",
+    );
+    assert!(
+        delivery_min >= M4_DELIVERY_FLOOR,
+        "[M4 hostile level] hostile-arm flow delivery {delivery_min:.3} is under the {M4_DELIVERY_FLOOR} floor (the arm's own per-flow counts: sent={:?} received={:?}): a level met by starving a flow is not met",
+        run.flows.iter().map(|f| f.sent).collect::<Vec<_>>(),
+        run.flows.iter().map(|f| f.received).collect::<Vec<_>>(),
+    );
+    assert!(
+        p99_max <= M4_HOSTILE_P99_CEILING_MS,
+        "[M4 hostile level] the four-flow hostile lane's p99 {p99_max:.1} ms exceeds its {M4_HOSTILE_P99_CEILING_MS:.1} ms ceiling (p50 {p50_max:.1}, per-flow p99 {:?}): the production shape runs {M4_FLOWS} flows on the one interactive lane, and its hostile tail is bounded only by M4's loose {M1_HOSTILE_P99_GUARD_MS:.0} ms per-flow guard -- a level regression past {M4_HOSTILE_P99_CEILING_MS:.1} ms (1.07x the recorded worst, {guard_tighter:.2}x tighter than that guard) is a product regression M1's one-flow clean arm cannot see",
         run.flows.iter().map(|f| f.summary.p99).collect::<Vec<_>>(),
     );
 }
