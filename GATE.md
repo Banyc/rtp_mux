@@ -678,7 +678,7 @@ soak@scale=multi-hour = `rtp_longrun` is multi-minute; a multi-hour soak fits no
 multipath@impairment=multipath = the multi-path UDP transport (rtp's `mpudp`) has no rtp_mux arm; a cell for it belongs to the layer that owns that transport.
 rate-asymmetry@impairment=rate-asymmetry = only the asymmetric frame-delivery diag arm varies lane asymmetry; an asymmetric *rate* with symmetric latency is not covered.
 loaded-lone-tail@shape=request-response+load=bulk = the lone-tail arms run with the bulk lane idle; the request/response shape under a loaded bulk lane is not covered.
-m1-four-flow-clean@flows=4+impairment=clean+metric=p99-ceiling = the M1 ceiling is asserted on M1's *one-flow* clean arm, and the four-flow M4 panel draws the same ceiling over four series without asserting it (M4 owns fairness and delivery; its doc comment records the deliberate choice, justified by the 179-231 ms the four-flow clean p99 measured when the arm was written). A four-flow clean breach is therefore reported and drawn but asserted by no arm, and it is reachable: raising `rtp`'s fresh-tail armour cover (`FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_*`, 4/5 to 8/9 - the larger cover the ladder's `n = floor(burst / m)` count would need to shorten the field's climb) leaves M1's one-flow clean arm untouched (p99 median 89.0 to 90.8 ms over three reps each, `>250 ms` count 0 on both) while moving M4's four-flow clean arm from `clean_p50_max` 23.4-25.0 ms and `clean_p99_max` 177.4-183.7 ms to 99.3-118.5 ms and 253.4-265.0 ms (six reps each, disjoint ranges), the last above the drawn ceiling - so M4 reports a clean-lane breach while M1, the arm that asserts it, passes. `rtp/GATE.md` records what the same sweep measured on the ladder itself and the refusal that follows (a cover 4 to 8 buys no reproducible field-scale tail: p99 1207.0 to 1205.1 ms at wire 4.19x to 5.13x; only `m = 13` moves it, at 12.47x wire). What closes this gap is a new arm asserting the four-flow clean p99 against the ceiling - declared beside M4, never by retuning it - or M1 gaining a four-flow clean row.
+m1-four-flow-clean@flows=4+impairment=clean+metric=p99-ceiling = **closed** by `mandate_smoke::m4_clean_lane_p99_ceiling` (default tier, 15.5 s, declared with its bound, its five coverage cells and its two vacuity probes in the M4 section above). What the line used to record was that M1's ceiling was asserted on M1's *one-flow* clean arm while the four-flow clean panel drew the same ceiling over four series without asserting it, and that a four-flow clean breach was therefore reported and drawn but asserted by no arm; and that it was reachable — raising `rtp`'s fresh-tail armour cover (4/5 to 8/9) left M1's one-flow clean arm untouched (`p99` 90.8 ms) while moving M4's four-flow clean arm to `clean_p50_max` 99.3-118.5 ms and `clean_p99_max` 253.4-265.0 ms, the last **above** the drawn ceiling. The new arm asserts the four-flow clean `clean_p99_max` against that same ceiling (`M1_CEILING_MS`, one authority), so the breach the cover sweep produced now fails a gate instead of only a panel. The gap's own text said what would close it — "a new arm asserting the four-flow clean p99 against the ceiling - declared beside M4, never by retuning it"; that is what this row records as done. The lever that would move the number rather than bound it was measured and is refused as it stands (`INIT_SEND_RATE` 128 -> 1024: the one-flow clean `p99` 90.8 -> 26.8 ms, the clean arm's own wire 2.22x -> 5.81x against its 6x budget) — see the M4-level section above for the numbers and for what would have to move with it.
 cellular-request-response@lane=cellular-timeline+shape=request-response = the cellular timeline arms use the cadence shape only.
 policer@impairment=policer = a token-bucket policer (as opposed to the shaper and queue the harness models) is not in the impairment instrument, so no arm can cover it.
 ```
@@ -725,6 +725,16 @@ M1 asserts the mandate-1 bound (p99 `<= 250 ms` and zero samples `> 250 ms`) on
 rate) as the within-run delivered/shaper-forwarded fraction, median of three.
 Those bounds and their derivations are the ones stated above; the smoke set
 does not restate them.
+
+The same target carries a fourth asserting arm beside M4 —
+`mandate_smoke::m4_clean_lane_p99_ceiling`, default tier, 15.5 s — because the
+production shape runs four interactive flows over one long-lived mux session
+and the interactive ceiling was asserted only on M1's one-flow clean arm. It
+reads M4's own clean arm and asserts the four-flow `clean_p99_max` against
+`M1_CEILING_MS`; the bound, its derivation, its coverage cells and its two
+vacuity probes are in *The four-flow clean level* above. It prints its own
+verdict line rather than a `MANDATE` line or an arm row, so it neither adds an
+id the runner refuses nor lands its measurement in M4's attribution.
 
 The smoke set's three arms all run the deployment's **25 ms one-way** profile
 (~50 ms round trip), which is not the RTT the deployed client sees: the field
@@ -1274,13 +1284,14 @@ arm, where the per-flow p99 differences are a GE loss realization rather than a
 scheduler property (that arm measured a spread of up to `2.93×` across 10
 runs); the hostile arm keeps M1's absolute guard instead.
 
-M4 **reports** rather than asserts the absolute interactive ceiling: the
-4-flow clean arm measures p99 179–231 ms — `0.72–0.92` of M1's ceiling — so an
-absolute per-flow assertion there would sit within 1.1× of the arm's own
-measurement and fire on host noise. M1 remains the authority for the ceiling,
-the M4 latency panel draws it, and the `MANDATE M4` line prints
-`clean_p50_max`/`clean_p99_max`/`hostile_p99_max`, so a multi-flow latency
-regression is visible in the evidence and in the verdict line. The arm's own
+M4 **reports** the absolute interactive ceiling rather than asserting it: the
+4-flow clean arm measures p99 174.8–188.9 ms — `0.70–0.76` of M1's ceiling —
+and it owns fairness and delivery, not the absolute level. M1 remains the
+authority for the ceiling on **one** flow, and the four-flow level is asserted
+by the separate arm below, which reads M4's own clean arm rather than
+restating it. The M4 latency panel draws the ceiling, and the `MANDATE M4` line
+prints `clean_p50_max`/`clean_p99_max`/`hostile_p99_max`, so a multi-flow
+latency regression is visible in the evidence and in the verdict line. The arm's own
 cost is the queueing delay of four flows behind the shared interactive window
 (p50 24 ms, p90 155 ms, p99 180 ms on the 12 s window where the one-flow arm
 sits at the 25 ms floor): the split is fair, and the lane's latency budget
@@ -1313,6 +1324,112 @@ declaration says so: it lengthens the round trip as well as crossing the cutoff,
 so it moves the offer as well as the arrival, and it cannot isolate `late` from
 `lost` on every run. What it isolates is the *cell*: in every run the three
 counts are separate and the floor's verdict is read from `lost` alone.
+
+### The four-flow clean level: `m4_clean_lane_p99_ceiling`
+
+The production shape runs four interactive flows over one long-lived mux
+session, and the interactive ceiling was asserted only on M1's **one-flow**
+clean arm, so the four-flow clean p99 was measured and drawn but bounded by no
+arm. `mandate_smoke::m4_clean_lane_p99_ceiling` closes that gap as a **new**
+arm beside M4 (M4 itself is untouched): it takes
+`fairness_arms("M4")`'s clean arm — the same `link(41/42, OWD, JITTER,
+LOSS_2, 0)` interactive link, the same four tagged flows at the same cadence
+over the same window, the same connected-but-unladen bulk lane — and asserts
+four things on it.
+
+| quantity | measured (this arm's derived runs) | bound (derived) |
+| --- | --- | --- |
+| aggregate four-flow clean `p99` (`max_i p99_i`) | `174.8–188.9 ms` across 10 runs, both revisions | `<= 250 ms` (`M4_CLEAN_P99_CEILING_MS`, one authority: [`M1_CEILING_MS`]) |
+| per-flow delivery (`received_i / sent_i`) | `1.000` on every flow of every run | `>= 0.995` ([`M4_DELIVERY_FLOOR`], not restated) |
+| clean p99 spread (`max p99 / min p99`) | `1.007–1.072` | `2×` ([`M4_LATENCY_SPREAD_BOUND`]) |
+| `samples > 0`, `p99` finite and positive | `8557` delivered in the recorded run | asserted (an instrument sanity, not a bound) |
+
+**Why the ceiling and not a looser guard.** The file's guard rule for a
+regression bound is a multiple of the worst measured — `1.67×` for the
+fair-latency bound, `2.2×` for the imbalance bound, `~3×` for the hostile
+latency guards. Applied here it wants `2 × 188.9 = 377.8 ms`, which is
+**above** the ceiling and therefore bounds nothing the product promises: a
+bound the lane could breach while still meeting M1's ceiling is not a level
+bound. The ceiling is thus the tightest level bound this arm's own
+distribution supports, and its value is reused rather than picked: the
+sensitivity is `250 / 188.9 = 1.32×` the worst measured (`1.415×` on the run
+recorded below), so the arm fires on a third again as much tail. The two
+remaining assertions are what keep a level pass meaningful, and they are read
+**with** the level rather than instead of it: a lane that meets its p99 by
+starving a flow, or by carrying three fast flows and one slow one, fails the
+floor or the spread and is named.
+
+**Vacuity, at the magnitude the property names.** Two probes perturb the arm's
+own input (so the failure is produced by the measurement path, never by the
+assertion), each an extra one-way delay on the arm's clean link:
+`MANDATE_SMOKE_FAULT=M4_CLEAN_LEVEL_double` (`+100 ms`) lands the aggregate
+p99 at **501.0 ms = `2.004×` the ceiling** — the doubling case — and fails the
+bound by name (`p99 501.0 ms exceeds the 250 ms interactive ceiling`), and
+`M4_CLEAN_LEVEL_slow` (`+200 ms`) drives it to **866.2 ms** with the fair-
+latency and delivery assertions still green, i.e. the level bound is what
+fails, not a side effect. `M4_CLEAN_LEVEL_slow` is **composite** and declared
+as such: at `+200 ms` it lengthens the round trip enough to slow the arm's own
+rate ramp as well as the one-way hop, so its reading is a floor on what the
+probe costs and not an isolated measurement of the one-way delay.
+
+**Cost and coverage.** Default tier (not `#[ignore]`d) beside M4, and it takes
+the smoke set's shared `SERIAL` guard so its wall-clock measurement never
+overlaps another arm's. Measured cost **15.5 s** on the 12 s window (`15.52 s`
+by `--report-time` over 10 filtered-out tests, two runs), which is the window
+plus `GRACE` plus ~1.5 s of connection and stream setup; `--quick` selects the
+8 s window. Cells provided:
+`M4-level@flows=4+impairment=clean+metric=p99-ceiling`,
+`M4-level@flows=4+impairment=clean+metric=no-starvation`,
+`M4-level@flows=4+impairment=clean+metric=fair-share`,
+`M4-level@flows=4+impairment=clean+metric=fair-latency`,
+`M4-level@instrument=degenerate-percentile`. Cells deliberately **not**
+covered, with the reason: an impaired four-flow level (the hostile four-flow
+lane is M4's own arm and its per-flow p99 is guarded there against M1's hostile
+guard — the level to assert on a loss-driven tail is a different question and
+would need its own derivation), and a flow count other than four (the sink
+attributes samples by first-byte tag, whose range caps at seven flows; four is
+the production shape).
+
+**What the level's number is made of.** The four-flow clean p99 is **not** a
+steady-state queueing tail: it is the connection's **start-up transient**.
+Reading the arm's own per-sample timeline (`rtp_mux_it125` run `tl_m4`, the
+same arm with a per-sample trace added to its collector), the four-flow clean
+lane sits at `80–193 ms` from `t=1.5 s` to `t=5.0 s` and at the `24 ms` one-way
+floor from `t=5.1 s` to the window's end, with a handful of `85–95 ms` blips
+left in the clean stretch; the one-flow clean arm's own timeline (`M1.csv`, the
+`mc_empty` run) has the same shape over `t=1.5–2.0 s` peaking at `99 ms`. The
+median is identical across one and four flows because the floor is what most
+samples are; the p99 doubles because the transient is four times as long and
+twice as deep. The transient's own driver is measurable: attaching an
+`rtp::metrics::MetricsObserver` to the interactive client connection (`rate_m4`
+run) shows `send_rate_packets_per_second` climbing `128 → 4099.5` between
+`t=1.503 s` and `t=6.689 s` and `delivery_sample_app_limited` flipping
+to `true` at the moment it stops — the ramp starts at `INIT_SEND_RATE`
+(`rtp/src/reliable/reliable_layer.rs:67`), and `cwnd` is derived from it
+(`cwnd = rate × rtt × CWND_SEND_RATE_SCALE`, `rtp/src/traffic_shaping/recovery/
+pkt_send_space.rs:30,1398`), so the offered load is served from a standing
+sender-side backlog until the ramp overtakes it. The alternatives the same
+measurements rule out: the transient is not loss/repair (delivery is `1.000`
+on every flow and the deep-Latency samples carry no repair counters), and it
+is not the `netem` link (the episode's end coincides with the rate crossing
+the offer, not with any impairment change).
+
+**A lever exists, is measured, and is refused as it stands.** Raising
+`INIT_SEND_RATE` from `128` to `1024` removes the transient almost entirely on
+the **one-flow** clean arm — measured `clean_p99` `90.8 → 26.8 ms` and
+`clean_p50` `24.0 → 21.6 ms` (two reps each, `26.6/26.8` ms; the same change
+leaves the four-flow p99 essentially where it was, `188.9 → 176.4 ms`, so the
+four-flow transient is *not* the initial pacer rate) — but it buys that with
+wire: the M2 clean arm's own-wire multiple rises `2.22× → 5.81×` against its
+`6×` budget. That is a `2.6×` inflation of the clean arm's own traffic, and the
+clean arm is where M2's real budget is asserted, so by the constitution it is
+not an improvement: it consumes the whole M2 margin (`97 %` of budget) to buy
+the M1 tail. What would have to change for the lever to be landable is the
+*second* parameter it is coupled to — the fresh-tail armour cover
+(`FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_*`, whose own frontier
+`rtp/GATE.md` refuses upward) determines how many of a message's six datagrams
+the higher rate admits, so the two have to move together and be measured
+together. That is a two-parameter change and is not in this arm.
 
 ## Tiers
 
@@ -1370,6 +1487,7 @@ mandate_smoke::m1_interactive_tail_latency
 mandate_smoke::m2_interactive_delivery_and_wire
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness
+mandate_smoke::m4_clean_lane_p99_ceiling
 mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
 mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
 mux_over_rtp::mux_over_rtp_over_netem_clean_link_echoes
@@ -1618,6 +1736,7 @@ mandate_smoke::m1_lone_tail_rung_distribution
 mandate_smoke::m2_interactive_delivery_and_wire
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness
+mandate_smoke::m4_clean_lane_p99_ceiling
 ```
 
 ## Perf-tier reach into asserting helpers
@@ -1904,11 +2023,14 @@ different arms:
 - `MANDATE_SMOKE_FAULT` (`tests/mandate_smoke.rs:272`) selects a perturbation
   of one smoke arm's input: `M1_latency`, `M1_FIELD_RTT_slow`,
   `M1_LOSS_MODEL_uncorrelated`, `M1_LOSS_MODEL_correlated`, `M2_wire`,
-  `M2_delivery`, `M3_starve`, `M4_starve`, `M4_late` and `M4_drop`. Unset in every real
+  `M2_delivery`, `M3_starve`, `M4_starve`, `M4_late`, `M4_drop`,
+  `M4_CLEAN_LEVEL_double` and `M4_CLEAN_LEVEL_slow`. Unset in every real
   run — the runner never sets it. The value's prefix (`starts_with(mandate)`,
   `:271-278`) names the arm whose input is perturbed, and each arm's own
   matcher then tests the value it owns; an arm that does not own the selected
-  value leaves its input alone (`_ => {}`, `:398`).
+  value leaves its input alone (`_ => {}`, `:398`). The two `M4_CLEAN_LEVEL_*`
+  values name the four-flow level arm's own namespace so that probing *its*
+  assertion cannot read as probing M4's.
 - `HOL_PROBE_FAULT` (`tests/hol_probe.rs:2377`) selects the two offering
   faults the concurrent frame-delivery arms' red proof uses: `serialize`
   (only the first flow may offer until its window closes) and `throttle`
