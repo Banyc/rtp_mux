@@ -79,10 +79,17 @@ either sees the whole constitution:
    client→server wire forwarded by the impairment proxy must stay within `6×`
    of it (measured ~3.6× on the seeded `both` arm — RTP/mux framing +
    control + the repair traffic 2 % loss needs — so ~1.6× headroom, and the
-   aggregate wire must not grow by more than ~+64 %). The budget does not
+   aggregate wire must not grow by more than ~+64 %; the same arm re-measures
+   **3.67×** on the local `rtp` revision under test after `INIT_SEND_RATE` was
+   raised there, 128 → 1024 (that revision is not released — this crate still
+   pins `rtp` `v0.0.97` — see the `m1-four-flow-clean` row below), i.e. it does
+   not move, because this arm offers ~100 msg/s and so never outran the old
+   128 pkt/s seed — the cost of the rate is confined to the arms whose offered
+   rate *exceeds* the old seed, which is the high-cadence `mandate_smoke` arm
+   at 200 msg/s and the production four-flow shape at 800). The budget does not
    bound one message's redundancy: a fully-armored lone interactive tail is
    `primary + 5 copies` = six datagrams carrying the same 256 B payload, so
-   it alone costs at least the whole budget before framing. The check is
+   it alone costs the whole budget before framing. The check is
    **two-sided**: the floor `wire >= offered` is asserted alongside the budget,
    because the messages whose delivery the same arm asserts must have crossed
    that path — a zeroed or unobserved wire counter reads as a pass against the
@@ -678,7 +685,7 @@ soak@scale=multi-hour = `rtp_longrun` is multi-minute; a multi-hour soak fits no
 multipath@impairment=multipath = the multi-path UDP transport (rtp's `mpudp`) has no rtp_mux arm; a cell for it belongs to the layer that owns that transport.
 rate-asymmetry@impairment=rate-asymmetry = only the asymmetric frame-delivery diag arm varies lane asymmetry; an asymmetric *rate* with symmetric latency is not covered.
 loaded-lone-tail@shape=request-response+load=bulk = the lone-tail arms run with the bulk lane idle; the request/response shape under a loaded bulk lane is not covered.
-m1-four-flow-clean@flows=4+impairment=clean+metric=p99-ceiling = **closed** by `mandate_smoke::m4_clean_lane_p99_ceiling` (default tier, 15.5 s, declared with its bound, its five coverage cells and its two vacuity probes in the M4 section above). What the line used to record was that M1's ceiling was asserted on M1's *one-flow* clean arm while the four-flow clean panel drew the same ceiling over four series without asserting it, and that a four-flow clean breach was therefore reported and drawn but asserted by no arm; and that it was reachable — raising `rtp`'s fresh-tail armour cover (4/5 to 8/9) left M1's one-flow clean arm untouched (`p99` 90.8 ms) while moving M4's four-flow clean arm to `clean_p50_max` 99.3-118.5 ms and `clean_p99_max` 253.4-265.0 ms, the last **above** the drawn ceiling. The new arm asserts the four-flow clean `clean_p99_max` against that same ceiling (`M1_CEILING_MS`, one authority), so the breach the cover sweep produced now fails a gate instead of only a panel. The gap's own text said what would close it — "a new arm asserting the four-flow clean p99 against the ceiling - declared beside M4, never by retuning it"; that is what this row records as done. The lever that would move the number rather than bound it was measured and is refused as it stands (`INIT_SEND_RATE` 128 -> 1024: the one-flow clean `p99` 90.8 -> 26.8 ms, the clean arm's own wire 2.22x -> 5.81x against its 6x budget) — see the M4-level section above for the numbers and for what would have to move with it.
+m1-four-flow-clean@flows=4+impairment=clean+metric=p99-ceiling = **closed** by `mandate_smoke::m4_clean_lane_p99_ceiling` (default tier, 15.5 s, declared with its bound, its five coverage cells and its two vacuity probes in the M4 section above). What the line used to record was that M1's ceiling was asserted on M1's *one-flow* clean arm while the four-flow clean panel drew the same ceiling over four series without asserting it, and that a four-flow clean breach was therefore reported and drawn but asserted by no arm; and that it was reachable — raising `rtp`'s fresh-tail armour cover (4/5 to 8/9) left M1's one-flow clean arm untouched (`p99` 90.8 ms) while moving M4's four-flow clean arm to `clean_p50_max` 99.3-118.5 ms and `clean_p99_max` 253.4-265.0 ms, the last **above** the drawn ceiling. The new arm asserts the four-flow clean `clean_p99_max` against that same ceiling (`M1_CEILING_MS`, one authority), so the breach the cover sweep produced now fails a gate instead of only a panel. The gap's own text said what would close it — "a new arm asserting the four-flow clean p99 against the ceiling - declared beside M4, never by retuning it"; that is what this row records as done. The lever that would move the number rather than bound it is superseded by a **one-parameter change to `rtp`** — `INIT_SEND_RATE` 128 -> 1024, measured on this workspace's `rtp` revision (one-flow clean `p99` 90.8 -> 26.8 ms, four-flow clean p99 180.8 -> 176.1 ms, the clean arm's own wire 2.22x -> 5.80x inside its 6x budget). **That revision is not released and this crate's pin is unchanged** (`rtp` `v0.0.97`, whose arms still measure `clean_p99` 88.1 ms and `clean_wire_x` 2.24x): the numbers above describe the local transport under test, and shipping them is the tag train's job — tag `rtp`, bump this crate's `rtp` pin, re-run this battery, tag this crate. The cover half of the pair was **swept and refused**: the two settings that fit the wire better each break a safeguard (the ladder's monotone-non-increasing copy count at `m = 2`, the hostile arm's window-adequacy gate at `m = 4`). The frontier and both refusals are recorded in the M4-level section above and in `rtp/GATE.md`.
 cellular-request-response@lane=cellular-timeline+shape=request-response = the cellular timeline arms use the cadence shape only.
 policer@impairment=policer = a token-bucket policer (as opposed to the shaper and queue the harness models) is not in the impairment instrument, so no arm can cover it.
 ```
@@ -797,8 +804,8 @@ bounds above (measured X, bound Y, so a change that at least doubles it fails):
 | M1 field-RTT lone-tail p99 | `rtp v0.0.94`: 427–719 ms; landed `rtp` `bdacf5c0`: 293–432 ms | `1500 ms` (~2.1× the pinned band) |
 | M1 field-RTT lone-tail `> 250 ms` share | `v0.0.94` 3.3–5.6 %; landed 2.6–5.3 % | `15 %` (~2.7×) |
 | M1 field-RTT lone-tail max | `v0.0.94`: 1015–3868 ms; landed: 386–529 ms | not asserted (one sample at n≈200) |
-| M2 hostile own-wire | 4.63–4.81× | `10×` (~2×) |
-| M2 lone-tail own-wire | 6.07–6.41× (15 s), field 6.22–7.17× | `14×` (~2×) |
+| M2 hostile own-wire | 4.63–4.81× (6.58–6.65× after `INIT_SEND_RATE` 128 → 1024) | `10×` (~2×) |
+| M2 lone-tail own-wire | 6.07–6.41× (15 s), field 6.22–7.17×; 5.97–6.36× after `INIT_SEND_RATE` 128 → 1024 | `14×` (~2×) |
 | M2 hostile/lone delivery | 1.000 | `0.995` |
 
 The smoke panels carry the mandate lines regardless: the M1 latency panel
@@ -1414,22 +1421,36 @@ on every flow and the deep-Latency samples carry no repair counters), and it
 is not the `netem` link (the episode's end coincides with the rate crossing
 the offer, not with any impairment change).
 
-**A lever exists, is measured, and is refused as it stands.** Raising
+**A lever existed, is measured, was refused as a one-parameter change, and has
+now landed as one and only one of its two parameters.** Raising
 `INIT_SEND_RATE` from `128` to `1024` removes the transient almost entirely on
 the **one-flow** clean arm — measured `clean_p99` `90.8 → 26.8 ms` and
-`clean_p50` `24.0 → 21.6 ms` (two reps each, `26.6/26.8` ms; the same change
-leaves the four-flow p99 essentially where it was, `188.9 → 176.4 ms`, so the
-four-flow transient is *not* the initial pacer rate) — but it buys that with
-wire: the M2 clean arm's own-wire multiple rises `2.22× → 5.81×` against its
-`6×` budget. That is a `2.6×` inflation of the clean arm's own traffic, and the
-clean arm is where M2's real budget is asserted, so by the constitution it is
-not an improvement: it consumes the whole M2 margin (`97 %` of budget) to buy
-the M1 tail. What would have to change for the lever to be landable is the
-*second* parameter it is coupled to — the fresh-tail armour cover
-(`FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_*`, whose own frontier
-`rtp/GATE.md` refuses upward) determines how many of a message's six datagrams
-the higher rate admits, so the two have to move together and be measured
-together. That is a two-parameter change and is not in this arm.
+`clean_p50` `24.0 → 21.6 ms` (two reps each, `26.6/26.8` ms; this run measures
+`clean_p99` 26.2 ms, p999 28.7, max 30.0) — but it buys that with wire: the M2
+clean arm's own-wire multiple rises `2.22× → 5.81×` against its `6×` budget.
+That is a `2.6×` inflation of the clean arm's own traffic, and the clean arm is
+where M2's real budget is asserted, so the change consumes `97 %` of the M2
+margin to buy the M1 tail.  The *reason* the wire moves is the coupled second
+parameter: at `128` the send pacer was the binding term and never admitted the
+declared sixth datagram — measured, cutting the declared cover to one changed
+neither the wire (2.08× → 2.07×) nor the p99 (87.3 → 82.8 ms) — so at `1024`
+the whole declared budget reaches the wire for the first time.  The cover was
+therefore swept as a frontier, and **refused at every setting below the one
+that ships**; the table, the two safeguards and the numbers are in
+`rtp/GATE.md` ("What `INIT_SEND_RATE` was bought with").  In short: `m = 2`
+(closed-gate 1 / open-gate 4) reads one-flow clean p99 29.7 ms at 2.27× wire
+and four-flow p99 130.4 ms but **breaks the ladder's monotone-non-increasing
+invariant**; `m = 4` reads 27.7 ms at 4.53× wire with four-flow p99 137.2 ms but
+**fails `m1_latency_window_censoring`**, an existing default-tier gate, because
+the hostile arm's mean-8-datagram burst can then build 7 rungs against a frozen
+2000 ms room (2150 ms required) and that arm's reported tail would be a lower
+bound; `m = 1` is worse on both axes (87.0 ms at 3.40× wire).  What the landing
+leaves open, stated rather than implied: the wire margin (5.80× of 6×) and the
+four-flow clean tail (`176.1 ms`, essentially unmoved from `180.8`).  The lever
+for both is `m = 5`, which the window-adequacy arithmetic admits (5 rungs,
+`1550 ms` ≤ 2000 ms) but which no *existing* hostile arm can observe — so
+admitting it is a **new arm with a longer window**, declared here in `rtp_mux`,
+not a retune of an existing one, and it is not taken in this change.
 
 ## Tiers
 
