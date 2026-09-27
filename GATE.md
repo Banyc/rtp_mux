@@ -1190,7 +1190,9 @@ first-byte tag exactly as the two-interactive battery does) and the same
 `send_timestamped_messages` offer — carrying **four** interactive streams
 (`M4_FLOWS`) instead of one, each offered the same 256 B payload at the same
 ~5 ms cadence, each attributed by its own tag. Every flow's delivered bytes and
-latency are measured; the bulk lane is connected (the topology is the
+latency are measured, split by **when** the sink observed them (`on_time`,
+`late`, `lost` — see the table below), and the data the assertion reads is
+their own counts; the bulk lane is connected (the topology is the
 production dual-lane one) but carries no stream, so the quantity measured is
 the interactive lane's own split, which no other arm measures. A second arm
 repeats the multi-flow offer on the M1/M2 `hostile` link.
@@ -1199,10 +1201,64 @@ Four quantities, asserted on both arms unless the row says otherwise:
 
 | quantity | measured (M4's own runs) | bound (derived) |
 | --- | --- | --- |
-| per-flow delivery (`received_i / offered_i`) | 1.000 on every flow of both arms, 29 runs | `>= 0.995` (no starvation) |
+| per-flow delivery (`received_i / offered_i`, `received_i` = the messages the arm observed inside its whole horizon = `on_time_i + late_i`) | 1.000 on every flow of both arms, 29 runs | `>= 0.995` (no starvation) |
+| per-flow lost (`lost_i` = `sent_i - received_i`: offered, never observed) | 0 on every flow of both arms in every steady-state run | the floor's own unit budget, stated below |
+| per-flow late (`late_i`: observed after the arm's `window + GRACE` cutoff, inside the 1.2 s drain after it) | 0 on both arms in every steady-state run; 25-35 of the clean arm's ~2300 units under `MANDATE_SMOKE_FAULT=M4_late` | **not asserted**: reported per flow, per arm, on its own panel and in `M4.csv`. A late arrival is a latency event, bounded by the per-flow p99 bounds below and drawn against M1's ceiling -- the delivery floor is not a latency bound and does not pretend to be one |
 | fair-share imbalance `max_i \|share_i − 1/N\| / (1/N)`, `share_i` = flow `i`'s share of the lane's delivered bytes | `0.46 %` (clean worst), `0.43 %` (hostile worst) | `1 %` (2.2× the worst measured, so a change that at least doubles the imbalance fails) |
 | clean-arm p99 spread `max p99 / min p99` | `1.20×` (36 runs, both windows) | `2×` (1.67× the worst measured) |
 | hostile-arm per-flow p99 | `<= 423 ms` | M1's hostile p99 regression guard (item 1's row above; not restated) |
+
+The two delivery rows are one measurement split by **when** the sink observed it,
+and the split is the whole reason the floor is a starvation bound. A cadence
+arm's samples are read from the server sink, so before the split a message
+still riding the repair ladder when the `window + GRACE` drain expired was
+counted as lost although the lane delivered it: `recv` meant "observed within
+`window + GRACE`" while the arm's own claim is "every flow delivers what it is
+offered", and the two differ by the ladder (the 1 s `MIN_RTO` floor with
+backoff, and M1's lone-tail arm -- the same ladder on the same lane -- measures
+p99 1530 ms against its own 3200 ms guard, so `GRACE` sat *inside* the
+documented repair tail). The drain is now `GRACE + 1.2 s` (`3200 - 2000`), it
+ends the moment the whole offer has been observed, and only a message the arm
+never observes is lost. Nothing was moved to make anything pass: the cutoff is
+still `window + GRACE` and still what `on_time` means, and a late arrival is
+still visible -- in the `late` cell, on the `M4-late` panel, and in the
+percentile series (a late sample carries its own latency, so a lane that
+stalls raises the per-flow p99 this arm draws against M1's ceiling).
+
+**The floor's granularity, in the units it is made of.** M4 counts
+sink-observed **messages** against `write_all`-accepted ones, so one unit is one
+256 B message and the floor's slack is a count, not a decimal: at an offer of
+`sent` the floor tolerates `floor(sent × 0.005)` lost units and the next one
+fails it. Across the battery's 640 flow-arms `sent` spans 2037–2301, so
+`budget_units` is **10-11** and the first failing count is **11-12 on every
+run** (`tools/mandate-check` computes and prints exactly this on its `delivery:`
+line every run, and records it in `mandate-check.json` under
+`delivery_granularity`). The **event size** matters more than the budget: `mux`'s
+reader is a **byte stream**, so one frame lost on the hostile link
+head-of-line blocks every message of that flow offered behind it -- the arm's
+smallest possible shortfall is **one tail block, not eleven independent
+losses**. At this arm's 12 s window and ~2136-unit smallest offer that block is
+`11 × 12 s / 2136` = **61.8 ms** of the flow's own offer (`block_ms`; the
+measured band across the derived runs is 61.9–64.1 ms). **A floor of `0.995` is
+therefore one block away from failing on every run**: the arm can see almost
+nothing between a clean pass and a breach, and the smallest breach is a single
+head-of-line event, not a statistical loss rate. That is why a shortfall here is
+reported as a count with its block duration rather than as the ratio's third
+decimal, and why the loss cell and the late cell are separate: before the split,
+the same block could be one unit *late* or eleven units *lost* depending on a
+two-second drain that the ladder itself outlives.
+
+**The M2 arms keep their cutoff, and that is stated rather than fixed here.**
+The single-flow `clean`/`hostile`/`lone_tail` arms still read `recv` at the
+`window + GRACE` cutoff, so the same "late or lost?" ambiguity sits under their
+delivery figures (the clean arm asserts `delivery == 1.000` exactly, and the
+hostile/lone floors are `0.995` with 11- and 4-unit budgets). They do not carry
+the starvation claim the M4 split exists to make -- there is no second flow to
+starve -- and their samples are the same ones the M1 tails are derived from, so
+changing their basis would move six recorded M1/M2 numbers in one edit. The gap
+is recorded, not closed: an M2 delivery figure is still a figure the drain
+timed, and a reader comparing the two mandates' delivery rows should know that
+only M4's is a loss count.
 
 The imbalance bound's derivation in full: one delivered frame is
 `1 / (4 × 2064) = 0.012 %` of the lane, i.e. `0.048 %` of the equal share, so
@@ -1233,13 +1289,29 @@ M4 is **default tier** (not `#[ignore]`d): its asserted quantities are counts
 and shares over a seeded link, the same class as the mandate-2 constitution
 gate, and its ~31 s wall-clock belongs in the gate that always runs. The
 measurement is part of the one command above — M4's evidence is `M4.json` plus
-four panels (per-flow shares against the fair-share line, per-flow departure
-from it against the ±bound, per-flow delivery against the floor, and per-flow
-p50/p99 against M1's ceiling). The two vacuity demonstrations are
-`MANDATE_SMOKE_FAULT=M4_starve` (flow 0 is offered the whole window and the
-rest only its second half: the fair-share bound fails naming M4 at 0.70
-imbalance) and `MANDATE_SMOKE_FAULT=M4_drop` (90 % loss on the clean link: the
-per-flow delivery floor fails naming M4).
+**six** panels: the four that were already there (per-flow shares against the
+fair-share line, per-flow departure from it against the ±bound, per-flow
+delivery against the floor, and per-flow p50/p99 against M1's ceiling) plus the
+split of the delivery cell into the units the floor is made of — a per-flow
+`M4-lost` line against the floor's own unit budget (the count that first
+breaches it is the budget plus one) and a per-flow unattributed `M4-late` line
+holding the backfill the old basis counted as lost. The three vacuity
+demonstrations are `MANDATE_SMOKE_FAULT=M4_starve` (flow 0 is offered the whole
+window and the rest only its second half: the fair-share bound fails naming M4
+at 0.70 imbalance), `MANDATE_SMOKE_FAULT=M4_drop` (90 % loss on the clean link:
+the per-flow delivery floor fails naming M4, and the failure line prints the
+identity it was read from — `sent = on_time + late + lost`, measured `12 = 0 +
+0 + 12` on the arm's first flow) and `MANDATE_SMOKE_FAULT=M4_late` (the clean
+link's c2s direction delayed by `GRACE + 50 ms`, so the offers of the window's
+last ~50 ms are observed after the cutoff and inside the drain: `late` is
+non-zero on every flow with `lost` at 0 in two of three runs — the floor green,
+`delivery 1.000`, the old basis's `on_time / sent` 0.879 — and `late=25,
+lost=6` in the third, where the floor fails on the six never-observed messages
+rather than on the 25 late ones). The `M4_late` fault is **composite** and the
+declaration says so: it lengthens the round trip as well as crossing the cutoff,
+so it moves the offer as well as the arrival, and it cannot isolate `late` from
+`lost` on every run. What it isolates is the *cell*: in every run the three
+counts are separate and the floor's verdict is read from `lost` alone.
 
 ## Tiers
 
@@ -1831,7 +1903,7 @@ different arms:
 - `MANDATE_SMOKE_FAULT` (`tests/mandate_smoke.rs:272`) selects a perturbation
   of one smoke arm's input: `M1_latency`, `M1_FIELD_RTT_slow`,
   `M1_LOSS_MODEL_uncorrelated`, `M1_LOSS_MODEL_correlated`, `M2_wire`,
-  `M2_delivery`, `M3_starve`, `M4_starve` and `M4_drop`. Unset in every real
+  `M2_delivery`, `M3_starve`, `M4_starve`, `M4_late` and `M4_drop`. Unset in every real
   run — the runner never sets it. The value's prefix (`starts_with(mandate)`,
   `:271-278`) names the arm whose input is perturbed, and each arm's own
   matcher then tests the value it owns; an arm that does not own the selected

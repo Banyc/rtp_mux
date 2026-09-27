@@ -72,6 +72,16 @@
 //! (no flow's p99 exceeds the best flow's p99 by more than
 //! [`M4_LATENCY_SPREAD_BOUND`] on the clean arm, the dimension the share
 //! statistic cannot see; the hostile arm keeps M1's absolute guard).
+//!
+//! "Delivers what it is offered" is read as a **delivery** claim and not as a
+//! latency one: a flow's samples are split by when the sink observed them —
+//! **on time** inside the `window + GRACE` cutoff, **late** inside the
+//! [`M4_LATE_HORIZON`] drain that follows, and **lost** when the arm never
+//! observes them at all. The floor is asserted on `received / sent` with
+//! `received = on_time + late`, so a head-of-line block the repair ladder clears
+//! is a late arrival and not a starvation event; `on_time`, `late` and `lost`
+//! are printed per flow, written to `M4.csv` and drawn on their own panels.
+//!
 //! The per-flow latencies are reported and the panel draws M1's ceiling, so a
 //! fair-but-slow split is visible; M1 remains the authority for the absolute
 //! interactive ceiling. The statistic, its derived
@@ -264,7 +274,7 @@ fn out_dir() -> PathBuf {
 /// The deliberate-fault selector used only by the vacuity demonstrations:
 /// `M1_latency`, `M1_FIELD_RTT_slow`, `M1_LOSS_MODEL_uncorrelated`,
 /// `M1_LOSS_MODEL_correlated`, `M2_wire`, `M2_delivery`, `M3_starve`,
-/// `M4_starve` or `M4_drop`. Unset in every real
+/// `M4_starve`, `M4_late` or `M4_drop`. Unset in every real
 /// run (the runner never sets it). Faults perturb an arm's *input* — the
 /// impairment or the offered payload — never the assertion, so the failure is
 /// produced by the measurement path.
@@ -2999,7 +3009,37 @@ const M4_FLOWS: usize = 4;
 /// the bound is derived from, so the floor carries the same slack M2's hostile
 /// floor uses -- a flow that loses more than ~0.5 % of its own offer is
 /// starved, while ordinary tail-repair jitter never trips it.
+///
+/// The floor bounds `lost`: a message this arm *never* observed. It did not
+/// always: the ratio used to be read at the `window + GRACE` cutoff, so a
+/// message still riding the repair ladder when the drain expired was counted as
+/// lost although the lane delivered it -- which made the floor race the ladder
+/// rather than measure starvation. See [`M4_LATE_HORIZON`].
 const M4_DELIVERY_FLOOR: f64 = 0.995;
+
+/// How long past the `window + GRACE` cutoff the arm keeps observing before a
+/// message it has not seen is a *delivery loss*.
+///
+/// `GRACE` (2 s) is the drain a cadence arm's summary is read after, and it sits
+/// **inside** the repair ladder this lane's tail rides: the ladder's post-probe
+/// step is `TAIL_PROBED_MIN_RTO` (300 ms,
+/// `rtp/src/traffic_shaping/recovery/tlp.rs`) and its retransmission deadline is
+/// floored at the 1 s `MIN_RTO` (`rtp/src/traffic_shaping/recovery/rto.rs`)
+/// with exponential backoff, and M1's lone-tail arm -- the same ladder on the
+/// same lane -- measures its p99 at 1530 ms and guards it at
+/// [`M1_LONE_P99_GUARD_MS`] (3200 ms). The documented tail therefore outlives
+/// the cutoff by `3200 - 2000 = 1200 ms`, which is this horizon: a message
+/// observed inside it is **late** (the lane delivered it, so it is a latency
+/// event and not a delivery loss), and only a message this arm never observes
+/// is lost. The horizon is a new constant rather than a wider `GRACE` because
+/// the cutoff is the *on-time* boundary the arm already measured: the two cells
+/// answer different questions and neither may be moved to make the other pass.
+const M4_LATE_HORIZON: Duration = Duration::from_millis(1_200);
+
+/// The late drain's poll interval. The horizon is a deadline the arm leaves as
+/// soon as every flow's whole offer has been observed, so this is the
+/// resolution of that early exit rather than a cost every run pays.
+const M4_LATE_POLL: Duration = Duration::from_millis(25);
 
 /// The fair-share imbalance bound: the worst flow's share of the lane's
 /// delivered bytes may not depart from the equal share `1/M4_FLOWS` by more
@@ -3058,11 +3098,42 @@ struct FairArmSpec {
 struct FlowSample {
     tag: u8,
     sent: u64,
+    /// Messages the sink observed inside the arm's `window + GRACE` cutoff.
+    on_time: u64,
+    /// Messages observed after that cutoff but inside [`M4_LATE_HORIZON`]:
+    /// delivered, late. Its own cell, with its own count, because the mandate's
+    /// claim is that the flow is not *starved* -- and a late arrival is the
+    /// repair ladder completing, not starvation.
+    late: u64,
+    /// Messages never observed: `sent - on_time - late`. This is the delivery
+    /// loss [`M4_DELIVERY_FLOOR`] bounds, so the floor is decided on what the
+    /// lane failed to deliver rather than on how fast it delivered it.
+    lost: u64,
+    /// `on_time + late`: the messages the lane delivered for this flow. The
+    /// printed `delivery` is `received / sent`, the quotient of the two counts
+    /// the arm prints beside it (`sent` and `recv`), so the report's unit budget
+    /// for the floor is read from this arm's own numbers.
     received: u64,
     offered_bytes: u64,
     delivered_bytes: u64,
     share: f64,
     summary: HolSummary,
+}
+
+/// One arm's per-flow cells, summed: the run totals the arm line and the
+/// `MANDATE M4` line report, and the shares' denominator.
+fn arm_totals(run: &FairRun) -> (u64, u64, u64, u64) {
+    run.flows.iter().fold(
+        (0u64, 0u64, 0u64, 0u64),
+        |(sent, on_time, late, lost), flow| {
+            (
+                sent + flow.sent,
+                on_time + flow.on_time,
+                late + flow.late,
+                lost + flow.lost,
+            )
+        },
+    )
 }
 
 /// One M4 arm's outcome, plus the aggregate statistic the fair-share bound is
@@ -3110,6 +3181,23 @@ fn fairness_arms(mandate: &str) -> Vec<FairArmSpec> {
             // flow 0 and the fair-share bound must fail while every flow still
             // delivers everything it offers.
             "M4_starve" => stagger = fairness_window() / 2,
+            // Hold the last stretch of every flow's offer past the arm's
+            // `window + GRACE` cutoff without losing a message: the c2s link is
+            // delayed by just over the cutoff's drain, so the offers of the
+            // window's last ~50 ms land in the *late* cell while the rest of
+            // the offer still arrives on time. The per-flow delivery floor must
+            // stay green (nothing is lost) and `late` must be non-zero on every
+            // flow -- the late cell's own vacuity demonstration. Only c2s is
+            // shifted: the sink is downstream of it, while the s2c return path
+            // keeps the round trip short enough that the arm is not measuring a
+            // stalled link. The shift is deliberately the smallest that crosses
+            // the cutoff, because a repaired message's total is about twice the
+            // one-way delay (the shaper's own delay plus an srtt-sized rung),
+            // and a shift large enough for that sum to pass the horizon would
+            // put real losses in the `lost` cell instead of isolating `late`.
+            "M4_late" => {
+                clean_c2s.latency = GRACE + Duration::from_millis(50);
+            }
             // Collapse every flow's delivery: the per-flow delivery floor must
             // fail naming M4.
             "M4_drop" => {
@@ -3141,6 +3229,15 @@ fn fairness_arms(mandate: &str) -> Vec<FairArmSpec> {
 /// lane, all tagged, all offered the same `MSG_BYTES` payload at `CADENCE` for
 /// `window`, all drained by one collector that buckets the tagged sink's
 /// samples per flow.
+///
+/// Each flow's samples are split by *when* the sink observed them, not only by
+/// whether it did: everything observed by the `window + GRACE` cutoff is
+/// **on time**, everything observed inside the [`M4_LATE_HORIZON`] drain that
+/// follows is **late**, and everything never observed is **lost**. The split is
+/// what makes the delivery floor a starvation bound: a head-of-line block that
+/// the repair ladder clears inside the horizon leaves the floor green and the
+/// backfill in the `late` cell, where it is visible, instead of being counted
+/// as a message the lane never delivered.
 async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
     let FairArmSpec {
         name,
@@ -3229,7 +3326,7 @@ async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
             let mut futs = Vec::with_capacity(M4_FLOWS);
             for (index, (tag, write)) in streams.iter_mut().enumerate() {
                 if write.write_all(&[*tag]).await.is_err() {
-                    return (vec![0u64; M4_FLOWS], Vec::new());
+                    return (vec![0u64; M4_FLOWS], Vec::new(), Vec::new());
                 }
                 let delay = if index == 0 { Duration::ZERO } else { stagger };
                 let run_for = window.saturating_sub(delay);
@@ -3242,45 +3339,87 @@ async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
                 });
             }
             let sent_per_flow: Vec<u64> = join_all(futs).await;
+            let offered_total: u64 = sent_per_flow.iter().sum();
             for (_, write) in streams.iter_mut() {
                 let _ = write.shutdown();
             }
 
+            // The cutoff: the `window + GRACE` drain the summary used to be read
+            // after. A sample observed by now is *on time*.
             tokio::time::sleep(GRACE).await;
-            let collected = std::mem::take(&mut *collector.lock().unwrap());
+            let on_time = std::mem::take(&mut *collector.lock().unwrap());
+
+            // Past the cutoff the arm keeps observing, because the repair
+            // ladder that carries a head-of-line-blocked message outlives
+            // `GRACE`. Everything observed in here is *late*: the lane did
+            // deliver it. The drain ends the moment the whole offer has been
+            // observed, so a healthy run pays a poll interval and not the
+            // horizon.
+            let horizon = Instant::now() + M4_LATE_HORIZON;
+            let mut late = Vec::new();
+            loop {
+                late.extend(std::mem::take(&mut *collector.lock().unwrap()));
+                if on_time.len() as u64 + late.len() as u64 >= offered_total
+                    || Instant::now() >= horizon
+                {
+                    break;
+                }
+                tokio::time::sleep(M4_LATE_POLL).await;
+            }
+            // One last drain, so a sample that raced the loop's own check is
+            // classified rather than read as lost.
+            late.extend(std::mem::take(&mut *collector.lock().unwrap()));
             int_pair.stop();
             bulk_pair.stop();
-            (sent_per_flow, collected)
+            (sent_per_flow, on_time, late)
         })
         .await;
-    let (sent_per_flow, collected) = outcome;
+    let (sent_per_flow, on_time, late) = outcome;
 
-    let mut per_flow_samples: Vec<Vec<f64>> = vec![Vec::new(); M4_FLOWS];
-    for (tag, _elapsed, latency) in collected {
-        if let Some(flow) = (0..M4_FLOWS).find(|&i| m4_flow_tag(i) == tag) {
-            per_flow_samples[flow].push(latency);
+    let bucket = |samples: Vec<(u8, f64, f64)>| {
+        let mut per_flow: Vec<Vec<f64>> = vec![Vec::new(); M4_FLOWS];
+        for (tag, _elapsed, latency) in samples {
+            if let Some(flow) = (0..M4_FLOWS).find(|&i| m4_flow_tag(i) == tag) {
+                per_flow[flow].push(latency);
+            }
         }
-    }
-    let delivered: Vec<u64> = per_flow_samples
-        .iter()
-        .map(|samples| samples.len() as u64 * MSG_BYTES as u64)
+        per_flow
+    };
+    let on_time_per_flow = bucket(on_time);
+    let late_per_flow = bucket(late);
+    let delivered: Vec<u64> = (0..M4_FLOWS)
+        .map(|flow| {
+            (on_time_per_flow[flow].len() + late_per_flow[flow].len()) as u64 * MSG_BYTES as u64
+        })
         .collect();
     let total_delivered: u64 = delivered.iter().sum();
     let ideal_share = 1.0 / M4_FLOWS as f64;
     let mut flows = Vec::with_capacity(M4_FLOWS);
     for flow in 0..M4_FLOWS {
         let sent = sent_per_flow[flow];
-        let received = per_flow_samples[flow].len() as u64;
+        let on_time = on_time_per_flow[flow].len() as u64;
+        let late = late_per_flow[flow].len() as u64;
+        let received = on_time + late;
+        let lost = sent.saturating_sub(received);
         let offered_bytes = sent.saturating_mul(MSG_BYTES as u64);
         let share = if total_delivered == 0 {
             0.0
         } else {
             delivered[flow] as f64 / total_delivered as f64
         };
-        let summary = summarize(per_flow_samples[flow].clone(), sent, received, 0, 0.0);
+        // The series the percentiles are read from is every delivered sample --
+        // on time and late alike -- so a late arrival raises the tail it is: the
+        // reading is the latency the lane took, not only the latency it took
+        // within the cutoff.
+        let mut samples = on_time_per_flow[flow].clone();
+        samples.extend_from_slice(&late_per_flow[flow]);
+        let summary = summarize(samples, sent, received, 0, 0.0);
         flows.push(FlowSample {
             tag: m4_flow_tag(flow),
             sent,
+            on_time,
+            late,
+            lost,
             received,
             offered_bytes,
             delivered_bytes: delivered[flow],
@@ -3310,12 +3449,16 @@ fn print_fair_arm(run: &FairRun) {
     for flow in &run.flows {
         eprintln!(
             "[mandate-smoke m4/{name} flow {tag}] sent={sent:>5} recv={recv:>5} \
-             delivery={del:.3} share={share:.4} offered={offered:>8}B delivered={delivered:>8}B \
+             on_time={on_time:>5} late={late:>5} lost={lost:>5} delivery={del:.3} \
+             share={share:.4} offered={offered:>8}B delivered={delivered:>8}B \
              p50={p50:7.1} p90={p90:7.1} p99={p99:7.1} max={max:8.1}",
             name = run.name,
             tag = flow.tag as char,
             sent = flow.sent,
             recv = flow.received,
+            on_time = flow.on_time,
+            late = flow.late,
+            lost = flow.lost,
             del = flow.summary.delivery_pct,
             share = flow.share,
             offered = flow.offered_bytes,
@@ -3326,9 +3469,11 @@ fn print_fair_arm(run: &FairRun) {
             max = flow.summary.max,
         );
     }
+    let (sent, on_time, late, lost) = arm_totals(run);
     eprintln!(
         "[mandate-smoke m4/{name}] ideal_share={ideal:.4} min_share={min:.4} max_share={max:+.4} \
-         imbalance={imbalance:.4} window={window:?} wall={wall:.1}s",
+         imbalance={imbalance:.4} sent={sent} on_time={on_time} late={late} lost={lost} \
+         window={window:?} wall={wall:.1}s",
         name = run.name,
         ideal = run.ideal_share,
         min = run.min_share,
@@ -3341,7 +3486,7 @@ fn print_fair_arm(run: &FairRun) {
 
 // ────────────────────────── M4: evidence writing ─────────────────────────────
 
-fn m4_declaration() -> String {
+fn m4_declaration(runs: &[FairRun]) -> String {
     let ideal = 1.0 / M4_FLOWS as f64;
     let ideal_pct = ideal * 100.0;
     let bound_pct = M4_IMBALANCE_BOUND * 100.0;
@@ -3349,13 +3494,38 @@ fn m4_declaration() -> String {
     let flows = M4_FLOWS;
     let delivery_floor = M4_DELIVERY_FLOOR;
     let ceiling = M1_CEILING_MS;
+    // The floor's own unit budget at this run's smallest offer: the count of
+    // never-delivered messages the floor tolerates, and the count that first
+    // breaches it. The panel states the floor in the units it is made of, so a
+    // breach is read as an event size rather than as the ratio's third decimal
+    // -- the same arithmetic `tools/mandate-check` prints on its `delivery:`
+    // line, from the same two quantities (`sent` and the floor).
+    let offered_min = runs
+        .iter()
+        .flat_map(|run| run.flows.iter())
+        .map(|flow| flow.sent)
+        .min()
+        .unwrap_or(0);
+    let lost_budget = ((offered_min as f64) * (1.0 - M4_DELIVERY_FLOOR)).floor() as u64;
+    let first_breach = lost_budget + 1;
+    // The line is the **first failing count**, not the tolerance: a count of
+    // `first_breach` lost units is a breach, and drawing the tolerance instead
+    // would put the failing value one unit above the panel's own top (the axis
+    // carries each bound and `FRAME_HEADROOM` of the span, so a series at
+    // `bound + 1` is off the frame). The label states both numbers.
     // The fair-share line is drawn on the share panel; the floor is the same
     // line pulled in by the imbalance bound, so drawing both there overprints
     // two labels one percent apart. The floor is drawn instead on the imbalance
     // panel, whose axis is the deviation itself, where the two bounds and every
     // flow's departure are legible.
+    //
+    // `lost` and `late` are the floor's two cells split in the evidence: `lost`
+    // is the count the floor bounds and is drawn against that count's own unit
+    // budget, and `late` is the backfill the arm would otherwise have counted as
+    // lost -- reported, with no line, because a late arrival is bounded by the
+    // latency panels and not by the delivery floor.
     format!(
-        r#"{{"mandate":"M4","title":"M4 interactive lane fairness: {flows} flows on one interactive lane","x_label":"flow (1..{flows})","y_label":"share of the lane's delivered bytes","panels":[{{"id":"shares","chart":"bar","series":[{{"name":"clean"}},{{"name":"hostile"}}],"bounds":[{{"y":{ideal:.6},"label":"fair share {ideal_pct:.1}%"}}]}},{{"id":"imbalance","chart":"bar","y_label":"departure from the fair share","x_label":"flow (1..{flows})","series":[{{"name":"clean"}},{{"name":"hostile"}}],"bounds":[{{"y":{bound},"label":"fair-share bound \u00b1{bound_pct:.1}%"}}]}},{{"id":"delivery","chart":"bar","y_label":"delivery (received / offered)","series":[{{"name":"clean"}},{{"name":"hostile"}}],"bounds":[{{"y":{delivery_floor},"label":"M4 per-flow delivery floor {delivery_floor}"}}]}},{{"id":"latency","chart":"bar","y_label":"latency (ms)","series":[{{"name":"clean_p50"}},{{"name":"clean_p99"}},{{"name":"hostile_p50"}},{{"name":"hostile_p99"}}],"bounds":[{{"y":{ceiling},"label":"M1 ceiling {ceiling} ms"}}]}}]}}"#
+        r#"{{"mandate":"M4","title":"M4 interactive lane fairness: {flows} flows on one interactive lane","x_label":"flow (1..{flows})","y_label":"share of the lane's delivered bytes","panels":[{{"id":"shares","chart":"bar","series":[{{"name":"clean"}},{{"name":"hostile"}}],"bounds":[{{"y":{ideal:.6},"label":"fair share {ideal_pct:.1}%"}}]}},{{"id":"imbalance","chart":"bar","y_label":"departure from the fair share","x_label":"flow (1..{flows})","series":[{{"name":"clean"}},{{"name":"hostile"}}],"bounds":[{{"y":{bound},"label":"fair-share bound \u00b1{bound_pct:.1}%"}}]}},{{"id":"delivery","chart":"bar","y_label":"delivery (received / offered)","series":[{{"name":"clean"}},{{"name":"hostile"}}],"bounds":[{{"y":{delivery_floor},"label":"M4 per-flow delivery floor {delivery_floor}"}}]}},{{"id":"lost","chart":"line","y_label":"never observed (messages)","x_label":"flow (1..{flows})","series":[{{"name":"lost_clean"}},{{"name":"lost_hostile"}}],"bounds":[{{"y":{first_breach},"label":"{first_breach} lost breaches the floor ({lost_budget} tolerated)"}}]}},{{"id":"late","chart":"line","y_label":"observed late (messages)","x_label":"flow (1..{flows})","series":[{{"name":"late_clean"}},{{"name":"late_hostile"}}],"bounds":[]}},{{"id":"latency","chart":"bar","y_label":"latency (ms)","series":[{{"name":"clean_p50"}},{{"name":"clean_p99"}},{{"name":"hostile_p50"}},{{"name":"hostile_p99"}}],"bounds":[{{"y":{ceiling},"label":"M1 ceiling {ceiling} ms"}}]}}]}}"#
     )
 }
 
@@ -3376,6 +3546,18 @@ fn m4_rows(runs: &[FairRun]) -> Vec<(String, String, f64, f64)> {
                 run.name.to_owned(),
                 x,
                 flow.summary.delivery_pct,
+            ));
+            rows.push((
+                "lost".to_owned(),
+                format!("lost_{}", run.name),
+                x,
+                flow.lost as f64,
+            ));
+            rows.push((
+                "late".to_owned(),
+                format!("late_{}", run.name),
+                x,
+                flow.late as f64,
             ));
             rows.push((
                 "latency".to_owned(),
@@ -3406,6 +3588,14 @@ fn m4_rows(runs: &[FairRun]) -> Vec<(String, String, f64, f64)> {
 /// fire on host noise. M1 owns the ceiling, the M4 latency panel draws it, and
 /// the `MANDATE M4` line reports `clean_p99_max` -- which is what makes a
 /// multi-flow latency regression visible.
+///
+/// The delivery cells are the split of "delivered when": `delivery` is
+/// `received / sent` where `received = on_time + late` is everything the lane
+/// delivered inside the arm's whole observation horizon, so the floor bounds a
+/// **loss** (`lost = sent - received`) rather than a repair that outran a
+/// cutoff; `late` and `lost` are reported per flow and per arm on the lines, in
+/// `M4.csv` and on their own panels. Late arrivals are not unasserted: they are
+/// in the percentile series every M4 latency bound reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn m4_interactive_lane_fairness() {
     let _serial = SERIAL.lock().await;
@@ -3418,7 +3608,7 @@ async fn m4_interactive_lane_fairness() {
         print_fair_arm(&run);
         runs.push(run);
     }
-    write_evidence(&dir, "M4", &m4_declaration(), &m4_rows(&runs));
+    write_evidence(&dir, "M4", &m4_declaration(&runs), &m4_rows(&runs));
 
     let clean = &runs[0];
     let hostile = &runs[1];
@@ -3459,6 +3649,8 @@ async fn m4_interactive_lane_fairness() {
     let clean_p50_max = p50_ceiling_of(clean);
     let hostile_p99_max = p99_ceiling_of(hostile);
     let wall = clean.wall.as_secs_f64() + hostile.wall.as_secs_f64();
+    let (clean_sent, clean_on_time, clean_late, clean_lost) = arm_totals(clean);
+    let (hostile_sent, hostile_on_time, hostile_late, hostile_lost) = arm_totals(hostile);
     let pass = clean_floor >= M4_DELIVERY_FLOOR
         && hostile_floor >= M4_DELIVERY_FLOOR
         && clean.imbalance <= M4_IMBALANCE_BOUND
@@ -3466,7 +3658,7 @@ async fn m4_interactive_lane_fairness() {
         && clean_spread <= M4_LATENCY_SPREAD_BOUND
         && hostile_p99_max <= M1_HOSTILE_P99_GUARD_MS;
     println!(
-        "MANDATE M4 {} flows={} clean_delivery_min={:.3} hostile_delivery_min={:.3} clean_share_min={:.4} clean_share_max={:.4} hostile_share_min={:.4} hostile_share_max={:.4} clean_imbalance={:.4} hostile_imbalance={:.4} imbalance_bound={:.3} fair_share={:.4} delivery_floor={:.3} clean_p99_spread={:.3} hostile_p99_spread={:.3} spread_bound={:.1} clean_p50_max={:.1} clean_p99_max={:.1} hostile_p99_max={:.1} ceiling={:.1} hostile_p99_guard={:.1} window_s={:.1} wall_s={:.1}",
+        "MANDATE M4 {} flows={} clean_delivery_min={:.3} hostile_delivery_min={:.3} clean_share_min={:.4} clean_share_max={:.4} hostile_share_min={:.4} hostile_share_max={:.4} clean_imbalance={:.4} hostile_imbalance={:.4} imbalance_bound={:.3} fair_share={:.4} delivery_floor={:.3} clean_sent={} clean_on_time={} clean_late={} clean_lost={} hostile_sent={} hostile_on_time={} hostile_late={} hostile_lost={} late_horizon_s={:.1} clean_p99_spread={:.3} hostile_p99_spread={:.3} spread_bound={:.1} clean_p50_max={:.1} clean_p99_max={:.1} hostile_p99_max={:.1} ceiling={:.1} hostile_p99_guard={:.1} window_s={:.1} wall_s={:.1}",
         verdict(pass),
         M4_FLOWS,
         clean_floor,
@@ -3480,6 +3672,15 @@ async fn m4_interactive_lane_fairness() {
         M4_IMBALANCE_BOUND,
         clean.ideal_share,
         M4_DELIVERY_FLOOR,
+        clean_sent,
+        clean_on_time,
+        clean_late,
+        clean_lost,
+        hostile_sent,
+        hostile_on_time,
+        hostile_late,
+        hostile_lost,
+        M4_LATE_HORIZON.as_secs_f64(),
         clean_spread,
         hostile_spread,
         M4_LATENCY_SPREAD_BOUND,
@@ -3495,23 +3696,35 @@ async fn m4_interactive_lane_fairness() {
     for (index, flow) in clean.flows.iter().enumerate() {
         assert!(
             flow.summary.delivery_pct >= M4_DELIVERY_FLOOR,
-            "[M4] clean-arm flow {} (tag {}) delivered {}/{} messages ({:.3} < the {M4_DELIVERY_FLOOR} floor): a flow sharing the interactive lane was starved of what it offered",
+            "[M4] clean-arm flow {} (tag {}) was delivered {}/{} messages ({:.3} < the {M4_DELIVERY_FLOOR} floor) and {} were never observed inside the {:.1}s horizon (sent {} = on_time {} + late {} + lost {}): a flow sharing the interactive lane was starved of what it offered",
             index + 1,
             flow.tag as char,
             flow.received,
             flow.sent,
             flow.summary.delivery_pct,
+            flow.lost,
+            M4_LATE_HORIZON.as_secs_f64(),
+            flow.sent,
+            flow.on_time,
+            flow.late,
+            flow.lost,
         );
     }
     for (index, flow) in hostile.flows.iter().enumerate() {
         assert!(
             flow.summary.delivery_pct >= M4_DELIVERY_FLOOR,
-            "[M4] hostile-arm flow {} (tag {}) delivered {}/{} messages ({:.3} < the {M4_DELIVERY_FLOOR} floor): a flow sharing the interactive lane was starved of what it offered under the hostile impairment",
+            "[M4] hostile-arm flow {} (tag {}) was delivered {}/{} messages ({:.3} < the {M4_DELIVERY_FLOOR} floor) and {} were never observed inside the {:.1}s horizon (sent {} = on_time {} + late {} + lost {}): a flow sharing the interactive lane was starved of what it offered under the hostile impairment",
             index + 1,
             flow.tag as char,
             flow.received,
             flow.sent,
             flow.summary.delivery_pct,
+            flow.lost,
+            M4_LATE_HORIZON.as_secs_f64(),
+            flow.sent,
+            flow.on_time,
+            flow.late,
+            flow.lost,
         );
     }
     assert!(
