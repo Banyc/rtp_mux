@@ -557,11 +557,55 @@ and summarised here: mux's sliding receive deadline is `heartbeat_interval * 4`
 with no max-retry or give-up path in the reliable layer; and the proxy's pool
 heartbeat is a 30 s write timeout
 (`proxy/common/src/stream_runtime/pool.rs:19`). The one exception is a *birth*
-deadline: rtp's opening handshake is `OPENING_TIMEOUT = 3 s`
-(`rtp/src/traffic_shaping/control/handshake/opening/mod.rs:13`), shorter than a
-3.2 s spike round trip — the mechanical reason a reconnect during a spike is
-worse than the spike, and why the identity guard is the point of the row. A
-birth-on-spike arm is `rtp`'s, not this crate's. The vacuity injections are
+deadline, and there are now two of them, both derived from the same field
+measurement: `rtp`'s opening handshake is `OPENING_LEG_TIMEOUT = 4 s`
+(`rtp/src/traffic_shaping/control/handshake/opening/mod.rs`, the smallest whole
+second above the field's worst 3205 ms sample), and `rtp_mux`'s own
+`BIRTH_LIVENESS_DEADLINE` (`src/shared.rs`), the mux-level backstop over the
+whole dual-lane birth and the lanes' first receive. The second was **2.5 s
+until this revision** — below the field's worst measured round trip — and the
+record of that defect is the subsection below. A *live* session under a spike
+is this family's arm; a **birth** under one is `birth_liveness`'s.
+
+**The birth's own liveness deadline: `birth_liveness`.**
+`BIRTH_LIVENESS_DEADLINE` is the one field-reachable timer in this crate whose
+expiry is **pure elapsed time** rather than evidence of a dead path, and it was
+recorded in no document before this revision. It is armed twice per dual-lane
+birth (`src/connector/dial.rs`): as the mux lanes' *first receive* deadline (a
+sliding deadline from the last byte that arrived,
+`mux/src/central_io/reader.rs`) and as the race over the whole birth. Expiry
+**aborts and reaps the birth's supervisor** — both rtp lane sessions and both
+mux tasks — and returns `Err`; `retry_dual_connect` then starts a **fresh cold
+birth** (`connect_dual_lane_once` opens two new rtp sessions with a new nonce),
+so a birth killed for slowness re-pays the cold establishment and produces the
+reconnect `AGENTS.md` calls worse than the spike. What bounds the cost is
+`MAX_DUAL_CONNECT_ATTEMPTS = 3`: a stall longer than
+`3 * (deadline + grace)` fails the dial outright.
+
+The value is a **measurement**: the operator's path measures a 190 ms minimum
+round trip with maxima of 1063 ms and **3205 ms**, and at the old **2500 ms** the
+deadline sat below the worst of those — a birth on a spike was killed for
+slowness. **4 s is the smallest whole second above 3205 ms** (a 25 % margin),
+the same derivation `rtp`'s opening leg budget uses, so the mux-level backstop
+can never fire before the transport's own opening budget has had its chance.
+Measured by `birth_liveness::a_birth_is_not_killed_by_a_spike_scale_gap_but_still_times_out_beyond_its_budget`
+(`full` tier, 17.4 s, its own libtest stamp; run with `--ignored --nocapture
+--test-threads=1`), on the **birth** with the rtp opening handshake off so this
+is the only birth timer in force:
+
+| arm | round trip | deadline | birth wall | stream | verdict |
+| --- | --- | --- | --- | --- | --- |
+| `clean` | 50 ms | 4 s | 51.5 ms | round-trips | birth completes |
+| `spike_scale` | 2600 ms (above the old 2500 ms, below the field's 3205 ms) | 4 s | 2603.0 ms | round-trips | birth completes |
+| `beyond_budget` | 5000 ms | 4 s | 12 086.0 ms | — | fails, inside the 3 x (4 s + 250 ms) retry budget |
+
+The `beyond_budget` arm is the vacuity: it proves the instrument can see an
+expiry, so `spike_scale`'s pass is a measurement rather than an arm that cannot
+fail, and it pins the retry cost. The mutation proof that `spike_scale` depends
+on the constant: with `BIRTH_LIVENESS_DEADLINE` back at **2500 ms** the arm
+fails — *"the spike_scale arm's birth did not complete (round trip 2600 ms,
+wall 7588.8 ms): Some(BrokenPipe)"* — which is the field defect reproduced on a
+bench (the failed attempt's retry is visible in the 7.6 s wall clock). The vacuity injections are
 `SPIKE_SURVIVAL_FAULT=no_spike` (the injection is skipped, so the
 delay-matches-injection check fails on a 191 ms round), `=churn_session`
 (`RtpMuxConnector::reset()` mid-spike: the in-flight rounds error
@@ -1649,6 +1693,7 @@ non-`support` tests reported by `cargo test -p rtp_mux --test <target> --
 --list --ignored`.
 
 ```gate-manifest
+birth_liveness::a_birth_is_not_killed_by_a_spike_scale_gap_but_still_times_out_beyond_its_budget = full
 cold_connection::cold_connection_decomposition = standard
 cold_connection::mux_lane_birth_is_one_round_trip = standard
 contested_latency::contested_capped_clean = full

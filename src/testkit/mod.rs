@@ -25,3 +25,21 @@
 pub mod dual;
 pub mod mux_over_rtp;
 pub mod rtp_mux;
+
+/// The production dual-lane birth's liveness deadline, in milliseconds —
+/// re-exported so a measurement arm can assert its relation to the field's
+/// worst recorded round trip without the constant leaving the crate's private
+/// surface. One authority for its value and derivation:
+/// [`crate::shared::BIRTH_LIVENESS_DEADLINE`].
+pub const BIRTH_LIVENESS_DEADLINE_MS: u64 =
+    crate::shared::BIRTH_LIVENESS_DEADLINE.as_millis() as u64;
+
+/// The grace added to the birth's liveness deadline for the whole dual-lane
+/// birth's race, in milliseconds — re-exported with the deadline so a
+/// measurement arm can state the retry budget (`MAX_DUAL_CONNECT_ATTEMPTS x
+/// (deadline + grace)`) it bounds a dead birth by.
+pub const BIRTH_LIVENESS_GRACE_MS: u64 = crate::shared::BIRTH_LIVENESS_GRACE.as_millis() as u64;
+
+/// The bound on a dead birth's dial cost: the number of fresh cold-birth
+/// attempts `retry_dual_connect` makes. Re-exported for the same arithmetic.
+pub const MAX_DUAL_CONNECT_ATTEMPTS: usize = crate::shared::MAX_DUAL_CONNECT_ATTEMPTS;

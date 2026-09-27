@@ -4,8 +4,28 @@ use mux::{Initiation, MuxConfig};
 
 pub(crate) const PAIRING_DEADLINE: Duration = Duration::from_secs(10);
 pub(crate) const HELLO_DEADLINE: Duration = Duration::from_secs(5);
-/// Birth liveness: the dual-lane hello handshake and first receive must complete within these deadlines.
-pub(crate) const BIRTH_LIVENESS_DEADLINE: Duration = Duration::from_millis(2500);
+/// Birth liveness: the dual-lane hello handshake and first receive must
+/// complete within these deadlines.
+///
+/// The value is a **measurement**, and it is the *same* measurement rtp's own
+/// opening leg budget is derived from: the operator's path measures a 190 ms
+/// minimum round trip with maxima of 1063 ms and **3205 ms**, and a birth
+/// killed by that spike is retried — which re-pays the cold dual-lane
+/// establishment, so a reconnect during a spike is worse than the spike.
+/// **4 s is the smallest whole second above the field's worst sample** (a 25 %
+/// margin over 3205 ms), the derivation `rtp`'s `OPENING_LEG_TIMEOUT` already
+/// uses (`rtp/src/traffic_shaping/control/handshake/opening/mod.rs`), so this
+/// mux-level backstop can never fire before the transport's own opening budget
+/// has had its chance. The prior value, 2500 ms, sat *below* the field's worst
+/// round trip: a birth on such a spike was killed for slowness. The cost of a
+/// genuinely dead birth is bounded by `MAX_DUAL_CONNECT_ATTEMPTS` (3), i.e.
+/// `3 * (deadline + grace)` before the dial fails.
+///
+/// Measured by `tests/birth_liveness.rs` with the rtp opening handshake off (so
+/// this is the only birth timer in force): a birth at a 2600 ms round trip —
+/// above the old 2500 ms and below the field's 3205 ms — completes with its
+/// stream usable, while one at a 5000 ms round trip still fails `TimedOut`.
+pub(crate) const BIRTH_LIVENESS_DEADLINE: Duration = Duration::from_secs(4);
 pub(crate) const BIRTH_LIVENESS_GRACE: Duration = Duration::from_millis(250);
 pub(crate) const MAX_DUAL_CONNECT_ATTEMPTS: usize = 3;
 pub(crate) const MAX_PENDING_LANES: usize = 1024;
