@@ -1595,6 +1595,271 @@ tests/rtp_mux_jitter.rs::assert_reportable = 2
 tests/rtp_mux_jitter.rs::assert_sane = 2
 ```
 
+## The env-scaled opt-in surface
+
+Seven surfaces in this crate are scaled from the process environment rather
+than from an `#[ignore]` set, so no `gate-manifest` tier, no
+`gate-default-required` line and no `gate-perf-design` row can see them: the
+same green arm runs a 4 s window or a 15 s one, three reps or thirty, a 300 s
+soak or a 30 s one, depending on variables the caller sets. They are declared
+in the `gate-env-tier` block below, which is also what makes them visible to
+the checker: a name this crate's sources read from the environment and no
+declared surface names is an error, and a declared name the sources never
+read is a stale declaration.
+
+All seven rows are **scriptless** (`-`). Not one of these names is set by a
+script of this crate — the checker's `_crate_scripts` finds no file at all
+in the script suffixes it scans (`.sh`/`.py`/`.nu`/`.js`/`.ts`/…) under the
+crate root — and the runner that does set two of them, the harness's
+`netem_test/tools/mandate-check`, is not a script
+of this crate. The checker's runner field can only name a script of the crate
+it checks, so `-` is the honest record here and the prose names the external
+runner instead.
+
+Every name below is resolved from the sources, not from a list written here,
+and this crate spells its reads all four of the ways the checker resolves: a
+literal handed straight to `env::var` (`tests/mandate_smoke.rs:230,253,272`,
+`tests/dynamic_contested.rs:49`, `tests/hol_probe.rs:2377`,
+`tests/perf_probe.rs:212,221,230,263,338,502,617` and
+`:831,840,849,861,900,1058`, `tests/mux_stream_fairness.rs:43`), a literal
+forwarded through a crate-local helper that hands its parameter to
+`env::var` (`rtp_longrun`'s `env_u64`/`env_usize`/`env_string` at
+`tests/rtp_longrun.rs:107,114,119`, `mux_stream_fairness`'s `env_u64` at
+`:42`, `perf_probe`'s `parse_flag_env` closure at `tests/perf_probe.rs:276`),
+and a name spelled once as a per-file `const` alias and handed to `env::var`
+by that alias (`tests/cold_connection.rs:60,653`,
+`tests/spike_survival.rs:122,125`).
+
+### The smoke set's own tier and sink: `MANDATE_SMOKE_QUICK`, `MANDATE_CHECK_DIR`
+
+`MANDATE_SMOKE_QUICK` (`tests/mandate_smoke.rs:230`) is the smoke set's own
+window tier: `1` takes the shortest window per arm — `QUICK_WINDOW` 4 s,
+`RR_QUICK_WINDOW` 5 s, `QUICK_BULK_WINDOW` 2 s — and unset takes `WINDOW`
+12 s, `RR_WINDOW` 15 s, `BULK_WINDOW` 6 s, for the same four mandate arms. It
+is what `tools/mandate-check --quick` sets. It selects a window *set* rather
+than sizing a count: the same four mandate measurements run either way, so
+`4 * MANDATE_SMOKE_QUICK` would be arithmetic the surface does not do, and
+this row carries no load.
+
+`MANDATE_CHECK_DIR` (`:253`) names the directory the arms' evidence is
+written to — `M1/M2/M3/M4.json` and `.csv` — and is what the runner always
+sets so the evidence lands outside the target tree; a plain
+`cargo test -p rtp_mux` falls back to `target/mandate-smoke` under
+`CARGO_TARGET_TMPDIR`. It is a diagnostic output sink, and it sizes no count
+either.
+
+With no load field on this row, the surface's measured cost is recorded here
+instead: the target's own wall, which this file records three times —
+142.48 s with `m1_latency_window_censoring` skipped, 142.59 s and 143.18 s
+with it, against 142.60 s on the parent revision, so the arm pays no
+measurement of its own and reads the series the other arms already produce.
+The per-arm costs the smoke set declares elsewhere are its `gate-perf-design`
+rows (M3's 108 s and the four `m1_lone_tail_*` rows); M1's, M2's and M4's own
+walls are still the recorded `cost@metric=wall-clock` gap, which is why no
+per-arm shape is stated here.
+
+### The battery's repetition count: `DYN_REPS`
+
+`DYN_REPS` (`tests/dynamic_contested.rs:48`, read at `:275,404,564,719,896,1051,1069,1366,1425,1586,1766,1919`)
+is the repetition count of every arm in the dynamic-packet-size
+latency/bulk battery: each of the twelve `dynamic_contested` arms runs its
+scenario `DYN_REPS` times (default 3) with a fresh seed per rep (the arm's
+own base offset plus the rep index, e.g. `100 + seed_base` at `:166` and
+`200 + seed_base` at `:1324`), drawing 200 B latency messages at a 25 ms
+cadence with 1-in-16 bursts of 4–64 KiB against 64–512 KiB bulk chunks over
+one shared 400 KiB/s bottleneck, and reports per-message one-way latency
+percentiles and bulk goodput as the median over reps. Reps, not tests, are
+the independent draws: the twelve arms are twelve scenarios and their seeds
+advance with the rep index. The rep's own *length* is the harness kit's
+`DYN_RUN_SECS` (15 s, `netem_test/netem-test/src/kit/contested.rs:13`), read
+in the kit rather than in this crate's sources, so it is not a variable of
+this surface and the load does not name it.
+
+The load's `wall` is one `--ignored --test-threads=1` run of the target at
+the default shape: 12 tests, all passing, `finished in 582.34s` (real
+587.3 s), with per-test stamps from 45.32 s to 50.38 s. That is 36 rep
+executions of a 15 s scenario window, so the measured wall fits the
+`12 * DYN_REPS` the row states. The total is **derived** — arithmetic over
+the surface's one variable, and over no measured quantity.
+
+### The mux egress fairness long run: `MUX_FAIR_*`
+
+`tests/mux_stream_fairness.rs`'s `mux_stream_fairness_longrun` reads six
+names (`:337-341`, `:411-412`), and they are the only reads in the target:
+the `full`-tier `mux_stream_fairness_sweep` uses the module constants
+`WARMUP`/`STEADY` instead.
+
+- `MUX_FAIR_WARMUP_SECS` (default 10) and `MUX_FAIR_STEADY_SECS`
+  (default 240) size the run: the post-join ramp that is discarded, and the
+  measured window that is binned. They are the surface's two cost keys.
+- `MUX_FAIR_WINDOW_SECS` (default 10, floored at 1, `:339`) is the bin
+  width of the steady window's per-stream byte-delta series, so it sets the
+  *number* of Jain samples a run yields, not its duration.
+- `MUX_FAIR_REPS` (default 1, `:341`) repeats both arms on a fresh seed
+  (`500 + rep * 7`).
+- `MUX_FAIR_STREAMS` (default 8, clamped to 1..=16, `:411`) is the stream
+  count of each arm. It sizes each arm's volume — more streams, more streams
+  held backlogged — but not its duration, because the shaped link and the
+  steady window are both time-bounded; it is recorded in the load as a shape
+  value and does not appear in the total.
+- `MUX_FAIR_CHUNKS` (default unset, `:412`) is a comma-separated chunk-size
+  list for the mixed arm. It is a selector, not a count, so it cannot be a
+  load factor at all: the total below does not name it.
+
+The row's `total` is the shape's own duration `2 * MUX_FAIR_REPS *
+(MUX_FAIR_WARMUP_SECS + MUX_FAIR_STEADY_SECS)` = 500 s of nominal arm-run
+time (two arms × one rep × 250 s), and it is **derived** rather than
+measured: the arithmetic is the surface's own variables and the measured
+`wall` is the run below. The two numbers are recorded separately because one
+is arithmetic over the shape and the other is a measurement, not because they
+are expected to differ: each arm also pays a few tens of milliseconds of
+setup (server spawn, rtp connect, mux pairing) and overshoots its steady
+phase by less than one `MUX_FAIR_WINDOW_SECS` bin, and the two largely
+cancel.
+
+Measured: one `--ignored --exact mux_stream_fairness_longrun
+--test-threads=1` run at the default shape reported 1 passed,
+`finished in 500.10s` (real 502.2 s), so the wall landed 0.1 s above the
+500 s the row's arithmetic yields. The run yielded 24 windows per arm — 48 in
+all, the denominator behind the row's `bound` — with the homogeneous arm's
+whole-run Jain 1.0000, worst window Jain 0.9993 and worst minimum share
+0.1208, and the mixed arm's whole-run Jain 1.0000, worst window Jain 1.0000
+and worst minimum share 0.1246, and no stream's whole-run total at zero in
+either arm.
+
+### The multi-minute long-run arms: `RTP_LONGRUN_*`
+
+`tests/rtp_longrun.rs`'s two `full`-tier arms read five names
+(`longrun_duallane` at `:665-668`, `multiflow_duallane` at `:678-681`, and
+`RTP_LONGRUN_LOSS_PCT` inside the shared `run_longrun` at `:368`):
+
+- `RTP_LONGRUN_SECS` (default 300 for the single-flow arm, 180 for the
+  multi-flow one) is the measurement window and the surface's cost key.
+- `RTP_LONGRUN_INTERVAL_SECS` (default 10, floored at 1) is the CSV sampling
+  interval, so it sets how many `[longrun-iv]` rows the run yields:
+  `RTP_LONGRUN_SECS / RTP_LONGRUN_INTERVAL_SECS` of them.
+- `RTP_LONGRUN_STREAMS` (default 1 / 4) is the interactive stream count
+  sharing the lane. Like `MUX_FAIR_STREAMS` it sizes volume, not duration.
+- `RTP_LONGRUN_LOSS_PCT` (default 2, `:368`) selects the independent-loss
+  regime — `0` separates a multi-flow queueing tail from a loss-repair tail —
+  and so selects a regime rather than a size.
+- `RTP_LONGRUN_LABEL` (default `base` / `multiflow`, `:119`) is the CSV label
+  suffix, a report selector.
+
+The load records the **reference arm**'s default shape: the single-flow arm
+at `RTP_LONGRUN_SECS=300`, `RTP_LONGRUN_INTERVAL_SECS=10`,
+`RTP_LONGRUN_STREAMS=1`, i.e. `total=RTP_LONGRUN_SECS` = 300 s of nominal
+measurement window — a **derived** count, arithmetic over the surface's own
+cost key and over no measured quantity — with the multi-flow arm's 180 s
+default recorded here in prose rather than folded into one total. Its `bound`
+is the rule of three over the
+30 `[longrun-iv]` samples the reference shape yields (`3 / (300 / 10) =
+0.1`).
+
+Measured: one `--ignored --test-threads=1` run of the target stamped
+`longrun_duallane` ok in 304.565 s and `multiflow_duallane` ok in 184.550 s
+(both passed, `finished in 489.11s`), so each arm's wall is its own
+`RTP_LONGRUN_SECS` plus the same ~4.6 s of ramp, grace and teardown. The
+reference arm's run reported delivery 1.0000 over 11 999 samples with p50
+22.70 ms and p99 28.59 ms; the multi-flow arm reported delivery 1.0000 over
+28 796 samples across four streams with p99 91.33 ms, its bulk lane's
+goodput byte-comparable to the single-flow arm's (0.6739 against
+0.6740 MiB/s), which is the reading the multi-flow arm exists to produce.
+
+### The hostile perf probes' regime: `NETEM_PERF_*` and `RTP_RTX_DUP`
+
+`tests/perf_probe.rs`'s two `full`-tier hostile probes read these names, and
+they read them with **different defaults**, so the surface is split into one
+row per arm rather than one row over two different "default shapes":
+
+- `probe_hostile_goodput_30s` (`:212-338,502,617`) defaults
+  `NETEM_PERF_WINDOW_SECONDS` to 30, `NETEM_PERF_WARMUP_SECONDS` to 20,
+  `NETEM_PERF_LINK_PROFILE` to `hostile`, `NETEM_PERF_MSS_BYTES` to
+  `LOOPBACK_MSS` and `NETEM_PERF_SEED` to 4.
+- `probe_hostile_message_latency` (`:831-900,1058`) defaults the same window
+  to 30 but the warmup to 5, the profile to
+  `hostile-periodic-bottleneck-300ms` and the MSS to 1400.
+
+`NETEM_PERF_WINDOW_SECONDS` and `NETEM_PERF_WARMUP_SECONDS` are the two
+sizing keys: the window is the time-boxed measurement and the warmup is the
+ramp discarded before it, so the goodput arm's shape is `30 + 20 = 50` s and
+the message arm's is `30 + 5 = 35` s. Both totals are **derived** from the
+surface's own variables; the two `wall`s are the costs this file already
+declares for those rows (51 s and 40 s), measured from those rows' own libtest
+stamps, so neither number is invented here. The message probe's accepted
+profile list (`:849-856`) is a **subset** of the goodput probe's much longer
+one (`:230-260`), which is why the two rows still share the name: the same
+variable has two accepted value sets, and each row records the set its own
+arm validates against.
+
+The rest are selectors and carry no arithmetic:
+
+- `NETEM_PERF_MSS_BYTES` sets the transport MSS the probe dials with, and
+  `NETEM_PERF_SEED` the c2s draw (`s2c_seed = c2s_seed + 1` at `:341` and
+  `:903`): a treatment and a reproducible draw, not a count.
+- `NETEM_PERF_REVISION` (`:502`, `:1058`) is a string stamped into the
+  `PerfTrace` artifact as the run's own revision label. It is report
+  metadata.
+- `NETEM_PERF_DIAGNOSTIC_MODE=1` (`:617`) is the one control here that
+  **weakens a check**: when the median sub-window goodput is below
+  `HOSTILE_GOODPUT_FLOOR_MIB_S` it prints the bypass line and skips the
+  assertion instead of failing. It is a diagnostic escape hatch, not a fault
+  injection — it perturbs no input — and the row gives it a cell of its own
+  so that a run taken with it is visibly a run without the floor. It is read
+  only by the goodput arm.
+- `NETEM_PERF_FEC` and `RTP_RTX_DUP` (`:286`, `:884`) select the *treatment*
+  of the paired FEC/armor arms: whether the data packet is wrapped in the FEC
+  envelope, and whether a recovery send gets a duplicate wire copy. Both are
+  parsed strictly (`0`/`1`/`false`/`true` only, anything else panics), so a
+  typo cannot silently flip a treatment on a timed run. `RTP_RTX_DUP` is
+  **not** a fault injection: it is `rtp`'s own production behaviour toggle,
+  and `rtp/GATE.md`'s `reliability-path-defaults` row classifies it the same
+  way (a behaviour an explicit per-connection argument overrides, sizing no
+  measurement). It is declared here too because this crate's `parse_flag_env`
+  closure hands its parameter to `env::var`, so this crate does read it.
+
+### The red-proof fault selectors
+
+The four remaining names are the **vacuity injections**, and they are not
+measurements: each perturbs an arm's *input* — the impairment or the offered
+payload — so that the failure a red-proof demonstration shows is produced by
+the measurement path rather than by the assertion. None sizes anything, so
+this row carries no load: a `total` over these names would be invented
+arithmetic, and the grammar has no line for one. They belong to four
+different arms:
+
+- `MANDATE_SMOKE_FAULT` (`tests/mandate_smoke.rs:272`) selects a perturbation
+  of one smoke arm's input: `M1_latency`, `M1_FIELD_RTT_slow`,
+  `M1_LOSS_MODEL_uncorrelated`, `M1_LOSS_MODEL_correlated`, `M2_wire`,
+  `M2_delivery`, `M3_starve`, `M4_starve` and `M4_drop`. Unset in every real
+  run — the runner never sets it. The value's prefix (`starts_with(mandate)`,
+  `:271-278`) names the arm whose input is perturbed, and each arm's own
+  matcher then tests the value it owns; an arm that does not own the selected
+  value leaves its input alone (`_ => {}`, `:398`).
+- `HOL_PROBE_FAULT` (`tests/hol_probe.rs:2377`) selects the two offering
+  faults the concurrent frame-delivery arms' red proof uses: `serialize`
+  (only the first flow may offer until its window closes) and `throttle`
+  (every other flow offered at an eighth of the cadence).
+- `SPIKE_SURVIVAL_FAULT` (`tests/spike_survival.rs:125`) selects one of
+  `no_spike` (the injection is skipped, so the delay-matches-injection check
+  fails on a 191 ms round), `churn_session` (`RtpMuxConnector::reset()`
+  mid-spike) and `late_churn` (the reset lands after every round has passed,
+  so only the session-identity guard can catch it).
+- `RTP_MUX_COLD_CONNECTION_FAULT=serialize`
+  (`tests/cold_connection.rs:653`) replaces the production cold-connect arm
+  with a reproduction of the pre-fix critical path (two sequential bare rtp
+  dials plus the mux pairing), which the birth gate must reject.
+
+```gate-env-tier
+tri-mandate-smoke-tier = MANDATE_SMOKE_QUICK,MANDATE_CHECK_DIR | - | the tri-mandate smoke set's own window tier and evidence sink rather than a load knob: MANDATE_SMOKE_QUICK=1 selects the shortest window per arm (4 s interactive cadence, 5 s request/response, 2 s saturating bulk) for the same four mandate arms and is what `tools/mandate-check --quick` sets, unset selects the 12 s / 15 s / 6 s tier, and MANDATE_CHECK_DIR names the directory the M1/M2/M3/M4 JSON and CSV evidence is written to (always set by `tools/mandate-check`, defaulting under target/mandate-smoke for a plain `cargo test`); neither variable sizes a count, so no arithmetic derives from this surface and its load is refused rather than invented | smoke-mandate@mandate=M1+arm-set=clean-and-hostile-and-lone-tail+metric=p99-and-over250-share, smoke-mandate@mandate=M2+arm-set=clean-and-hostile-and-lone-tail+metric=delivery-and-own-wire, smoke-mandate@mandate=M3+arm-set=saturated-bulk+metric=capacity-fraction, smoke-mandate@mandate=M4+arm-set=four-flow+metric=no-starvation-and-share, smoke-evidence@artifact=mandate-json-and-csv, smoke-window-tier@knob=MANDATE_SMOKE_QUICK+window=quick-or-full
+dynamic-contested-battery = DYN_REPS | - | the dynamic-packet-size latency/bulk battery's per-arm repetition count: each of the twelve `dynamic_contested` arms runs its scenario DYN_REPS times (default 3) with a fresh seed per rep, drawing 200 B latency messages at a 25 ms cadence with 1-in-16 bursts of 4-64 KiB against 64-512 KiB bulk chunks over one shared 400 KiB/s bottleneck, and reports per-message one-way latency percentiles and bulk goodput as the median over reps; the rep's own length is the harness kit's `DYN_RUN_SECS` (15 s), read outside this crate's sources, so it is not a variable of this surface | dyn-size-latency@arm-set=static-classification+metric=small-and-burst-p50-p99, dyn-size-bulk@metric=goodput-fraction, dyn-size-migration@arm-set=migrating-variants+metric=latency-and-goodput, dyn-size-reps@metric=rule-of-three+unit=rep | DYN_REPS=3,total=12*DYN_REPS,wall=582.34s,bound=8.3e-2/rep
+mux-fair-longrun = MUX_FAIR_WARMUP_SECS,MUX_FAIR_STEADY_SECS,MUX_FAIR_WINDOW_SECS,MUX_FAIR_REPS,MUX_FAIR_STREAMS,MUX_FAIR_CHUNKS | - | the mux egress fair-queue long-run fairness measurement: one mux session over one rtp connection through a fixed-rate seeded NetemPair carrying MUX_FAIR_STREAMS bulk logical streams whose per-stream delivered bytes are counted by peer tag, with the MUX_FAIR_WARMUP_SECS post-join ramp discarded and the following MUX_FAIR_STEADY_SECS sampled in MUX_FAIR_WINDOW_SECS bins, reporting the windowed Jain index, the slower stream's minimum share and a per-stream starvation check, over two arms (homogeneous 64 KiB chunks, and a mixed-chunk arm set by MUX_FAIR_CHUNKS) repeated MUX_FAIR_REPS times on a fresh seed; MUX_FAIR_CHUNKS is a chunk-size list rather than a count, so it sizes nothing and is not a load factor | fair-window@metric=jain-window+scale=long-run, fair-share@metric=min-share+scale=long-run, byte-fairness@arm=mixed-chunk+metric=jain, starvation@metric=per-stream-delivered-bytes-zero, fair-rate@metric=rule-of-three+unit=window | MUX_FAIR_WARMUP_SECS=10,MUX_FAIR_STEADY_SECS=240,MUX_FAIR_WINDOW_SECS=10,MUX_FAIR_REPS=1,MUX_FAIR_STREAMS=8,total=2*MUX_FAIR_REPS*(MUX_FAIR_WARMUP_SECS+MUX_FAIR_STEADY_SECS),wall=500.1s,bound=6.3e-2/window
+rtp-longrun-arms = RTP_LONGRUN_SECS,RTP_LONGRUN_INTERVAL_SECS,RTP_LONGRUN_STREAMS,RTP_LONGRUN_LOSS_PCT,RTP_LONGRUN_LABEL | - | the multi-minute long-run arms' measurement window and CSV sampling cadence, over the production dual-lane composition: an aggregate interactive p50/p99/max and offered/forwarded wire series plus per-stream rows and the sender controller state, sampled every RTP_LONGRUN_INTERVAL_SECS across a RTP_LONGRUN_SECS window with RTP_LONGRUN_STREAMS interactive streams sharing the lane, RTP_LONGRUN_LOSS_PCT selecting the independent-loss regime and RTP_LONGRUN_LABEL naming the CSV run; the load records the single-flow reference arm's default shape, and the multi-flow arm's 180 s default is prose in the section above rather than folded into one total | longrun-drift@shape=cadence+scale=multi-minute+metric=p50-p99-max-series, longrun-fairness@arm=multi-flow+metric=per-stream-p99, longrun-bulk@scale=multi-minute+metric=goodput, longrun-repair@metric=fec-and-rtx-breakdown, longrun-rate@metric=rule-of-three+unit=interval | RTP_LONGRUN_SECS=300,RTP_LONGRUN_INTERVAL_SECS=10,RTP_LONGRUN_STREAMS=1,total=RTP_LONGRUN_SECS,wall=304.57s,bound=1.0e-1/interval
+hostile-goodput-probe = NETEM_PERF_WINDOW_SECONDS,NETEM_PERF_WARMUP_SECONDS,NETEM_PERF_LINK_PROFILE,NETEM_PERF_MSS_BYTES,NETEM_PERF_SEED,NETEM_PERF_REVISION,NETEM_PERF_DIAGNOSTIC_MODE,NETEM_PERF_FEC,RTP_RTX_DUP | - | the time-boxed counting-sink goodput window over the hostile link profiles: the window and its discarded warmup are the sizing pair, the profile selects the link (validated against the goodput probe's own list), the MSS and seed select the dial and its reproducible draw, the revision labels the PerfTrace artifact, NETEM_PERF_DIAGNOSTIC_MODE=1 makes the median sub-window goodput floor informational rather than asserted, and NETEM_PERF_FEC and RTP_RTX_DUP select the paired arms' FEC envelope and retransmission-armor treatment; the reported quantity is the median of the sub-window goodputs against the goodput floor, with every delivered byte verified by the sink | hostile-goodput@shape=counting-sink+window=30s+metric=median-subwindow-goodput, hostile-integrity@metric=every-delivered-byte-verified, probe-diagnostic-bypass@knob=NETEM_PERF_DIAGNOSTIC_MODE+effect=floor-becomes-informational, probe-treatment@knob=NETEM_PERF_FEC+mode=fec-off-or-on, probe-treatment@knob=RTP_RTX_DUP+mode=armor-off-or-on | NETEM_PERF_WINDOW_SECONDS=30,NETEM_PERF_WARMUP_SECONDS=20,total=NETEM_PERF_WINDOW_SECONDS+NETEM_PERF_WARMUP_SECONDS,wall=51s
+hostile-message-latency-probe = NETEM_PERF_WINDOW_SECONDS,NETEM_PERF_WARMUP_SECONDS,NETEM_PERF_LINK_PROFILE,NETEM_PERF_MSS_BYTES,NETEM_PERF_SEED,NETEM_PERF_REVISION,NETEM_PERF_FEC,RTP_RTX_DUP | - | the sparse-message one-way latency probe over the periodic hostile bottleneck profiles: 64 B timestamped messages every 100 ms for NETEM_PERF_WINDOW_SECONDS after a NETEM_PERF_WARMUP_SECONDS ramp, with netem sampled every 50 ms and a four-second straggler allowance, reporting one-way latency p50/p95/p99 and frame delivery; the profile is validated against the message probe's own periodic-only list, and NETEM_PERF_FEC and RTP_RTX_DUP select the paired arms' treatment as above | hostile-message@shape=timestamped-messages+window=30s+metric=one-way-p50-p95-p99, hostile-message-delivery@metric=delivered-frame-count, probe-treatment@knob=NETEM_PERF_FEC+mode=fec-off-or-on, probe-treatment@knob=RTP_RTX_DUP+mode=armor-off-or-on | NETEM_PERF_WINDOW_SECONDS=30,NETEM_PERF_WARMUP_SECONDS=5,total=NETEM_PERF_WINDOW_SECONDS+NETEM_PERF_WARMUP_SECONDS,wall=40s
+vacuity-fault-selectors = MANDATE_SMOKE_FAULT,HOL_PROBE_FAULT,SPIKE_SURVIVAL_FAULT,RTP_MUX_COLD_CONNECTION_FAULT | - | the red-proof input perturbations, not measurements: MANDATE_SMOKE_FAULT selects one smoke arm's perturbed input (a slowed or re-shaped link, or a starved or dropped flow), HOL_PROBE_FAULT the concurrent arms' offering serialization or throttle, SPIKE_SURVIVAL_FAULT the skipped spike, the mid-spike session churn or the late churn, and RTP_MUX_COLD_CONNECTION_FAULT the pre-fix sequential birth surrogate; each exists so the arm it perturbs can be shown to fail from the measurement path, each is unset in every real run, and none sizes anything, so this row's load is refused rather than invented | smoke-vacuity@fault=MANDATE_SMOKE_FAULT+targets=M1-M2-M3-M4, offer-vacuity@fault=HOL_PROBE_FAULT+targets=concurrent-offer-floor, spike-vacuity@fault=SPIKE_SURVIVAL_FAULT+targets=session-identity, birth-vacuity@fault=RTP_MUX_COLD_CONNECTION_FAULT+targets=dual-lane-birth
+```
+
 ## Opt-in targets outside this manifest
 
 `check-gate.py` covers only the rtp_mux scenario targets. The crate's own
