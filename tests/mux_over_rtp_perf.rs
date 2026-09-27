@@ -13,9 +13,11 @@
 //!    is never placed behind bulk traffic it shares a session with — asserted here by
 //!    `mux_over_rtp_small_stream_while_bulk_perf` (small-before-bulk arrival
 //!    ordering, plus the liveness bound derived from the scenario budget).
-//! 2. **Reasonable goodput of the interactive lane** — the lane delivers what
-//!    it is offered (`delivery = 1.000`) without inflating its own wire. The
-//!    wire budget is owned by `rtp_mux`; the layer asserts the delivery half
+//! 2. **The interactive lane's latency does not degrade under a known offered
+//!    throughput** — the lane is offered a known rate and must deliver it
+//!    without the offer degrading its latency; `rtp_mux` owns the offer, the
+//!    delivery and the non-degradation bound, while this layer asserts the
+//!    delivery
 //!    at stream granularity: every scenario asserts the offered payload arrives byte-identical (`mux_over_rtp_over_netem_clean_link_echoes`,
 //!    `mux_over_rtp_lossy_perf_smoke`, `mux_over_rtp_400kib_lossy_contended_perf`,
 //!    `mux_over_rtp_400mib_hostile_perf`'s `delivered == sent`). The bound is

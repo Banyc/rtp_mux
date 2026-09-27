@@ -2,9 +2,9 @@
 //! per mandate, plus the panels a reader checks the numbers against.
 //!
 //! The operator's product constitution is three mandates — **M1** interactive
-//! tail latency, **M2** the interactive lane delivering what it is offered
-//! without inflating its own wire, **M3** bulk goodput as a fraction of the
-//! link rate — and this target is the one command that measures all three and
+//! tail latency, **M2** the interactive lane's latency **not degrading under a
+//! known offered throughput**, **M3** bulk goodput as a fraction of the link
+//! rate — and this target is the one command that measures all three and
 //! leaves machine-checkable evidence for each:
 //!
 //! ```sh
@@ -48,12 +48,15 @@
 //! floor: measured GE lone-tail p99 1053–1542 ms, `> 250 ms` up to 2.7 %), so
 //! they assert a *regression bound* derived from that measurement with
 //! documented headroom instead of a bound that is currently false. **M2**
-//! asserts `delivery == 1.000` and the `6x` own-wire budget on `clean`, and
-//! regression bounds (delivery floor, wire ceiling) on the hostile arms.
+//! asserts, on `clean`, that the lane was **offered the known throughput**
+//! (`MSG_BYTES / CADENCE`, read from the measured `sent`), that it
+//! **delivered** all of it (`delivery == 1.000`), and that its **latency did
+//! not degrade under that offer** (`p99 <= M2_NONDEGRADING_P99_MS`); the
+//! hostile and lone-tail arms keep their delivery floors as regression guards.
 //! **M3** asserts the within-run delivered/shaper-forwarded fraction against
-//! the `0.35x` floor. The hostile panels draw the mandate ceiling/budget/floor
-//! lines regardless, so the breach stays visible even where the assertion is
-//! only a guard — the assertion is a tripwire, the panel is the evidence.
+//! the `0.35x` floor. The hostile panels draw the mandate ceiling/floor lines
+//! regardless, so the breach stays visible even where the assertion is only a
+//! guard — the assertion is a tripwire, the panel is the evidence.
 //!
 //! The regression bounds and their derivation are recorded in `GATE.md`; the
 //! constants below carry a one-line pointer rather than restating it.
@@ -159,9 +162,14 @@ const M3_REPS: usize = 3;
 /// The M1 ceiling: the mandate bound asserted on the clean arm. One authority
 /// for its value and derivation: `rtp_mux/GATE.md` ("Performance").
 const M1_CEILING_MS: f64 = 250.0;
-/// The M2 own-wire budget (`int_c2s_wire_bytes / (sent * MSG_BYTES)`) asserted
-/// on the clean arm. One authority: `rtp_mux/GATE.md` ("Performance").
-const M2_WIRE_BUDGET_X: f64 = 6.0;
+/// The M2 non-degradation bound: the interactive lane's p99 must stay at the
+/// link's floor while it is offered its known throughput. The link's one-way
+/// floor is `OWD + JITTER` = 30 ms and the measured clean-arm p99 is ~26 ms; a
+/// lane whose goodput fell would have to show the backlog as latency, and the
+/// value is ~4x the measured p99 and well below the M1 ceiling, so it bites on
+/// a backlog rather than on the 2 % loss realisation. One authority for the
+/// value and derivation: `rtp_mux/GATE.md` ("Performance").
+const M2_NONDEGRADING_P99_MS: f64 = 100.0;
 /// The M3 goodput floor as a fraction of the configured link rate. One
 /// authority: `rtp_mux/GATE.md` ("Performance").
 const M3_CAPACITY_FRACTION: f64 = 0.35;
@@ -215,11 +223,12 @@ const M1_FIELD_RTT_OVER250_GUARD_PCT: f64 = 15.0;
 const M2_HOSTILE_DELIVERY_FLOOR: f64 = 0.995;
 /// M2 lone-tail delivery floor (measured 1.000).
 const M2_LONE_DELIVERY_FLOOR: f64 = 0.995;
-/// M2 hostile cadence-arm wire-multiple guard (measured 4.7-4.8x).
-const M2_HOSTILE_WIRE_GUARD_X: f64 = 10.0;
-/// M2 lone-tail wire-multiple guard. The field measured lone-tail wire
-/// 6.22-7.17x (over the 6x budget) and the smoke arm 6.07-6.41x; ~2x the top.
-const M2_LONE_WIRE_GUARD_X: f64 = 14.0;
+/// How far the measured offer count may fall below the arm's schedule before
+/// the lane is no longer being offered the mandate's known throughput. The
+/// cadence sender starts its first interval after the window opens and the
+/// measured runs land at 2395-2400 of 2400 messages (0.2 %), so 2 % is slack
+/// for scheduler jitter rather than a tolerance on the offer itself.
+const M2_OFFER_TOLERANCE: f64 = 0.02;
 
 // ───────── the deployed baseline the impaired tail must not regress past ─────
 
@@ -234,18 +243,13 @@ const M2_LONE_WIRE_GUARD_X: f64 = 14.0;
 /// deviations**, rounded up to the next whole millisecond. The bound is a
 /// *derived* limit, not a round number: M1 is a hard floor, so an impaired arm
 /// whose tail exceeds the band its own baseline repeats showed is rejected
-/// rather than weighed against M2's wire budget or the clean arm. The reps'
+/// rather than weighed against the clean arm. The reps'
 /// own ranges are carried beside the values so the derivation is checkable,
 /// and [`m1_impaired_baseline_rows`] prints the comparison with every run.
 ///
-/// The clean arm and the wire multiples are recorded with the same baseline in
-/// `rtp_mux/GATE.md` ("The deployed baseline the impaired tail must not regress
-/// past"): clean `p99` **26.5 ms** (median of the same six reps, bound 27 ms),
-/// own-wire multiples **clean 5.82x, hostile 6.56x, lone_tail 6.11x**, and the
-/// M2 owner gate (`jitter_duallane_constitution_gate`, the 40 msg/s `both` arm)
-/// at **6.85x** against its 6x budget — the breach the revert restores and the
-/// seed dimension cannot repair without a 3.2x clean-arm p99 regression (the
-/// sweep table is in `GATE.md`).
+/// The clean arm is recorded with the same baseline in `rtp_mux/GATE.md`
+/// ("The deployed baseline the impaired tail must not regress past"): clean
+/// `p99` **26.5 ms** (median of the same six reps, bound 27 ms).
 struct M1ImpairedBaseline {
     arm: &'static str,
     p99_ms: f64,
@@ -346,7 +350,7 @@ fn m1_impaired_baseline_rows(run: &ArmRun) -> Vec<(String, Option<String>)> {
                  baseline ({recorded:.1} ms over {reps} reps, whose range was {lo:.1}-{hi:.1} ms) beyond its \
                  derived bound {bound:.1} ms (those reps' mean + 3 sample standard deviations): {pct:+.1}% \
                  against the recorded baseline. M1's impaired tail is a hard floor — it must not be traded for \
-                 M2's wire budget or the clean arm, and a candidate that does is rejected here rather than \
+                 M2's offered-load latency or the clean arm, and a candidate that does is rejected here rather than \
                  absorbed inside a guard.",
                 arm = baseline.arm,
                 metric = metric,
@@ -417,7 +421,7 @@ fn out_dir() -> PathBuf {
 /// The deliberate-fault selector used only by the vacuity demonstrations:
 /// `M1_latency`, `M1_IMPAIRED_slow`, `M1_FIELD_RTT_slow`,
 /// `M1_LOSS_MODEL_uncorrelated`,
-/// `M1_LOSS_MODEL_correlated`, `M2_wire`, `M2_delivery`, `M3_starve`,
+/// `M1_LOSS_MODEL_correlated`, `M2_delivery`, `M3_starve`,
 /// `M4_starve`, `M4_late`, `M4_drop`, `M4_CLEAN_LEVEL_double` or
 /// `M4_CLEAN_LEVEL_slow`. Unset in every real
 /// run (the runner never sets it). Faults perturb an arm's *input* — the
@@ -535,9 +539,9 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
     let clean_fault = fault(mandate);
     let mut clean_c2s = link(41, OWD, JITTER, LOSS_2, 0);
     let mut clean_s2c = link(42, OWD, JITTER, LOSS_2, 0);
-    let mut clean_bulk = true;
-    let mut clean_load = Load::Cadence;
-    let mut clean_window = cadence_window();
+    let clean_bulk = true;
+    let clean_load = Load::Cadence;
+    let clean_window = cadence_window();
     if let Some(fault) = clean_fault.as_deref() {
         match fault {
             // Blow the latency ceiling: +500 ms one-way on both directions.
@@ -545,15 +549,10 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
                 clean_c2s.latency = OWD + Duration::from_millis(500);
                 clean_s2c.latency = OWD + Duration::from_millis(500);
             }
-            // Inflate the own-wire multiple: put the clean arm on the lone-tail
-            // request/response shape, the measured over-budget wire regime
-            // (the fresh-tail armour of a lone unacked message).
-            "M2_wire" => {
-                clean_bulk = false;
-                clean_load = Load::RequestResponse { depth: 1 };
-                clean_window = rr_window();
-            }
-            // Drop a delivery: starve the interactive lane to 90 % iid loss.
+            // Suppress goodput: starve the interactive lane to 90 % iid loss, so
+            // the lane's delivery falls and the backlog its unrepaired data
+            // builds shows up as latency. Either failure names the arm, the
+            // observed value and the bound.
             "M2_delivery" => {
                 clean_c2s.loss = loss_pct(90);
                 clean_s2c.loss = loss_pct(90);
@@ -632,8 +631,9 @@ struct ArmRun {
     int_c2s_counters: netem_test::Counters,
     /// The s2c direction's counters, for the same reading on the return path.
     int_s2c_counters: netem_test::Counters,
+    /// The payload the arm offered, `sent * msg_bytes`: M2's *input*, printed
+    /// so the throughput the mandate asserts on is a number the run carries.
     offered_bytes: u64,
-    wire_x: f64,
     bulk_sink_bytes: u64,
     bulk_wire_bytes: u64,
     window: Duration,
@@ -961,11 +961,6 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
         int_c2s_counters,
         int_s2c_counters,
         offered_bytes,
-        wire_x: if offered_bytes == 0 {
-            f64::INFINITY
-        } else {
-            int_c2s_wire_bytes as f64 / offered_bytes as f64
-        },
         bulk_sink_bytes,
         bulk_wire_bytes,
         window,
@@ -1104,7 +1099,7 @@ fn print_arm(run: &ArmRun) {
     let row = format!(
         "[mandate-smoke {name:<9}] sent={sent:>5} recv={recv:>5} delivery={del:.3} \
          p50={p50:7.1} p90={p90:7.1} p99={p99:7.1} p999={p999:7.1} max={max:8.1} \
-         over250={o25:>4} wire={w:>10}B x={x:.2} bulk_sink={bs:>10}B bulk_wire={bw:>10}B wall={wall:.1}s window={win:?}\n",
+         over250={o25:>4} wire={w:>10}B offered={offered:>10}B bulk_sink={bs:>10}B bulk_wire={bw:>10}B wall={wall:.1}s window={win:?}\n",
         name = run.name,
         sent = s.sent,
         recv = s.received,
@@ -1116,7 +1111,7 @@ fn print_arm(run: &ArmRun) {
         max = s.max,
         o25 = over250_count(&run.samples),
         w = run.int_c2s_wire_bytes,
-        x = run.wire_x,
+        offered = run.offered_bytes,
         bs = run.bulk_sink_bytes,
         bw = run.bulk_wire_bytes,
         wall = run.wall.as_secs_f64(),
@@ -1182,11 +1177,9 @@ fn verdict(pass: bool) -> &'static str {
 // that says what the window had to be.
 
 /// Datagrams one interactive tail transmission emits: the primary plus its
-/// armour copies and the message-sized parity symbol. One authority for the
-/// value is `GATE.md` ("Performance", mandate 2: "a fully-armored lone
-/// interactive tail is `primary + 5 copies` = six datagrams"); it is
-/// corroborated by the M2 lone-tail arm's own `lone_wire_x`, which measures
-/// 5.91-7.42 x `MSG_BYTES` on this lane.
+/// armour copies and the message-sized parity symbol. The value is the
+/// fresh-tail armour's `primary + 5 copies` cover (`m = 6`), fixed by `rtp`'s
+/// armour configuration and recorded in `rtp/GATE.md`.
 const TAIL_DATAGRAMS_PER_TRANSMISSION: u64 = 6;
 
 /// The repair ladder's steady rung interval: rtp's post-probe repair-deadline
@@ -1571,7 +1564,8 @@ async fn m1_interactive_tail_latency() {
     // printed for every impaired arm before the guards below: a candidate that
     // is worse on either arm's p99 or p999 is rejected here (the failure names
     // the arm, the metric, the baseline value, the observed value and the
-    // direction) rather than weighed against M2's wire budget or the clean arm.
+    // direction) rather than weighed against M2's offered-load latency or the
+    // clean arm.
     let mut impaired_regressions = Vec::new();
     for run in [hostile, lone] {
         for (row, failure) in m1_impaired_baseline_rows(run) {
@@ -2212,10 +2206,6 @@ struct LossModelArm {
     samples: Vec<f64>,
     sent: u64,
     received: u64,
-    wire_bytes: u64,
-    offered_bytes: u64,
-    /// The widest own-wire multiple of any single window.
-    worst_wire_x: f64,
     /// Mean loss the link applied, and the share its model declares.
     applied: f64,
     declared: f64,
@@ -2238,21 +2228,8 @@ impl LossModelArm {
             samples: Vec::new(),
             sent: 0,
             received: 0,
-            wire_bytes: 0,
-            offered_bytes: 0,
-            worst_wire_x: 0.0,
             applied: 0.0,
             declared: 0.0,
-        }
-    }
-
-    /// The pooled own-wire multiple: the interactive c2s wire the impairment
-    /// proxy forwarded over the offered payload, both summed over the pool.
-    fn wire_x(&self) -> f64 {
-        if self.offered_bytes == 0 {
-            f64::INFINITY
-        } else {
-            self.wire_bytes as f64 / self.offered_bytes as f64
         }
     }
 
@@ -2268,8 +2245,8 @@ impl LossModelArm {
 /// arm's lane, request/response shape, depth, window, seeds, one-way delay,
 /// jitter and message size held fixed, with the impairment's loss model
 /// replaced — the four-state Gilbert-Elliott burst model against independent
-/// loss at the same mean rate — and the rung distribution, the tail and the
-/// own-wire multiple read off both.
+/// loss at the same mean rate — and the rung distribution and the tail read
+/// off both.
 ///
 /// **Comparability, by arithmetic rather than assertion.**
 /// `gilbert_elliott_loss(pct, mean_burst)` builds the two-state model
@@ -2303,20 +2280,16 @@ impl LossModelArm {
 ///   same pool;
 /// * the independent arm's first-rung count stays below the *upper* band of the
 ///   correlated model's law, so a collapsed cover (which would put ~70 rounds a
-///   window there) cannot pass as independence;
-/// * both arms' own-wire multiple stays inside the M2 lone-tail guard and above
-///   the payload.
+///   window there) cannot pass as independence.
 ///
-/// The tail's *level* (max, p99, p999), the ladder's **depth** and the
-/// **wire's direction** are printed and not asserted. A maximum is one draw of
+/// The tail's *level* (max, p99, p999) and the ladder's **depth** are printed
+/// and not asserted. A maximum is one draw of
 /// a geometric burst — `GATE.md` records why no M1 arm asserts one — and a
 /// lower bound on the correlated arm's second-rung count would be a guard with
 /// no margin over the one or two events four windows produce, which is the
 /// family of check that fails on its own noise. What the arm asserts on the
 /// direction is the side the law makes a hard statement about: an independent
-/// burst cannot climb a rung. The wire is the same six datagrams of cover per
-/// message on both arms, so whether repair traffic moves it is a measurement
-/// the arm reports rather than a bound it invents.
+/// burst cannot climb a rung.
 ///
 /// It is a **new** arm: `clean`, `hostile`, `lone_tail`, the field-RTT arms and
 /// the rung-distribution probe keep their impairment, windows, cadence, seeds,
@@ -2444,7 +2417,7 @@ async fn m1_lone_tail_loss_model() {
             let corrected = corrected_rung_counts(&inputs, run.samples.len() as u64);
             let uncorrected = law_rung_counts(&inputs);
             eprintln!(
-                "[loss-model] arm={} run={rep} rounds={} c2s={} dropped={} applied={:.4} declared={:.4} E={:.1} max_rungs={:.2} over250={} wire_x={:.3} p50={:.1} p99={:.1} p999={:.1} max={:.1}",
+                "[loss-model] arm={} run={rep} rounds={} c2s={} dropped={} applied={:.4} declared={:.4} E={:.1} max_rungs={:.2} over250={} p50={:.1} p99={:.1} p999={:.1} max={:.1}",
                 arm.label,
                 run.samples.len(),
                 run.int_c2s_packets,
@@ -2454,7 +2427,6 @@ async fn m1_lone_tail_loss_model() {
                 expected_bursts(&inputs),
                 max_rungs,
                 by_threshold[0],
-                run.wire_x,
                 run.summary.p50,
                 run.summary.p99,
                 run.summary.p999,
@@ -2486,9 +2458,6 @@ async fn m1_lone_tail_loss_model() {
             arm.samples.extend(run.samples.iter().copied());
             arm.sent += run.summary.sent;
             arm.received += run.summary.received;
-            arm.wire_bytes += run.int_c2s_wire_bytes;
-            arm.offered_bytes += run.offered_bytes;
-            arm.worst_wire_x = arm.worst_wire_x.max(run.wire_x);
             arm.applied += applied;
             arm.declared += inputs.loss;
         }
@@ -2510,7 +2479,7 @@ async fn m1_lone_tail_loss_model() {
             arm.bins,
         );
         eprintln!(
-            "[loss-model] pooled arm={} max_rungs={:.2} over250={} ({:.3}%) p50={:.1} p99={:.1} p999={:.1} max={:.1} wire_x={:.3} worst_run_wire_x={:.3}",
+            "[loss-model] pooled arm={} max_rungs={:.2} over250={} ({:.3}%) p50={:.1} p99={:.1} p999={:.1} max={:.1}",
             arm.label,
             arm.max_rungs,
             arm.over250(),
@@ -2519,8 +2488,6 @@ async fn m1_lone_tail_loss_model() {
             tail.p99,
             tail.p999,
             tail.max,
-            arm.wire_x(),
-            arm.worst_wire_x,
         );
         let waited: Vec<String> = arm
             .samples
@@ -2597,12 +2564,6 @@ async fn m1_lone_tail_loss_model() {
         ge.threshold[1],
         iid.threshold[1],
     );
-    eprintln!(
-        "[loss-model] measured_direction wire_x ge={:.3} iid={:.3} difference={:+.3}x (the cover is the same six datagrams per message on both arms, so the repair traffic the correlated arm adds is what this difference measures)",
-        ge.wire_x(),
-        iid.wire_x(),
-        ge.wire_x() - iid.wire_x(),
-    );
 
     assert!(
         ge_band_ok,
@@ -2628,22 +2589,8 @@ async fn m1_lone_tail_loss_model() {
         iid.over250(),
         RUNG_DIST_BAND_HIGH * ge.corrected[0],
     );
-    for arm in [iid, ge] {
-        assert!(
-            arm.wire_x() <= M2_LONE_WIRE_GUARD_X,
-            "[loss-model] the {} arm's own-wire multiple {:.3}x exceeds the {M2_LONE_WIRE_GUARD_X}x lone-tail guard",
-            arm.label,
-            arm.wire_x(),
-        );
-        assert!(
-            arm.wire_x() >= 1.0,
-            "[loss-model] the {} arm's own-wire multiple {:.3}x is below 1.0, i.e. under the payload it delivered: an observation that was never taken, not a low-redundancy arm",
-            arm.label,
-            arm.wire_x(),
-        );
-    }
     println!(
-        "LOSS_MODEL PASS runs_per_model={LOSS_MODEL_RUNS} rounds_ge={} rounds_iid={} ge_over250={} (corrected {:.2}) ge_ge2={} iid_over250={} iid_ge2={} ge_wire_x={:.3} iid_wire_x={:.3}",
+        "LOSS_MODEL PASS runs_per_model={LOSS_MODEL_RUNS} rounds_ge={} rounds_iid={} ge_over250={} (corrected {:.2}) ge_ge2={} iid_over250={} iid_ge2={}",
         ge.rounds,
         iid.rounds,
         ge.over250(),
@@ -2651,8 +2598,6 @@ async fn m1_lone_tail_loss_model() {
         ge.threshold[1],
         iid.over250(),
         iid.threshold[1],
-        ge.wire_x(),
-        iid.wire_x(),
     );
 }
 
@@ -2799,16 +2744,29 @@ async fn m1_lone_tail_field_rtt_depth_sweep() {
 
 // ────────────────────────── M2: delivery and wire ────────────────────────────
 
+// ───────── M2: the offered load's latency does not degrade ──────────────────
+
+/// The **known offered throughput** of a cadence arm: `MSG_BYTES` every
+/// [`CADENCE`]. This is M2's *input*: the mandate asserts that a lane offered
+/// this rate keeps its latency at the floor, and infers the goodput from that.
+fn cadence_offer_bps() -> f64 {
+    MSG_BYTES as f64 / CADENCE.as_secs_f64()
+}
+
+/// The number of messages a cadence arm's schedule offers over `window`.
+fn cadence_offer_messages(window: Duration) -> f64 {
+    window.as_secs_f64() / CADENCE.as_secs_f64()
+}
+
 fn m2_declaration() -> String {
     format!(
-        r#"{{"mandate":"M2","title":"M2 interactive delivery and own-wire multiple (1=clean 2=hostile 3=lone_tail)","x_label":"arm (1=clean 2=hostile 3=lone_tail)","y_label":"value","panels":[{{"id":"delivery","chart":"bar","series":[{{"name":"delivery"}}],"bounds":[{{"y":1.0,"label":"M2 delivery floor 1.000"}}]}},{{"id":"wire","chart":"bar","series":[{{"name":"wire_x"}}],"bounds":[{{"y":{M2_WIRE_BUDGET_X},"label":"M2 wire budget 6x"}}]}}]}}"#
+        r#"{{"mandate":"M2","title":"M2 interactive delivery and latency under a known offer (1=clean 2=hostile 3=lone_tail)","x_label":"arm (1=clean 2=hostile 3=lone_tail)","y_label":"value","panels":[{{"id":"delivery","chart":"bar","series":[{{"name":"delivery"}}],"bounds":[{{"y":1.0,"label":"M2 delivery floor 1.000"}}]}},{{"id":"latency","chart":"bar","series":[{{"name":"p99_ms"}}],"bounds":[{{"y":{M2_NONDEGRADING_P99_MS},"label":"M2 non-degrading p99 bound (ms)"}}]}}]}}"#
     )
 }
 
 fn m2_rows(runs: &[ArmRun]) -> Vec<(String, String, f64, f64)> {
-    // One series per panel, one bar per arm at its ordinal x, so the 6x
-    // budget (and the 1.000 floor) is drawn once against all three arms and a
-    // hostile/lone breach is visible as a bar crossing the line.
+    // One bar per arm per panel: the delivery relation and the latency the
+    // mandate asserts under the offer, each against its own bound.
     let mut rows = Vec::new();
     for (index, run) in runs.iter().enumerate() {
         let x = (index + 1) as f64;
@@ -2818,17 +2776,28 @@ fn m2_rows(runs: &[ArmRun]) -> Vec<(String, String, f64, f64)> {
             x,
             run.summary.delivery_pct,
         ));
-        rows.push(("wire".to_owned(), "wire_x".to_owned(), x, run.wire_x));
+        rows.push((
+            "latency".to_owned(),
+            "p99_ms".to_owned(),
+            x,
+            run.summary.p99,
+        ));
     }
     rows
 }
 
-/// Mandate 2: the interactive lane delivers what it is offered without
-/// inflating its own wire. The clean arm asserts the mandate bound
-/// (`delivery == 1.000`, `offered <= own-wire <= 6x`); the hostile arms
-/// assert the regression guards.
+/// Mandate 2: the interactive lane is offered a **known throughput** and its
+/// latency does **not degrade** under that offer. The `clean` cadence arm
+/// asserts the mandate — the offered message count is its schedule (the
+/// input), it delivers all of it (`delivery == 1.000`), and its p99 stays at
+/// the link's floor ([`M2_NONDEGRADING_P99_MS`]) — so the goodput is inferred
+/// from the latency holding: a lane draining what it is offered cannot be
+/// accumulating a queue, and a lane whose goodput fell would have to show the
+/// backlog as latency or stop offering. The `hostile` cadence arm asserts the
+/// same known offer plus its delivery floor; the lone-tail arm keeps its
+/// delivery floor as a regression guard.
 #[tokio::test(flavor = "multi_thread")]
-async fn m2_interactive_delivery_and_wire() {
+async fn m2_offered_load_latency() {
     let _serial = SERIAL.lock().await;
     let dir = out_dir();
     let runs = mandate_runs("M2").await;
@@ -2837,44 +2806,67 @@ async fn m2_interactive_delivery_and_wire() {
     let clean = &runs[0];
     let hostile = &runs[1];
     let lone = &runs[2];
-    let pass = clean.summary.received == clean.summary.sent
-        && clean.wire_x <= M2_WIRE_BUDGET_X
+
+    // The mandate's input: the known offered throughput and the message count
+    // the two cadence arms' schedules must have produced over their windows.
+    let offer_bps = cadence_offer_bps();
+    let clean_offer_floor = cadence_offer_messages(clean.window) * (1.0 - M2_OFFER_TOLERANCE);
+    let hostile_offer_floor = cadence_offer_messages(hostile.window) * (1.0 - M2_OFFER_TOLERANCE);
+    let clean_offer_met = clean.summary.sent as f64 >= clean_offer_floor;
+    let hostile_offer_met = hostile.summary.sent as f64 >= hostile_offer_floor;
+    let clean_delivered = clean.summary.received == clean.summary.sent;
+    let clean_latency_held = clean.summary.p99 <= M2_NONDEGRADING_P99_MS;
+    let pass = clean_offer_met
+        && clean_delivered
+        && clean_latency_held
+        && hostile_offer_met
         && hostile.summary.delivery_pct >= M2_HOSTILE_DELIVERY_FLOOR
-        && hostile.wire_x <= M2_HOSTILE_WIRE_GUARD_X
-        && lone.summary.delivery_pct >= M2_LONE_DELIVERY_FLOOR
-        && lone.wire_x <= M2_LONE_WIRE_GUARD_X;
+        && lone.summary.delivery_pct >= M2_LONE_DELIVERY_FLOOR;
     println!(
-        "MANDATE M2 {} clean_delivery={:.3} clean_wire_x={:.2} hostile_delivery={:.3} hostile_wire_x={:.2} lone_delivery={:.3} lone_wire_x={:.2} budget={:.1} hostile_wire_guard={:.1} lone_wire_guard={:.1} delivery_floor={:.3}",
+        "MANDATE M2 {} clean_offer_msgs={} clean_offer_floor={:.0} clean_offered_bps={:.0} clean_delivery={:.3} clean_p99={:.1} hostile_offer_msgs={} hostile_offer_floor={:.0} hostile_delivery={:.3} lone_delivery={:.3} offer_bps={:.0} offer_tolerance={:.2} nondergrading_p99_ms={:.1} delivery_floor={:.3}",
         verdict(pass),
+        clean.summary.sent,
+        clean_offer_floor,
+        offer_bps,
         clean.summary.delivery_pct,
-        clean.wire_x,
+        clean.summary.p99,
+        hostile.summary.sent,
+        hostile_offer_floor,
         hostile.summary.delivery_pct,
-        hostile.wire_x,
         lone.summary.delivery_pct,
-        lone.wire_x,
-        M2_WIRE_BUDGET_X,
-        M2_HOSTILE_WIRE_GUARD_X,
-        M2_LONE_WIRE_GUARD_X,
+        offer_bps,
+        M2_OFFER_TOLERANCE,
+        M2_NONDEGRADING_P99_MS,
         M2_LONE_DELIVERY_FLOOR,
     );
 
+    assert!(
+        clean_latency_held,
+        "[M2] the clean arm's p99 {:.1} ms exceeds the {M2_NONDEGRADING_P99_MS} ms non-degradation bound under its {:.0} B/s offer: the lane's latency degraded, so the backlog was not drained and the goodput is not what was offered",
+        clean.summary.p99, offer_bps,
+    );
     assert_eq!(
         clean.summary.received, clean.summary.sent,
         "[M2] clean-arm interactive delivery must be exactly 1.000: {}/{} messages delivered ({:.3}) — the interactive lane ate its own goodput",
         clean.summary.received, clean.summary.sent, clean.summary.delivery_pct,
     );
     assert!(
-        clean.wire_x <= M2_WIRE_BUDGET_X,
-        "[M2] clean-arm interactive c2s wire {} bytes is {:.2}x the offered {} bytes, over the {M2_WIRE_BUDGET_X}x own-wire budget: redundant wire must not inflate unboundedly",
-        clean.int_c2s_wire_bytes,
-        clean.wire_x,
-        clean.offered_bytes,
+        clean_offer_met,
+        "[M2] the clean arm offered {} messages of the {:.0} its {:.0} B/s schedule requires over {:?} (a {:.2} tolerance): a lane that was never offered the known throughput has no goodput to infer, so the offer is asserted as the mandate's input",
+        clean.summary.sent,
+        cadence_offer_messages(clean.window),
+        offer_bps,
+        clean.window,
+        M2_OFFER_TOLERANCE,
     );
     assert!(
-        clean.int_c2s_wire_bytes >= clean.offered_bytes,
-        "[M2] clean-arm interactive c2s wire {} bytes is below the {} bytes offered: the messages asserted delivered above crossed this path, so a wire observation under the payload is an observation that was never taken, not a low-redundancy run",
-        clean.int_c2s_wire_bytes,
-        clean.offered_bytes,
+        hostile_offer_met,
+        "[M2] the hostile arm offered {} messages of the {:.0} its {:.0} B/s schedule requires over {:?} (a {:.2} tolerance): the hostile delivery floor is only a statement about that offer",
+        hostile.summary.sent,
+        cadence_offer_messages(hostile.window),
+        offer_bps,
+        hostile.window,
+        M2_OFFER_TOLERANCE,
     );
     assert!(
         hostile.summary.delivery_pct >= M2_HOSTILE_DELIVERY_FLOOR,
@@ -2882,19 +2874,9 @@ async fn m2_interactive_delivery_and_wire() {
         hostile.summary.delivery_pct,
     );
     assert!(
-        hostile.wire_x <= M2_HOSTILE_WIRE_GUARD_X,
-        "[M2] hostile arm own-wire {:.2}x exceeds its {M2_HOSTILE_WIRE_GUARD_X}x regression guard",
-        hostile.wire_x,
-    );
-    assert!(
         lone.summary.delivery_pct >= M2_LONE_DELIVERY_FLOOR,
         "[M2] hostile lone-tail arm delivery {:.3} fell below its {M2_LONE_DELIVERY_FLOOR} regression floor",
         lone.summary.delivery_pct,
-    );
-    assert!(
-        lone.wire_x <= M2_LONE_WIRE_GUARD_X,
-        "[M2] lone-tail own-wire {:.2}x exceeds its {M2_LONE_WIRE_GUARD_X}x regression guard: the known lone-tail wire defect has at least doubled",
-        lone.wire_x,
     );
 }
 

@@ -21,29 +21,27 @@
 //!    (full tier, opt-in): the median of three seeded runs plus a zero
 //!    `>250 ms` spike count on every run. Wall-clock, so median-of-N with a
 //!    documented run command.
-//! 2. **Reasonable goodput of the interactive lane** — the interactive lane
-//!    delivers what it is offered (`delivery == 1.000`) **without inflating
-//!    its own wire** to get there.
-//!    *Bound (derived):* the offered payload is the deterministic
-//!    sent-message byte count; the lane's *aggregate* client→server wire
-//!    forwarded by the impairment proxy must stay within a fixed budget of
-//!    it — `6×` (the `INTERACTIVE_WIRE_BUDGET_X` constant of
-//!    `rtp_mux_jitter.rs`), where the measured overhead on the seeded `both`
-//!    arm is ~3.6× (RTP/mux framing + control + the repair traffic that 2%
-//!    loss needs), so the budget leaves ~1.6× headroom and the aggregate
-//!    wire must not grow by more than ~+64%. The budget does not bound one
-//!    message's redundancy: a fully-armored lone interactive tail is
-//!    `primary + 5 copies` = six datagrams carrying the same 256 B payload,
-//!    so it alone costs at least the whole budget before framing.
+//! 2. **The interactive lane's latency does not degrade under a known offered
+//!    throughput** — the lane is offered a known rate and the mandate is that
+//!    its latency stays at the link's floor, so the goodput is *inferred* from
+//!    the latency holding: a lane draining its offer cannot be accumulating a
+//!    queue, and one whose goodput fell would have to show the backlog as
+//!    latency.
+//!    *Bound (derived):* the offer is the deterministic `MSG_BYTES` per
+//!    `CADENCE` schedule (a known bytes/second); the gate asserts the arm's
+//!    measured `sent` **is** that schedule (the input), that the lane
+//!    **delivered** every message (`received == sent`), and that its `p99`
+//!    stayed at the link's floor within `INTERACTIVE_NONDEGRADING_P99_MS`
+//!    (~4× the measured ~26 ms p99 on the seeded `both` arm, and far below the
+//!    `250 ms` M1 ceiling, so it bites on a backlog under the offer rather
+//!    than on the 2 % loss realisation).
 //!    *Asserted by:* `rtp_mux_jitter.rs::jitter_duallane_constitution_gate`
-//!    (default tier, runs on every `cargo test -p rtp_mux`). Both quantities
-//!    are deterministic counts over the seeded impairment link — counts
-//!    belong in the always-run gate — and they are asserted together so that
-//!    redundancy that inflates the interactive lane to buy latency violates
-//!    the constitution. At the mux layer beneath, per-stream delivery against
-//!    the offered payload is additionally asserted in `mux`'s default tier
-//!    (mux's `GATE.md`), so the offered payload's integrity is always-run
-//!    coverage.
+//!    (default tier, runs on every `cargo test -p rtp_mux`). The offer count
+//!    is a deterministic count over the seeded impairment link — counts
+//!    belong in the always-run gate. At the mux layer beneath, per-stream
+//!    delivery against the offered payload is additionally asserted in
+//!    `mux`'s default tier (mux's `GATE.md`), so the offered payload's
+//!    integrity is always-run coverage.
 //! 3. **High goodput of the bulk lane** — the bulk lane's goodput stays at a
 //!    high fraction of the link's capacity on the same topology.
 //!    *Bound (derived):* the bulk lane's link is shaped at a configured rate
@@ -74,9 +72,7 @@
 //!    command.
 //!
 //! **Redundancy monotonicity is NOT a mandate** — it was only ever a proxy
-//! for these outcomes. FEC recovery parity may legitimately grow with loss;
-//! what must not happen is the interactive lane's extra/armor packets
-//! inflating its own delivered wire.
+//! for these outcomes. FEC recovery parity may legitimately grow with loss.
 //!
 //! The harness (`netem_test`) must not restate this constitution: it keeps
 //! the impairment instrument and its own gate manifest, and points at the

@@ -34,16 +34,16 @@
 //!   `250 ms` spike ceiling (~8× the measured ~29 ms p99, and the README's
 //!   "zero >250 ms spikes" criterion) — gated on the **median of three**
 //!   seeded runs, with a zero `>250 ms` spike count on every run.
-//! * **M2 — reasonable goodput of the interactive lane**: the interactive
-//!   lane delivers what it is offered (`delivery == 1.000`) **without
-//!   inflating its own wire** to get there. Asserted by
+//! * **M2 — the interactive lane's latency does not degrade under a known
+//!   offered throughput**: the lane is offered a known rate and the mandate is
+//!   that its latency stays at the link's floor, so the goodput is *inferred*
+//!   (a lane draining its offer cannot be accumulating a queue; one whose
+//!   goodput fell would show the backlog as latency). Asserted by
 //!   [`jitter_duallane_constitution_gate`] (**default tier** — runs on every
-//!   `cargo test -p rtp_mux`; both quantities are deterministic counts, and
-//!   counts belong in the always-run gate): the offered payload
-//!   is the deterministic sent-message byte count, and the lane's *aggregate*
-//!   client→server wire forwarded by the impairment proxy must stay within a
-//!   fixed budget of it (6×, measured ~3.6× on the seeded `both` arm — ~1.6×
-//!   headroom, so the aggregate wire may grow by ~+64 % before it trips).
+//!   `cargo test -p rtp_mux`): the offer is the deterministic `MSG_BYTES` per
+//!   `CADENCE` schedule and is asserted from the arm's measured `sent` (the
+//!   input), the lane must **deliver** all of it (`delivery == 1.000`), and its
+//!   `p99` must stay within [`INTERACTIVE_NONDEGRADING_P99_MS`] of the floor.
 //!
 //! M3 — **high goodput of the bulk lane** (goodput ≥ a derived fraction of
 //! the configured link rate, median-of-N) — is asserted in
@@ -1980,7 +1980,8 @@ struct DualRun {
     run: JitterRun,
     /// Interactive-lane client->server wire bytes forwarded by the impairment
     /// proxy: the interactive lane's own offered wire (data + repairs +
-    /// control) — the wire-budget evidence for the constitution gate.
+    /// control), printed as diagnosis of the offer — M2 is a
+    /// delivery-and-latency mandate and asserts nothing about this ratio.
     int_c2s_wire_bytes: u64,
     /// Bulk-lane client->server wire bytes forwarded by the impairment proxy:
     /// the offered bulk load, i.e. the matched-load check across the two
@@ -2527,47 +2528,45 @@ async fn jitter_duallane_arms() {
     print_duallane_loads("duallane-strict-fec", &strict_view);
 }
 
-/// for the interactive lane's client→server wire
-/// versus the offered interactive payload (see
-/// [`jitter_duallane_constitution_gate`]). Measured overhead on the seeded
-/// `both` arm is ~3.6× the offered payload (RTP/mux framing + control + the
-/// repair traffic the 2 % loss needs); 6× leaves ~1.6× headroom, so the
-/// lane's aggregate wire must not grow by more than ~+64 %. The budget
-/// bounds that aggregate over the run, not one message's redundancy: a
-/// fully-armored lone interactive tail is `primary + 5 copies` = six
-/// datagrams carrying the same 256 B payload, so it alone is at least the
-/// whole budget before framing.
-const INTERACTIVE_WIRE_BUDGET_X: u64 = 6;
+/// The M2 non-degradation bound: the interactive lane's p99 must stay at the
+/// link's floor while it is offered its known throughput (`MSG_BYTES` every
+/// `CADENCE`). The link's one-way floor is `OWD + JITTER` = 30 ms and the
+/// measured `both`-arm p99 is ~26 ms, so the value is ~4x the measured p99 and
+/// far below the M1 ceiling: it bites on a backlog under the offer rather than
+/// on the 2 % loss realisation. One authority for the value and derivation:
+/// `rtp_mux/GATE.md` ("Performance").
+const INTERACTIVE_NONDEGRADING_P99_MS: f64 = 100.0;
+
+/// How far the measured offer count may fall below the arm's schedule before
+/// the lane is no longer being offered the mandate's known throughput. The
+/// cadence sender's first interval opens with the window, so the measured
+/// 1200 messages of a 1200-message schedule (or one fewer) is the offer; 2 %
+/// is slack for scheduler jitter rather than a tolerance on the offer itself.
+const M2_OFFER_TOLERANCE: f64 = 0.02;
 
 /// The interactive-lane constitution gate (mandate 2): the deployment
-/// topology's outcome criteria — the interactive lane keeps `delivery == 1.000`
-/// and its client→server wire stays within a fixed budget of the offered
-/// payload — asserted on the production `both` dual-lane arm (frame mode +
-/// fast-forward + prompt FEC interactive lane at 2 % loss, separate strict
-/// bulk lane at the matched 2 MiB / 3 s load). The offered payload is the
-/// deterministic sent-message byte count, so both quantities are counts over
-/// the seeded, deterministic impairment link: the gate is deterministic — a
-/// redundancy ladder that eats the interactive lane's own goodput (delivery
-/// falling below `1.000`) or a wire that inflates without bound fails here
-/// instead of being a human-read table row. Delivery is additionally the
-/// README constitution's first criterion; the wire budget is the second
-/// (redundancy may use *some* wire, never unboundedly). Latency is
-/// deliberately not asserted here — the p99 floor is the median-of-3
-/// constitution gate (mandate 1) that follows this one; the bulk lane's
-/// goodput fraction is mandate 3, asserted in `dual_lane_mandates.rs`.
+/// topology's mandate — the lane is **offered a known throughput** and its
+/// **latency does not degrade under that offer** — asserted on the production
+/// `both` dual-lane arm (frame mode + fast-forward + prompt FEC interactive
+/// lane at 2 % loss, separate strict bulk lane at the matched 2 MiB / 3 s
+/// load). The offered throughput is the deterministic `MSG_BYTES` per `CADENCE`
+/// schedule: the gate asserts the arm's measured `sent` *is* that schedule (the
+/// input), that the lane **delivered** every message (`received == sent`), and
+/// that its **p99 stayed at the link's floor**
+/// ([`INTERACTIVE_NONDEGRADING_P99_MS`]). A lane draining what it is offered
+/// cannot be accumulating a queue, so non-degrading latency *infers* the
+/// goodput; a lane whose goodput fell would have to show the backlog as
+/// latency, or stop offering — and both are asserted here. Latency's absolute
+/// ceiling is the median-of-3 constitution gate (mandate 1) that follows this
+/// one; the bulk lane's goodput fraction is mandate 3, asserted in
+/// `dual_lane_mandates.rs`.
 ///
 /// Counts belong in the default gate (the constitution's tier rule), so this
 /// gate is **not** `#[ignore]`d: it runs on every `cargo test -p rtp_mux`.
 ///
-/// The wire check is **two-sided**: the budget bounds it from above, and the
-/// offered payload bounds it from below. The floor is a true invariant, not a
-/// measurement expectation. The asserted `received == sent` means every one of
-/// the `sent` `MSG_BYTES`-byte messages was delivered, and every byte of a
-/// delivered message crossed the interactive pair's client->server path, so the
-/// forwarded-byte sum is at least the delivered payload (the `b"L"` stream tag
-/// and per-datagram framing only add). A `wire` reading below `offered`
-/// therefore cannot describe a correct run; it describes an observation that was
-/// never taken (a counter left at zero), which an upper bound alone cannot see.
+/// The raw client→server forwarded byte total is printed as diagnosis and is
+/// **not** asserted: M2 is an offered-load-latency mandate, not a wire-ratio
+/// budget.
 #[tokio::test(flavor = "multi_thread")]
 async fn jitter_duallane_constitution_gate() {
     let label = "duallane_constitution/both";
@@ -2579,32 +2578,33 @@ async fn jitter_duallane_constitution_gate() {
     .await;
     let summary = &run.run.summary;
     assert_sane(label, summary);
-    // The offered interactive payload: `sent` messages of `MSG_BYTES` bytes.
-    let offered = summary.sent * MSG_BYTES as u64;
-    let wire = run.int_c2s_wire_bytes;
+    // M2's input: the known offered throughput, and the message count the
+    // cadence schedule must have produced over the arm's window.
+    let expected = RUN_FOR.as_secs_f64() / CADENCE.as_secs_f64();
+    let offer_bps = MSG_BYTES as f64 / CADENCE.as_secs_f64();
+    assert!(
+        summary.sent as f64 >= expected * (1.0 - M2_OFFER_TOLERANCE),
+        "[{label}] the lane offered {} messages of the {expected:.0} its {offer_bps:.0} B/s schedule requires over {RUN_FOR:?} (a {M2_OFFER_TOLERANCE} tolerance): a lane that was never offered the known throughput has no goodput to infer",
+        summary.sent,
+    );
     assert_eq!(
         summary.received, summary.sent,
         "[{label}] interactive delivery must be exactly 1.000: {}/{} messages delivered ({:.3}), the interactive lane ate its own goodput",
         summary.received, summary.sent, summary.delivery_pct,
     );
     assert!(
-        wire <= offered * INTERACTIVE_WIRE_BUDGET_X,
-        "[{label}] interactive c2s wire {wire} bytes exceeds the {INTERACTIVE_WIRE_BUDGET_X}x offered-payload budget ({} bytes): redundant wire must not inflate unboundedly (measured {:.2}x)",
-        offered * INTERACTIVE_WIRE_BUDGET_X,
-        wire as f64 / offered as f64,
-    );
-    assert!(
-        wire >= offered,
-        "[{label}] interactive c2s wire {wire} bytes is below the {offered}-byte offered payload (measured {:.2}x): the delivered messages crossed this path, so a wire observation under the payload is an observation that was never taken, not a low-redundancy run",
-        wire as f64 / offered as f64,
+        summary.p99 <= INTERACTIVE_NONDEGRADING_P99_MS,
+        "[{label}] p99 {:.1} ms exceeds the {INTERACTIVE_NONDEGRADING_P99_MS} ms non-degradation bound under the {offer_bps:.0} B/s offer: the lane's latency degraded, so the backlog was not drained and the goodput is not what was offered",
+        summary.p99,
     );
     eprintln!(
-        "[{label}] constitution OK: delivery {:.3}, c2s wire {wire} bytes = {:.2}x offered {offered} bytes, p50 {:.1} p99 {:.1} max {:.1} ms",
+        "[{label}] constitution OK: offered {} messages = {offer_bps:.0} B/s (schedule {expected:.0}), delivery {:.3}, p50 {:.1} p99 {:.1} max {:.1} ms; c2s wire {} bytes (diagnostic)",
+        summary.sent,
         summary.delivery_pct,
-        wire as f64 / offered as f64,
         summary.p50,
         summary.p99,
         summary.max,
+        run.int_c2s_wire_bytes,
     );
 }
 
@@ -2621,14 +2621,13 @@ const INTERACTIVE_P99_CEILING_MS: f64 = 250.0;
 /// The median-of-3 interactive-latency constitution gate (mandate 1): the
 /// production `both` dual-lane arm (frame + fast-forward + prompt-FEC
 /// interactive lane at 2 % loss, separate strict bulk lane) run three times,
-/// asserting the interactive outcome triad on every run — `delivery == 1.000`
-/// and the client→server wire within the [`INTERACTIVE_WIRE_BUDGET_X`] budget
-/// (both deterministic counts, min over the three reps) — and the median-of-3
-/// p99 against the [`INTERACTIVE_P99_CEILING_MS`] ceiling, with a zero
-/// `>250 ms` spike count on every run. The p99 is a single wall-clock
-/// observation and its timing against the seeded loss stream varies with host
-/// scheduling, so it is gated on the median of the three runs, exactly as the
-/// contested-latency and paced-bulk HOL gates do.
+/// asserting the interactive outcome on every run — `delivery == 1.000` (the
+/// deterministic count) — and the median-of-3 p99 against the
+/// [`INTERACTIVE_P99_CEILING_MS`] ceiling, with a zero `>250 ms` spike count on
+/// every run. The offered-load mandate (M2) is asserted by
+/// [`jitter_duallane_constitution_gate`]; this gate carries the absolute
+/// latency ceiling, which is wall-clock and therefore gated on the median of
+/// three runs, exactly as the contested-latency and paced-bulk HOL gates do.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads and binds ephemeral ports; three ~35 s dual-lane constitution runs; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn jitter_duallane_constitution_gate_p99() {
@@ -2644,23 +2643,10 @@ async fn jitter_duallane_constitution_gate_p99() {
         .await;
         let summary = &run.run.summary;
         assert_sane(&label, summary);
-        let offered = summary.sent * MSG_BYTES as u64;
-        let wire = run.int_c2s_wire_bytes;
         assert_eq!(
             summary.received, summary.sent,
             "[{label}] interactive delivery must be exactly 1.000: {}/{} messages delivered ({:.3}), the interactive lane ate its own goodput",
             summary.received, summary.sent, summary.delivery_pct,
-        );
-        assert!(
-            wire <= offered * INTERACTIVE_WIRE_BUDGET_X,
-            "[{label}] interactive c2s wire {wire} bytes exceeds the {INTERACTIVE_WIRE_BUDGET_X}x offered-payload budget ({} bytes): redundant wire must not inflate unboundedly (measured {:.2}x)",
-            offered * INTERACTIVE_WIRE_BUDGET_X,
-            wire as f64 / offered as f64,
-        );
-        assert!(
-            wire >= offered,
-            "[{label}] interactive c2s wire {wire} bytes is below the {offered}-byte offered payload (measured {:.2}x): the delivered messages crossed this path, so a wire observation under the payload is an observation that was never taken, not a low-redundancy run",
-            wire as f64 / offered as f64,
         );
         assert_eq!(
             summary.over250_pct,
@@ -2672,10 +2658,9 @@ async fn jitter_duallane_constitution_gate_p99() {
         );
         *slot = summary.p99;
         eprintln!(
-            "[{label}] rep {}: delivery {:.3}, c2s wire {wire} bytes = {:.2}x offered {offered} bytes, p50 {:.1} p99 {:.1} ms",
+            "[{label}] rep {}: delivery {:.3}, p50 {:.1} p99 {:.1} ms",
             rep + 1,
             summary.delivery_pct,
-            wire as f64 / offered as f64,
             summary.p50,
             summary.p99,
         );

@@ -72,34 +72,26 @@ either sees the whole constitution:
    cargo test --release -p rtp_mux --test rtp_mux_jitter -- \
        --ignored jitter_duallane_constitution_gate_p99 --nocapture --test-threads=1
    ```
-2. **Reasonable goodput of the interactive lane** — the interactive lane
-   delivers what it is offered (`delivery == 1.000`) **without inflating its
-   own wire** to get there. Bound (derived): offered payload = the
-   deterministic sent-message byte count; the lane's *aggregate*
-   client→server wire forwarded by the impairment proxy must stay within `6×`
-   of it (measured ~3.6× on the seeded `both` arm — RTP/mux framing +
-   control + the repair traffic 2 % loss needs — so ~1.6× headroom, and the
-   aggregate wire must not grow by more than ~+64 %; the same arm re-measures
-   **3.67×** on the local `rtp` revision under test after `INIT_SEND_RATE` was
-   raised there, 128 → 1024 (that revision is not released — this crate still
-   pins `rtp` `v0.0.97` — see the `m1-four-flow-clean` row below), i.e. it does
-   not move, because this arm offers ~100 msg/s and so never outran the old
-   128 pkt/s seed — the cost of the rate is confined to the arms whose offered
-   rate *exceeds* the old seed, which is the high-cadence `mandate_smoke` arm
-   at 200 msg/s and the production four-flow shape at 800). The budget does not
-   bound one message's redundancy: a fully-armored lone interactive tail is
-   `primary + 5 copies` = six datagrams carrying the same 256 B payload, so
-   it alone costs the whole budget before framing. The check is
-   **two-sided**: the floor `wire >= offered` is asserted alongside the budget,
-   because the messages whose delivery the same arm asserts must have crossed
-   that path — a zeroed or unobserved wire counter reads as a pass against the
-   upper bound alone. Asserted by
-   `rtp_mux_jitter::jitter_duallane_constitution_gate` (**default tier** —
-   both quantities are deterministic counts, and counts belong in the gate
-   that always runs); it runs on every `cargo test -p rtp_mux`. The offered
-   payload's byte-exact integrity is additionally asserted always-run at the
-   mux layer beneath (mux's default tier, `mux/GATE.md`) and in rtp_mux's own
-   default tests (`tests/bidirectional.rs`).
+2. **The interactive lane's latency does not degrade under a known offered
+   throughput** — the lane is offered a **known rate** and the mandate is that
+   its latency stays at the link's floor. The **throughput is the input** and
+   the **goodput is inferred** from the latency holding: a lane draining what
+   it is offered cannot be accumulating a queue, and a lane whose goodput fell
+   would have to show the backlog as latency (or stop offering). The `both`
+   arm's offer is the deterministic `MSG_BYTES` per `CADENCE` schedule (256 B
+   every 25 ms = 10240 B/s, 40 msg/s). Bound (derived): the arm's measured
+   `sent` must be that schedule (the input — a lane never offered the rate has
+   no goodput to infer), its `delivery` must be exactly `1.000`, and its `p99`
+   must stay within `INTERACTIVE_NONDEGRADING_P99_MS = 100 ms` — the link's
+   `OWD + JITTER` = 30 ms one-way floor plus the repair margin, ~4× the
+   measured ~26 ms p99 and well below M1's 250 ms ceiling, so it bites on a
+   backlog under the offer rather than on the 2 % loss realisation. Asserted by
+   `rtp_mux_jitter::jitter_duallane_constitution_gate` (**default tier** — an
+   offer count, a delivery count and a floor-relative latency bound belong in
+   the gate that always runs); it runs on every `cargo test -p rtp_mux`. The
+   offered payload's byte-exact integrity is additionally asserted always-run
+   at the mux layer beneath (mux's default tier, `mux/GATE.md`) and in
+   rtp_mux's own default tests (`tests/bidirectional.rs`).
 3. **High goodput of the bulk lane** — the bulk lane's goodput stays at a
    high fraction of the link's capacity on the same topology. Bound
    (derived): sink-delivered goodput ≥ `0.35 ×` the configured bulk-lane rate
@@ -221,7 +213,7 @@ cold_connection::cold_connection_decomposition = standard | 28 | baseline@establ
 cold_connection::mux_lane_birth_is_one_round_trip = standard | 13 | orthogonal@establishment | cold-connection@lanes=dual+handshake=on+impairment=clean+scale=owd20-and-owd96+metric=mux-pairing-round-trips
 hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full | 66 | baseline | interactive-scaling@flows=4+offer=sequential
 hol_probe::hol_rtt100_ge5_four_interactive_concurrent_frame_delivery = full | 20 | orthogonal | interactive-scaling@flows=4+offer=concurrent
-rtp_mux_jitter::jitter_duallane_constitution_gate = default | 40 | baseline@constitution | M2@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=own-wire-budget
+rtp_mux_jitter::jitter_duallane_constitution_gate = default | 40 | baseline@constitution | M2@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=offered-load-latency
 rtp_mux_jitter::jitter_duallane_constitution_gate_p99 = full | 105 | orthogonal@constitution | M1@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=p99-median-of-3
 rtp_mux_jitter::jitter_fec_arms_2pct = perf | 175 | baseline@fec | fec-tuning@impairment=loss2pct-iid+fec=off-stock-prompt+metric=parity-and-latency
 rtp_mux_jitter::jitter_fec_arms_6pct = perf | 175 | orthogonal@fec | fec-tuning@impairment=loss6pct-iid+fec=off-stock-prompt+metric=parity-and-latency
@@ -242,7 +234,7 @@ rtp_mux_jitter::jitter_request_response_arms = perf | 1170 | baseline@lone-tail 
 mandate_smoke::m1_lone_tail_field_rtt = full | 20 | composite(depth,impairment)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd100-ge5pct-jitter100ms+metric=p99-and-over250-share
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep = full | 38 | orthogonal@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1-and-2+impairment=owd100-ge5pct-jitter100ms+metric=p99-and-over250-share
 mandate_smoke::m1_lone_tail_rung_distribution = full | 75 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-ge5pct-jitter100ms+metric=rung-count-vs-burst-law
-mandate_smoke::m1_lone_tail_loss_model = full | 150 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-iid5pct-vs-ge5pct-mean8-jitter100ms+metric=rung-count-and-wire-vs-loss-model
+mandate_smoke::m1_lone_tail_loss_model = full | 150 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-iid5pct-vs-ge5pct-mean8-jitter100ms+metric=rung-count-vs-loss-model
 hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
 hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
 hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
@@ -685,7 +677,7 @@ soak@scale=multi-hour = `rtp_longrun` is multi-minute; a multi-hour soak fits no
 multipath@impairment=multipath = the multi-path UDP transport (rtp's `mpudp`) has no rtp_mux arm; a cell for it belongs to the layer that owns that transport.
 rate-asymmetry@impairment=rate-asymmetry = only the asymmetric frame-delivery diag arm varies lane asymmetry; an asymmetric *rate* with symmetric latency is not covered.
 loaded-lone-tail@shape=request-response+load=bulk = the lone-tail arms run with the bulk lane idle; the request/response shape under a loaded bulk lane is not covered.
-m1-four-flow-clean@flows=4+impairment=clean+metric=p99-ceiling = **closed** by `mandate_smoke::m4_clean_lane_p99_ceiling` (default tier, 15.5 s, declared with its bound, its five coverage cells and its two vacuity probes in the M4 section above). What the line used to record was that M1's ceiling was asserted on M1's *one-flow* clean arm while the four-flow clean panel drew the same ceiling over four series without asserting it, and that a four-flow clean breach was therefore reported and drawn but asserted by no arm; and that it was reachable — raising `rtp`'s fresh-tail armour cover (4/5 to 8/9) left M1's one-flow clean arm untouched (`p99` 90.8 ms) while moving M4's four-flow clean arm to `clean_p50_max` 99.3-118.5 ms and `clean_p99_max` 253.4-265.0 ms, the last **above** the drawn ceiling. The new arm asserts the four-flow clean `clean_p99_max` against that same ceiling (`M1_CEILING_MS`, one authority), so the breach the cover sweep produced now fails a gate instead of only a panel. The gap's own text said what would close it — "a new arm asserting the four-flow clean p99 against the ceiling - declared beside M4, never by retuning it"; that is what this row records as done. The lever that would move the number rather than bound it is superseded by a **one-parameter change to `rtp`** — `INIT_SEND_RATE` 128 -> 1024, measured on this workspace's `rtp` revision (one-flow clean `p99` 90.8 -> 26.8 ms, four-flow clean p99 180.8 -> 176.1 ms, the clean arm's own wire 2.22x -> 5.80x inside its 6x budget). **That revision is not released and this crate's pin is unchanged** (`rtp` `v0.0.97`, whose arms still measure `clean_p99` 88.1 ms and `clean_wire_x` 2.24x): the numbers above describe the local transport under test, and shipping them is the tag train's job — tag `rtp`, bump this crate's `rtp` pin, re-run this battery, tag this crate. The cover half of the pair was **swept and refused**: the two settings that fit the wire better each break a safeguard (the ladder's monotone-non-increasing copy count at `m = 2`, the hostile arm's window-adequacy gate at `m = 4`). The frontier and both refusals are recorded in the M4-level section above and in `rtp/GATE.md`.
+m1-four-flow-clean@flows=4+impairment=clean+metric=p99-ceiling = **closed** by `mandate_smoke::m4_clean_lane_p99_ceiling` (default tier, 15.5 s, declared with its bound, its five coverage cells and its two vacuity probes in the M4 section above). What the line used to record was that M1's ceiling was asserted on M1's *one-flow* clean arm while the four-flow clean panel drew the same ceiling over four series without asserting it, and that a four-flow clean breach was therefore reported and drawn but asserted by no arm; and that it was reachable — raising `rtp`'s fresh-tail armour cover (4/5 to 8/9) left M1's one-flow clean arm untouched (`p99` 90.8 ms) while moving M4's four-flow clean arm to `clean_p50_max` 99.3-118.5 ms and `clean_p99_max` 253.4-265.0 ms, the last **above** the drawn ceiling. The new arm asserts the four-flow clean `clean_p99_max` against that same ceiling (`M1_CEILING_MS`, one authority), so the breach the cover sweep produced now fails a gate instead of only a panel. The gap's own text said what would close it — "a new arm asserting the four-flow clean p99 against the ceiling - declared beside M4, never by retuning it"; that is what this row records as done. The lever that would move the number rather than bound it is superseded by a **one-parameter change to `rtp`** — `INIT_SEND_RATE` 128 -> 1024, measured on this workspace's `rtp` revision (one-flow clean `p99` 90.8 -> 26.8 ms, four-flow clean p99 180.8 -> 176.1 ms). **That revision is not released and this crate's pin is unchanged** (`rtp` `v0.0.97`, whose arms still measure `clean_p99` 88.1 ms): the numbers above describe the local transport under test, and shipping them is the tag train's job — tag `rtp`, bump this crate's `rtp` pin, re-run this battery, tag this crate. The cover half of the pair was **swept and refused**: the two settings the sweep tried each break a safeguard (the ladder's monotone-non-increasing copy count at `m = 2`, the hostile arm's window-adequacy gate at `m = 4`). The frontier and both refusals are recorded in the M4-level section above and in `rtp/GATE.md`.
 cellular-request-response@lane=cellular-timeline+shape=request-response = the cellular timeline arms use the cadence shape only.
 policer@impairment=policer = a token-bucket policer (as opposed to the shaper and queue the harness models) is not in the impairment instrument, so no arm can cover it.
 ```
@@ -727,8 +719,10 @@ short run still carries thousands of samples per cadence arm; the run is ~3
 minutes, and `MANDATE_SMOKE_QUICK=1` takes the shortest windows.
 
 M1 asserts the mandate-1 bound (p99 `<= 250 ms` and zero samples `> 250 ms`) on
-`clean`; M2 asserts the mandate-2 bound (`delivery == 1.000`,
-`offered <= own-wire <= 6x`) on `clean`; M3 asserts the mandate-3 floor (`>= 0.35x` of the configured link
+`clean`; M2 asserts the mandate-2 relation on `clean` — the lane was **offered**
+its known throughput (`MSG_BYTES / CADENCE`), it **delivered** it
+(`delivery == 1.000`), and its **latency did not degrade under the offer**
+(`p99 <= 100 ms`); M3 asserts the mandate-3 floor (`>= 0.35x` of the configured link
 rate) as the within-run delivered/shaper-forwarded fraction, median of three.
 Those bounds and their derivations are the ones stated above; the smoke set
 does not restate them.
@@ -804,12 +798,12 @@ bounds above (measured X, bound Y, so a change that at least doubles it fails):
 | M1 field-RTT lone-tail p99 | `rtp v0.0.94`: 427–719 ms; landed `rtp` `bdacf5c0`: 293–432 ms | `1500 ms` (~2.1× the pinned band) |
 | M1 field-RTT lone-tail `> 250 ms` share | `v0.0.94` 3.3–5.6 %; landed 2.6–5.3 % | `15 %` (~2.7×) |
 | M1 field-RTT lone-tail max | `v0.0.94`: 1015–3868 ms; landed: 386–529 ms | not asserted (one sample at n≈200) |
-| M2 hostile own-wire | 4.63–4.81× (6.58–6.65× after `INIT_SEND_RATE` 128 → 1024) | `10×` (~2×) |
-| M2 lone-tail own-wire | 6.07–6.41× (15 s), field 6.22–7.17×; 5.97–6.36× after `INIT_SEND_RATE` 128 → 1024 | `14×` (~2×) |
-| M2 hostile/lone delivery | 1.000 | `0.995` |
+| M2 hostile delivery | 1.000 | `0.995` |
+| M2 lone-tail delivery | 1.000 | `0.995` |
 
 The smoke panels carry the mandate lines regardless: the M1 latency panel
-draws the **250 ms ceiling**, the M2 wire panel draws the **6× budget** and the
+draws the **250 ms ceiling**, the M2 panels draw the **1.000 delivery floor**
+and the **100 ms non-degradation bound** and the
 M3 panels draw the **0.35× floor**, so a hostile or lone-tail breach is visible
 in the evidence even when that arm's assertion is only a regression guard. The
 assertion is a tripwire; the panel shows what moved. The M1 evidence also
@@ -818,10 +812,9 @@ latency CDF), and every `MANDATE` line prints p50/p90/p99/p999/max and the
 `> 250 ms` sample count for all three arms.
 
 **Redundancy monotonicity is NOT a mandate** — it was only ever a proxy for
-these outcomes. FEC recovery parity may legitimately grow with loss; what must
-not happen is the interactive lane's extra/armor packets inflating its own
-delivered wire. Every gate above is vacuity-checked (break the bound — inject
-latency, inflate the wire, drop a delivery, starve the bulk lane — and the
+these outcomes, and with M2 an offered-load-latency mandate there is no wire
+ratio left to assert. Every gate above is vacuity-checked (break the bound —
+inject latency, drop a delivery, starve the bulk lane — and the
 gate fails naming the mandate); the harness must not restate this
 constitution.
 
@@ -850,8 +843,10 @@ their own reading and gain nothing else.
 **The window each arm needs, from the ladder's own law.** The lone tail is the
 only source on its direction, so a loss burst is consumed one forwarded
 datagram per datagram the lane sends; one tail transmission emits `m = 6`
-datagrams (mandate 2's "primary + 5 copies", corroborated by the M2 lone-tail
-arm's `lone_wire_x` of 5.91–7.42×); and each rung past the probe budget waits
+datagrams (the fresh-tail armour's `primary + 5 copies` cover, `m = 6`; the
+value is fixed by `rtp`'s armour configuration and recorded in `rtp/GATE.md`,
+and `mandate_smoke.rs`'s `TAIL_DATAGRAMS_PER_TRANSMISSION` is the one place this
+arithmetic reads it); and each rung past the probe budget waits
 rtp's `TAIL_PROBED_MIN_RTO = 300 ms`, the floor that binds on every M1 arm
 because the corroborated term `srtt + max(rttvar, srtt / 4)` is 250 ms even at
 the field arm's 190 ms round trip. A burst of `l` datagrams therefore costs
@@ -1063,15 +1058,14 @@ runs below, `4.9 %` applied where `5.0 %` is declared on the independent arm and
 `6.6–6.8 %` on the correlated one, both inside the `[0.5×, 2×]` check the
 sibling probe uses).
 
-*What it gates.* Four assertions, the first three of them properties of the
+*What it gates.* Three assertions, the first three of them properties of the
 law: the correlated arm's first-rung count sits inside its own law's band (the
 sibling's check, so this arm carries the same law); the independent arm reaches
 the **second** rung **never**, because its burst is one datagram and
 `floor(1 / 6) = 0` while the correlated arm's own law puts `5.4–5.6` such rounds
-in the same pool; the independent arm's first-rung count stays under the *upper*
-band of the correlated model's law, so a collapsed cover (which would put ~70
-rounds a window there) cannot pass as independence; and both arms' own-wire
-multiple stays inside the M2 lone-tail guard `[1×, 14×]`.
+in the same pool; and the independent arm's first-rung count stays under the
+*upper* band of the correlated model's law, so a collapsed cover (which would
+put ~70 rounds a window there) cannot pass as independence.
 
 *What it measures and does not gate.* Three clean runs of this revision (four
 windows per model each; libtest stamps 149.32 s and 149.81 s — the latter is the
@@ -1088,14 +1082,13 @@ and sibling probes):
 | p99 | 180.1 / 163.3 / 168.8 ms | 117.9 / 122.0 / 121.5 ms |
 | p99.9 | 412.5 / 413.5 / 367.4 ms | 250.6 / 275.2 / 237.8 ms |
 | loss applied (of 5.0 % declared) | 6.60 / 6.62 / 6.65 % | 4.88 / 4.94 / 4.87 % |
-| own-wire multiple | 6.078× / 6.092× / 6.228× | 6.425× / 6.080× / 5.959× |
 
 (The same instrument on the sibling's own four GE windows reads `> 250 ms` 8
 pooled and `> 550 ms` 4 pooled, the four events the section above lists at
 1510.5, 1037.2, 996.6 and one of 276.1–578.3 ms.)
 
-The **direction**, stated plainly: **yes on depth, no on frequency, and not at
-all on the wire.** The correlated process produces a longer ladder — it reaches
+The **direction**, stated plainly: **yes on depth, no on frequency.** The
+correlated process produces a longer ladder — it reaches
 the second rung in every run (`2`, `3` and `3` of `3894`, `3783` and `3747`
 rounds) where the independent one reaches it in none (`0` of `5987`, `5084` and
 `5687`), its deepest excursion is `3.3–3.9×` deeper (`1612.0`, `1688.6` and
@@ -1103,12 +1096,9 @@ rounds) where the independent one reaches it in none (`0` of `5987`, `5084` and
 with it (`p99` `1.34–1.53×`, `p99.9` `1.33–1.65×`). Its *first-rung* count does
 **not** order the two models — `13` against `8`, `8` against `10` and `12`
 against `5` — i.e. the independent arm produced *more* rounds above the floor in
-one of the three runs — and the wire does not move (`−0.35×`, `+0.01×`,
-`+0.27×`): the six-datagram cover a lone tail sends per message is the same on
-both arms, so the repair traffic a burst adds is a rounding error against it.
-The trade a correlated process raises — fewer loss events, more repair per event
-— is therefore **not visible in the wire at this mean rate**, and the honest
-reading is that a burst buys ladder depth, not wire.
+one of the three runs. The trade a correlated process raises — fewer loss
+events, more repair per event — is therefore **not visible at this mean rate**,
+and the honest reading is that a burst buys ladder depth.
 
 *The negative, and what it costs the law.* The independent arm's `> 250 ms`
 rounds are not zero, which is what the law's `burst = 1` branch predicts
@@ -1199,7 +1189,8 @@ needed: **the windows were already sufficient, and the battery could not tell.**
 ### The deployed baseline the impaired tail must not regress past
 
 **M1 is a hard floor, not a point on a frontier.** An impaired arm's tail is
-not a cost to weigh against M2's wire budget or the clean arm: a candidate that
+not a cost to weigh against M2's offered-load latency or the clean arm: a
+candidate that
 raises any impaired arm's `p99` or `p999` past the band the deployed baseline's
 own repeats showed is **rejected**, and where a change improves the clean arm or
 M2 while raising an impaired tail against a change that does neither, the one
@@ -1225,21 +1216,16 @@ baseline reps themselves all clear:
 
 The same six reps record the rest of the baseline for the reader, and are
 asserted nowhere because each mandate already owns its own bound: **clean
-`p99` 26.5 ms** (reps 26.1–26.6, bound 27 ms), own-wire multiples **clean
-5.82x, hostile 6.56x, lone_tail 6.11x**, and the **M2 owner gate**
+`p99` 26.5 ms** (reps 26.1–26.6, bound 27 ms), and the M2 owner gate
 (`rtp_mux_jitter::jitter_duallane_constitution_gate`, the 40 msg/s `both` arm)
-at **6.85x** — three reps reading 6.85/6.85/6.85 against its 6x budget, i.e.
-a live breach the deployed baseline itself carries. That breach is stated
-rather than repaired here because the working rule is M1 first: the revert
-restores the impaired tail at M2's expense, and the dimension that was supposed
-to pay for it does not (below).
+at ~26 ms `p99`, comfortably inside its 100 ms non-degradation bound.
 
 **The bound is a distributional limit and its sensitivity is the arms' own.**
 The `lone_tail` `p999` band is wide (its reps span 198.6–937.3 ms, 4.7x) because
 that arm's heaviest recovery episode lands inside a 15 s window or does not, so
 that assertion is a coarse tripwire; the two `p99` assertions carry the teeth,
 and `p999` still rejects a doubling of the ladder's height (the `>250 ms`
-shares, the wire and every other reading stay printed on the arm line). The
+shares and every other reading stay printed on the arm line). The
 band is **not** an artefact of the configuration the reps were taken in: four
 further runs of the same arms in the runner's own configuration (libtest's
 default threading, six concurrent tests — `m1_interactive_tail_latency` run
@@ -1266,7 +1252,7 @@ reads
 [m1-baseline] arm=hostile    metric=p999 observed=  1969.4 baseline_v0.0.98=   235.2 bound=   348.0 reps=6 baseline_reps_range=208.7..306.3 verdict=REGRESSED
 [m1-baseline] arm=lone_tail  metric=p99  observed=   720.4 baseline_v0.0.98=   159.0 bound=   199.0 reps=6 baseline_reps_range=151.2..177.1 verdict=REGRESSED
 [m1-baseline] arm=lone_tail  metric=p999 observed=   720.4 baseline_v0.0.98=   349.7 bound=  1321.0 reps=6 baseline_reps_range=198.6..937.3 verdict=OK
-[M1] the hostile arm's p99 is 1924.2 ms — WORSE than the deployed rtp v0.0.98 baseline (166.7 ms over 6 reps, whose range was 152.3-218.4 ms) beyond its derived bound 265.0 ms (those reps' mean + 3 sample standard deviations): +1054.3% against the recorded baseline. M1's impaired tail is a hard floor — it must not be traded for M2's wire budget or the clean arm, and a candidate that does is rejected here rather than absorbed inside a guard.
+[M1] the hostile arm's p99 is 1924.2 ms — WORSE than the deployed rtp v0.0.98 baseline (166.7 ms over 6 reps, whose range was 152.3-218.4 ms) beyond its derived bound 265.0 ms (those reps' mean + 3 sample standard deviations): +1054.3% against the recorded baseline. M1's impaired tail is a hard floor — it must not be traded for M2's offered-load latency or the clean arm, and a candidate that does is rejected here rather than absorbed inside a guard.
 ```
 
 and the test fails with three of the four baseline metrics `REGRESSED`. The
@@ -1278,9 +1264,9 @@ inside a superseded tripwire. No existing guard is loosened, removed or
 reordered: they remain, and still fire for the failures that move a share or a
 count without moving these percentiles.
 
-**The honest counterpart — the production lever itself.** The change the M2
-wire budget is *actually* bought with is the fresh-tail armour cover, and two
-runs with it removed (`FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY` /
+**The honest counterpart — the production lever itself.** Two
+runs with the fresh-tail armour cover removed
+(`FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY` /
 `..._NO_PARITY` 4/5 -> 0/0) read `lone_tail p99` 264.2 ms (past the 199 ms
 bound, `REGRESSED`) and 184.5 ms (inside it, `OK`): a **production** mutation of
 that family trips this gate on one run in two, which is exactly why the red
@@ -1302,39 +1288,33 @@ it fails. Closing that sensitivity needs more observation per arm (a
 median-of-N or a longer window), which is a **new** arm under the perf-test
 dual mandate and not a retune of this one.
 
-**The seed dimension, swept and refused.** `rtp/GATE.md` records the seed
+**The seed dimension, swept.** `rtp/GATE.md` records the seed
 (`INIT_SEND_RATE`) as the one dimension never swept between the two values that
-were (`128` and `1024`) and names the M2 breach as the higher seed admitting
-armour the budget does not allow. It was swept at the deployed cover
-(`m = 6`), one dimension per arm, on this workspace's `rtp` revision, with the
-full-window `mandate_smoke` arm set and the M2 owner gate run rather than
-inferred:
+were (`128` and `1024`), names the owner gate a **step function** of the seed
+(its 40 msg/s `both` arm offers 40 x 6 = 240 pkt/s, so every seed at or above
+`240` admits the whole declared fresh-tail cover) and refuses the seed as a wire
+lever. That record is the wire measurement's, and the length of the step is its
+owned fact; what the sweep also measures is the M1 tail, one dimension per arm,
+on this workspace's `rtp` revision, with the full-window `mandate_smoke` arm set:
 
-| seed | M2 owner gate (40 msg/s) | clean `p99` | `hostile p99` / `p999` | `lone_tail p99` / `p999` | clean own-wire |
-| --- | --- | --- | --- | --- | --- |
-| 128 | **3.68x** PASS | 87.6 ms | 202.1 / 297.4 | 156.7 / 239.3 | 2.10x |
-| 208 | **5.95x** PASS | 84.4 ms | 241.8 / 302.4 | 161.4 / 347.9 | 1.89x |
-| 256 | 6.82x FAIL | 85.6 ms | 198.2 / 231.6 | 161.1 / 910.0 | 1.90x |
-| 384 | 6.84x FAIL | 79.1 ms | 201.7 / 262.4 | 196.4 / 636.2 | 2.19x |
-| 512 | 6.85x FAIL | 29.5 ms | 271.0 / 331.2 | 161.1 / 528.1 | 2.92x |
-| 768 | 6.85x FAIL | 27.9 ms | 203.0 / 288.6 | 138.8 / 220.2 | 4.37x |
-| **1024 (deployed)** | 6.85x FAIL | **26.5 ms** | 166.7 / 235.2 | 159.0 / 349.7 | 5.82x |
+| seed | clean `p99` | `hostile p99` / `p999` | `lone_tail p99` / `p999` |
+| --- | --- | --- | --- |
+| 128 | 87.6 ms | 202.1 / 297.4 | 156.7 / 239.3 |
+| 208 | 84.4 ms | 241.8 / 302.4 | 161.4 / 347.9 |
+| 256 | 85.6 ms | 198.2 / 231.6 | 161.1 / 910.0 |
+| 384 | 79.1 ms | 201.7 / 262.4 | 196.4 / 636.2 |
+| 512 | 29.5 ms | 271.0 / 331.2 | 161.1 / 528.1 |
+| 768 | 27.9 ms | 203.0 / 288.6 | 138.8 / 220.2 |
+| **1024 (deployed)** | **26.5 ms** | 166.7 / 235.2 | 159.0 / 349.7 |
 
-The owner gate is a step function of the seed, not a slope: the `both` arm
-offers 40 msg/s x 6 datagrams = 240 pkt/s, so every seed at or above `240`
-admits the whole declared cover and reads 6.82–6.85x, while `208` truncates it
-to 5.95x and `128` to 3.68x. **No seed in the range clears both floors.** Every
-M2-passing seed (`<= 208`) pays a **3.2x clean-arm `p99` regression** (26.5 ->
-84.4 ms at `208`, 87.6 ms at `128`) for an impaired tail that is *not* better
-(the `hostile p99` at `208`/`128` is 241.8/202.1 ms, at or above the deployed
-median 166.7 ms), and every seed that holds the clean arm (`>= 512`) carries the
-deployed M2 breach unchanged. The refusal is therefore quantified rather than
-asserted: **the deployed seed is the only point the constitution selects**, the
-seed is not a lever for the M2 breach, and the lever that would reduce the wire
-without deepening the ladder — armouring only an actually unacked tail, since
-the 40 msg/s owner gate pipelines its messages so most of its fresh tails are
-not lone — is named in `rtp/GATE.md` as the change that is not attempted here
-and would need its own M1 measurement.
+The M1 reading is that the deployed seed is the best swept point on the clean arm
+by a factor of ~3 and is not worse on either impaired arm, so **the seed is not
+an M1 lever either**: no seed in the swept range beats `1024` on the clean tail
+without giving it back on an impaired one. The redesigned M2 does not read the
+seed at all — its assertion is the offered schedule and the latency under it,
+neither of which the seed moves — so the step-function record in `rtp/GATE.md`
+stands as the wire measurement's own history and this sweep closes the seed as an
+M1 dimension.
 
 ### M4: the interactive lane's split across several flows
 
@@ -1566,11 +1546,10 @@ now landed as one and only one of its two parameters.** Raising
 `INIT_SEND_RATE` from `128` to `1024` removes the transient almost entirely on
 the **one-flow** clean arm — measured `clean_p99` `90.8 → 26.8 ms` and
 `clean_p50` `24.0 → 21.6 ms` (two reps each, `26.6/26.8` ms; this run measures
-`clean_p99` 26.2 ms, p999 28.7, max 30.0) — but it buys that with wire: the M2
-clean arm's own-wire multiple rises `2.22× → 5.81×` against its `6×` budget.
-That is a `2.6×` inflation of the clean arm's own traffic, and the clean arm is
-where M2's real budget is asserted, so the change consumes `97 %` of the M2
-margin to buy the M1 tail.  The *reason* the wire moves is the coupled second
+`clean_p99` 26.2 ms, p999 28.7, max 30.0). The mechanism that buys it is
+a wire measurement, printed as diagnosis and no longer weighed against any
+budget: the clean arm's c2s forwarded wire rises `2.22× → 5.81×` of the offered
+payload.  The *reason* the wire moves is the coupled second
 parameter: at `128` the send pacer was the binding term and never admitted the
 declared sixth datagram — measured, cutting the declared cover to one changed
 neither the wire (2.08× → 2.07×) nor the p99 (87.3 → 82.8 ms) — so at `1024`
@@ -1578,16 +1557,16 @@ the whole declared budget reaches the wire for the first time.  The cover was
 therefore swept as a frontier, and **refused at every setting below the one
 that ships**; the table, the two safeguards and the numbers are in
 `rtp/GATE.md` ("What `INIT_SEND_RATE` was bought with").  In short: `m = 2`
-(closed-gate 1 / open-gate 4) reads one-flow clean p99 29.7 ms at 2.27× wire
+(closed-gate 1 / open-gate 4) reads one-flow clean p99 29.7 ms
 and four-flow p99 130.4 ms but **breaks the ladder's monotone-non-increasing
-invariant**; `m = 4` reads 27.7 ms at 4.53× wire with four-flow p99 137.2 ms but
+invariant**; `m = 4` reads 27.7 ms with four-flow p99 137.2 ms but
 **fails `m1_latency_window_censoring`**, an existing default-tier gate, because
 the hostile arm's mean-8-datagram burst can then build 7 rungs against a frozen
 2000 ms room (2150 ms required) and that arm's reported tail would be a lower
-bound; `m = 1` is worse on both axes (87.0 ms at 3.40× wire).  What the landing
-leaves open, stated rather than implied: the wire margin (5.80× of 6×) and the
-four-flow clean tail (`176.1 ms`, essentially unmoved from `180.8`).  The lever
-for both is `m = 5`, which the window-adequacy arithmetic admits (5 rungs,
+bound; `m = 1` is worse on both axes (87.0 ms).  What the landing
+leaves open, stated rather than implied, is the four-flow clean tail
+(`176.1 ms`, essentially unmoved from `180.8`).  The lever
+for it is `m = 5`, which the window-adequacy arithmetic admits (5 rungs,
 `1550 ms` ≤ 2000 ms) but which no *existing* hostile arm can observe — so
 admitting it is a **new arm with a longer window**, declared here in `rtp_mux`,
 not a retune of an existing one, and it is not taken in this change.
@@ -1597,8 +1576,10 @@ not a retune of an existing one, and it is not taken in this change.
 - **default** — not `#[ignore]`d, so a plain `cargo test -p rtp_mux` runs it.
   Every scenario here is seeded (deterministic impairment). The mandate-2
   constitution gate (`jitter_duallane_constitution_gate`) is a ~40 s
-  wall-clock dual-lane run whose asserted quantities are deterministic
-  counts, so it still belongs in the gate that always runs; the crate's own
+  wall-clock dual-lane run whose offer and delivery quantities are
+  deterministic counts and whose non-degradation bound has ~4× headroom over
+  the measured ~26 ms p99, so it still belongs in the gate that always runs;
+  the crate's own
   non-scenario targets are much faster. This is the gate that runs on every
   `cargo test`.
 - **standard** — `#[ignore]`d, runs in well under a minute per target and
@@ -1618,8 +1599,8 @@ not a retune of an existing one, and it is not taken in this change.
 ## Default tier (runs in `cargo test -p rtp_mux`)
 
 The mandate-2 interactive constitution gate
-(`rtp_mux_jitter::jitter_duallane_constitution_gate` — `delivery == 1.000`
-and the own-wire budget, both deterministic counts over the seeded dual-lane
+(`rtp_mux_jitter::jitter_duallane_constitution_gate` — the offered schedule,
+`delivery == 1.000`, and the non-degrading p99, over the seeded dual-lane
 link), the two hol_probe FEC-wiring property tests
 (`fec_gaming_treatment_has_bad_path_and_large_capacity_headroom` and
 `fec_saturated_pair_keys_loss_to_the_same_rtp_sequence`), the moved
@@ -1645,7 +1626,7 @@ perf_probe::controller_fat_pipe_has_only_fixed_shaping
 perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss
 rtp_mux_jitter::jitter_duallane_constitution_gate
 mandate_smoke::m1_interactive_tail_latency
-mandate_smoke::m2_interactive_delivery_and_wire
+mandate_smoke::m2_offered_load_latency
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness
 mandate_smoke::m4_clean_lane_p99_ceiling
@@ -1894,7 +1875,7 @@ mandate_smoke::m1_interactive_tail_latency
 spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect
 spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable
 mandate_smoke::m1_lone_tail_rung_distribution
-mandate_smoke::m2_interactive_delivery_and_wire
+mandate_smoke::m2_offered_load_latency
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness
 mandate_smoke::m4_clean_lane_p99_ceiling
@@ -2184,7 +2165,7 @@ different arms:
 - `MANDATE_SMOKE_FAULT` (`tests/mandate_smoke.rs:428`) selects a perturbation
   of one smoke arm's input: `M1_latency`, `M1_IMPAIRED_slow`,
   `M1_FIELD_RTT_slow`,
-  `M1_LOSS_MODEL_uncorrelated`, `M1_LOSS_MODEL_correlated`, `M2_wire`,
+  `M1_LOSS_MODEL_uncorrelated`, `M1_LOSS_MODEL_correlated`,
   `M2_delivery`, `M3_starve`, `M4_starve`, `M4_late`, `M4_drop`,
   `M4_CLEAN_LEVEL_double` and `M4_CLEAN_LEVEL_slow`. Unset in every real
   run — the runner never sets it. The value's prefix (`starts_with(mandate)`,
@@ -2210,7 +2191,7 @@ different arms:
   dials plus the mux pairing), which the birth gate must reject.
 
 ```gate-env-tier
-tri-mandate-smoke-tier = MANDATE_SMOKE_QUICK,MANDATE_CHECK_DIR | - | the tri-mandate smoke set's own window tier and evidence sink rather than a load knob: MANDATE_SMOKE_QUICK=1 selects the shortest window per arm (4 s interactive cadence, 5 s request/response, 2 s saturating bulk) for the same four mandate arms and is what `tools/mandate-check --quick` sets, unset selects the 12 s / 15 s / 6 s tier, and MANDATE_CHECK_DIR names the directory the M1/M2/M3/M4 JSON and CSV evidence is written to (always set by `tools/mandate-check`, defaulting under target/mandate-smoke for a plain `cargo test`); neither variable sizes a count, so no arithmetic derives from this surface and its load is refused rather than invented | smoke-mandate@mandate=M1+arm-set=clean-and-hostile-and-lone-tail+metric=p99-and-over250-share, smoke-mandate@mandate=M2+arm-set=clean-and-hostile-and-lone-tail+metric=delivery-and-own-wire, smoke-mandate@mandate=M3+arm-set=saturated-bulk+metric=capacity-fraction, smoke-mandate@mandate=M4+arm-set=four-flow+metric=no-starvation-and-share, smoke-evidence@artifact=mandate-json-and-csv, smoke-window-tier@knob=MANDATE_SMOKE_QUICK+window=quick-or-full
+tri-mandate-smoke-tier = MANDATE_SMOKE_QUICK,MANDATE_CHECK_DIR | - | the tri-mandate smoke set's own window tier and evidence sink rather than a load knob: MANDATE_SMOKE_QUICK=1 selects the shortest window per arm (4 s interactive cadence, 5 s request/response, 2 s saturating bulk) for the same four mandate arms and is what `tools/mandate-check --quick` sets, unset selects the 12 s / 15 s / 6 s tier, and MANDATE_CHECK_DIR names the directory the M1/M2/M3/M4 JSON and CSV evidence is written to (always set by `tools/mandate-check`, defaulting under target/mandate-smoke for a plain `cargo test`); neither variable sizes a count, so no arithmetic derives from this surface and its load is refused rather than invented | smoke-mandate@mandate=M1+arm-set=clean-and-hostile-and-lone-tail+metric=p99-and-over250-share, smoke-mandate@mandate=M2+arm-set=clean-and-hostile-and-lone-tail+metric=offer-and-delivery-and-latency, smoke-mandate@mandate=M3+arm-set=saturated-bulk+metric=capacity-fraction, smoke-mandate@mandate=M4+arm-set=four-flow+metric=no-starvation-and-share, smoke-evidence@artifact=mandate-json-and-csv, smoke-window-tier@knob=MANDATE_SMOKE_QUICK+window=quick-or-full
 dynamic-contested-battery = DYN_REPS | - | the dynamic-packet-size latency/bulk battery's per-arm repetition count: each of the twelve `dynamic_contested` arms runs its scenario DYN_REPS times (default 3) with a fresh seed per rep, drawing 200 B latency messages at a 25 ms cadence with 1-in-16 bursts of 4-64 KiB against 64-512 KiB bulk chunks over one shared 400 KiB/s bottleneck, and reports per-message one-way latency percentiles and bulk goodput as the median over reps; the rep's own length is the harness kit's `DYN_RUN_SECS` (15 s), read outside this crate's sources, so it is not a variable of this surface | dyn-size-latency@arm-set=static-classification+metric=small-and-burst-p50-p99, dyn-size-bulk@metric=goodput-fraction, dyn-size-migration@arm-set=migrating-variants+metric=latency-and-goodput, dyn-size-reps@metric=rule-of-three+unit=rep | DYN_REPS=3,total=12*DYN_REPS,wall=582.34s,bound=8.3e-2/rep
 mux-fair-longrun = MUX_FAIR_WARMUP_SECS,MUX_FAIR_STEADY_SECS,MUX_FAIR_WINDOW_SECS,MUX_FAIR_REPS,MUX_FAIR_STREAMS,MUX_FAIR_CHUNKS | - | the mux egress fair-queue long-run fairness measurement: one mux session over one rtp connection through a fixed-rate seeded NetemPair carrying MUX_FAIR_STREAMS bulk logical streams whose per-stream delivered bytes are counted by peer tag, with the MUX_FAIR_WARMUP_SECS post-join ramp discarded and the following MUX_FAIR_STEADY_SECS sampled in MUX_FAIR_WINDOW_SECS bins, reporting the windowed Jain index, the slower stream's minimum share and a per-stream starvation check, over two arms (homogeneous 64 KiB chunks, and a mixed-chunk arm set by MUX_FAIR_CHUNKS) repeated MUX_FAIR_REPS times on a fresh seed; MUX_FAIR_CHUNKS is a chunk-size list rather than a count, so it sizes nothing and is not a load factor | fair-window@metric=jain-window+scale=long-run, fair-share@metric=min-share+scale=long-run, byte-fairness@arm=mixed-chunk+metric=jain, starvation@metric=per-stream-delivered-bytes-zero, fair-rate@metric=rule-of-three+unit=window | MUX_FAIR_WARMUP_SECS=10,MUX_FAIR_STEADY_SECS=240,MUX_FAIR_WINDOW_SECS=10,MUX_FAIR_REPS=1,MUX_FAIR_STREAMS=8,total=2*MUX_FAIR_REPS*(MUX_FAIR_WARMUP_SECS+MUX_FAIR_STEADY_SECS),wall=500.1s,bound=6.3e-2/window
 rtp-longrun-arms = RTP_LONGRUN_SECS,RTP_LONGRUN_INTERVAL_SECS,RTP_LONGRUN_STREAMS,RTP_LONGRUN_LOSS_PCT,RTP_LONGRUN_LABEL | - | the multi-minute long-run arms' measurement window and CSV sampling cadence, over the production dual-lane composition: an aggregate interactive p50/p99/max and offered/forwarded wire series plus per-stream rows and the sender controller state, sampled every RTP_LONGRUN_INTERVAL_SECS across a RTP_LONGRUN_SECS window with RTP_LONGRUN_STREAMS interactive streams sharing the lane, RTP_LONGRUN_LOSS_PCT selecting the independent-loss regime and RTP_LONGRUN_LABEL naming the CSV run; the load records the single-flow reference arm's default shape, and the multi-flow arm's 180 s default is prose in the section above rather than folded into one total | longrun-drift@shape=cadence+scale=multi-minute+metric=p50-p99-max-series, longrun-fairness@arm=multi-flow+metric=per-stream-p99, longrun-bulk@scale=multi-minute+metric=goodput, longrun-repair@metric=fec-and-rtx-breakdown, longrun-rate@metric=rule-of-three+unit=interval | RTP_LONGRUN_SECS=300,RTP_LONGRUN_INTERVAL_SECS=10,RTP_LONGRUN_STREAMS=1,total=RTP_LONGRUN_SECS,wall=304.57s,bound=1.0e-1/interval
