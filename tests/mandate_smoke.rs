@@ -221,6 +221,149 @@ const M2_HOSTILE_WIRE_GUARD_X: f64 = 10.0;
 /// 6.22-7.17x (over the 6x budget) and the smoke arm 6.07-6.41x; ~2x the top.
 const M2_LONE_WIRE_GUARD_X: f64 = 14.0;
 
+// ───────── the deployed baseline the impaired tail must not regress past ─────
+
+/// One impaired arm's recorded **deployed** baseline: the `rtp` `v0.0.98`
+/// source (`rtp` dev `559fc2b3` — pacer seed `INIT_SEND_RATE = 1024` with the
+/// fresh-tail armour cover at 4/5 copies, `m = 6`), measured as six full-window
+/// reps of the very arms below on this revision: same seeds, windows, cadence,
+/// impairment and bulk shape.
+///
+/// `p99_ms`/`p999_ms` are the six reps' **medians**; `p99_bound_ms`/
+/// `p999_bound_ms` are the same reps' **mean plus three sample standard
+/// deviations**, rounded up to the next whole millisecond. The bound is a
+/// *derived* limit, not a round number: M1 is a hard floor, so an impaired arm
+/// whose tail exceeds the band its own baseline repeats showed is rejected
+/// rather than weighed against M2's wire budget or the clean arm. The reps'
+/// own ranges are carried beside the values so the derivation is checkable,
+/// and [`m1_impaired_baseline_rows`] prints the comparison with every run.
+///
+/// The clean arm and the wire multiples are recorded with the same baseline in
+/// `rtp_mux/GATE.md` ("The deployed baseline the impaired tail must not regress
+/// past"): clean `p99` **26.5 ms** (median of the same six reps, bound 27 ms),
+/// own-wire multiples **clean 5.82x, hostile 6.56x, lone_tail 6.11x**, and the
+/// M2 owner gate (`jitter_duallane_constitution_gate`, the 40 msg/s `both` arm)
+/// at **6.85x** against its 6x budget — the breach the revert restores and the
+/// seed dimension cannot repair without a 3.2x clean-arm p99 regression (the
+/// sweep table is in `GATE.md`).
+struct M1ImpairedBaseline {
+    arm: &'static str,
+    p99_ms: f64,
+    p99_bound_ms: f64,
+    p99_reps_min: f64,
+    p99_reps_max: f64,
+    p999_ms: f64,
+    p999_bound_ms: f64,
+    p999_reps_min: f64,
+    p999_reps_max: f64,
+}
+
+/// Reps behind every recorded value above.
+const M1_IMPAIRED_BASELINE_REPS: usize = 6;
+
+/// The deployed `rtp v0.0.98` impaired arms, six full-window reps each. The
+/// per-arm p99 reps are `hostile` 218.4/156.7/210.7/168.6/164.7/152.3 and
+/// `lone_tail` 155.2/176.5/162.8/177.1/151.3/151.2; the p999 reps are
+/// `hostile` 306.3/226.9/255.2/225.2/208.7/243.4 and `lone_tail`
+/// 670.4/937.3/198.6/410.9/288.4/267.5. The `lone_tail` p999 bound is wide
+/// (1.3-4.4x its median) because that arm's heaviest recovery episode lands in
+/// a 15 s window or does not: the p99 bounds carry the teeth, and the p999
+/// bound still rejects a doubling of the ladder's height.
+const M1_IMPAIRED_BASELINE: [M1ImpairedBaseline; 2] = [
+    M1ImpairedBaseline {
+        arm: "hostile",
+        p99_ms: 166.7,
+        p99_bound_ms: 265.0,
+        p99_reps_min: 152.3,
+        p99_reps_max: 218.4,
+        p999_ms: 235.2,
+        p999_bound_ms: 348.0,
+        p999_reps_min: 208.7,
+        p999_reps_max: 306.3,
+    },
+    M1ImpairedBaseline {
+        arm: "lone_tail",
+        p99_ms: 159.0,
+        p99_bound_ms: 199.0,
+        p99_reps_min: 151.2,
+        p99_reps_max: 177.1,
+        p999_ms: 349.7,
+        p999_bound_ms: 1321.0,
+        p999_reps_min: 198.6,
+        p999_reps_max: 937.3,
+    },
+];
+
+/// Read one impaired arm against its recorded deployed baseline: one
+/// `(row, failure)` pair per guarded metric (p99, p999). The row carries the
+/// observation, the recorded baseline, the bound, the reps and the direction,
+/// so the run's own log is the comparison; the failure is `Some` only when the
+/// arm regressed past the bound, and names the arm, the metric, the baseline
+/// value, the observed value and the direction the way the M2 owner gate names
+/// its own breach. `arm` is an arm of [`M1ImpairedBaseline`], so a caller that
+/// passes the clean arm gets no rows: the clean arm is recorded but not
+/// guarded here (M1's mandate bound already asserts it).
+fn m1_impaired_baseline_rows(run: &ArmRun) -> Vec<(String, Option<String>)> {
+    let Some(baseline) = M1_IMPAIRED_BASELINE
+        .iter()
+        .find(|baseline| baseline.arm == run.name)
+    else {
+        return Vec::new();
+    };
+    let metrics = [
+        (
+            "p99",
+            run.summary.p99,
+            baseline.p99_ms,
+            baseline.p99_bound_ms,
+            baseline.p99_reps_min,
+            baseline.p99_reps_max,
+        ),
+        (
+            "p999",
+            run.summary.p999,
+            baseline.p999_ms,
+            baseline.p999_bound_ms,
+            baseline.p999_reps_min,
+            baseline.p999_reps_max,
+        ),
+    ];
+    let mut out = Vec::new();
+    for (metric, observed, recorded, bound, reps_min, reps_max) in metrics {
+        let row = format!(
+            "[m1-baseline] arm={arm:<10} metric={metric:<4} observed={observed:8.1} \
+             baseline_v0.0.98={recorded:8.1} bound={bound:8.1} reps={reps} \
+             baseline_reps_range={lo:.1}..{hi:.1} verdict={verdict}\n",
+            arm = baseline.arm,
+            reps = M1_IMPAIRED_BASELINE_REPS,
+            lo = reps_min,
+            hi = reps_max,
+            verdict = if observed <= bound { "OK" } else { "REGRESSED" },
+        );
+        let failure = (observed > bound).then(|| {
+            format!(
+                "[M1] the {arm} arm's {metric} is {observed:.1} ms — WORSE than the deployed rtp v0.0.98 \
+                 baseline ({recorded:.1} ms over {reps} reps, whose range was {lo:.1}-{hi:.1} ms) beyond its \
+                 derived bound {bound:.1} ms (those reps' mean + 3 sample standard deviations): {pct:+.1}% \
+                 against the recorded baseline. M1's impaired tail is a hard floor — it must not be traded for \
+                 M2's wire budget or the clean arm, and a candidate that does is rejected here rather than \
+                 absorbed inside a guard.",
+                arm = baseline.arm,
+                metric = metric,
+                observed = observed,
+                recorded = recorded,
+                reps = M1_IMPAIRED_BASELINE_REPS,
+                lo = reps_min,
+                hi = reps_max,
+                bound = bound,
+                pct = 100.0 * (observed / recorded - 1.0),
+            )
+        });
+        out.push((row, failure));
+    }
+    out
+}
+
 // ─────────────────────────────── diagnostics ─────────────────────────────────
 
 /// Serialises the three mandate measurements: this target is run with no
@@ -272,7 +415,8 @@ fn out_dir() -> PathBuf {
 }
 
 /// The deliberate-fault selector used only by the vacuity demonstrations:
-/// `M1_latency`, `M1_FIELD_RTT_slow`, `M1_LOSS_MODEL_uncorrelated`,
+/// `M1_latency`, `M1_IMPAIRED_slow`, `M1_FIELD_RTT_slow`,
+/// `M1_LOSS_MODEL_uncorrelated`,
 /// `M1_LOSS_MODEL_correlated`, `M2_wire`, `M2_delivery`, `M3_starve`,
 /// `M4_starve`, `M4_late`, `M4_drop`, `M4_CLEAN_LEVEL_double` or
 /// `M4_CLEAN_LEVEL_slow`. Unset in every real
@@ -296,6 +440,15 @@ fn prompt_tuning() -> rtp::FecTuning {
         small_group_parity_count: 1,
     }
 }
+
+/// One-way delay `MANDATE_SMOKE_FAULT=M1_IMPAIRED_slow` adds to **both**
+/// impaired arms' links. It is a deterministic input perturbation, one ladder
+/// step and a half, so the red proof of the deployed-baseline bound is
+/// reproducible rather than a draw: the bound it must cross is
+/// [`M1_IMPAIRED_BASELINE`]'s tightest value (`lone_tail` p99, 199 ms) while
+/// the arm's own guards sit at 900 ms and 3200 ms, so the failure names the
+/// baseline gate and not a superseded tripwire.
+const IMPAIRED_TAIL_FAULT_SHIFT_MS: u64 = 300;
 
 // ────────────────────────────── arm definitions ──────────────────────────────
 
@@ -409,6 +562,21 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
         }
     }
     let cadence = cadence_window();
+    // The impaired arms' degeneracy, and the red proof of the deployed-baseline
+    // bound: `M1_IMPAIRED_slow` shifts the hostile *and* lone_tail links by one
+    // fixed delay, so the tail those arms report is produced by their own
+    // impairment rather than by an assertion. The clean arm is untouched, so a
+    // probe of the bound cannot read as a probe of the mandate ceiling.
+    let impaired_shift = if fault("M1_IMPAIRED").is_some() {
+        Duration::from_millis(IMPAIRED_TAIL_FAULT_SHIFT_MS)
+    } else {
+        Duration::ZERO
+    };
+    let impaired_link = |seed: u64| {
+        let mut link = hostile_link(seed);
+        link.latency += impaired_shift;
+        link
+    };
     vec![
         ArmSpec {
             name: "clean",
@@ -421,8 +589,8 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
         },
         ArmSpec {
             name: "hostile",
-            int_c2s: hostile_link(41),
-            int_s2c: hostile_link(42),
+            int_c2s: impaired_link(41),
+            int_s2c: impaired_link(42),
             bulk: true,
             load: Load::Cadence,
             window: cadence,
@@ -430,8 +598,8 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
         },
         ArmSpec {
             name: "lone_tail",
-            int_c2s: hostile_link(41),
-            int_s2c: hostile_link(42),
+            int_c2s: impaired_link(41),
+            int_s2c: impaired_link(42),
             bulk: false,
             load: Load::RequestResponse { depth: 1 },
             window: rr_window(),
@@ -1399,13 +1567,28 @@ async fn m1_interactive_tail_latency() {
     let clean = &runs[0];
     let hostile = &runs[1];
     let lone = &runs[2];
+    // The deployed baseline the impaired tail must not regress past, read and
+    // printed for every impaired arm before the guards below: a candidate that
+    // is worse on either arm's p99 or p999 is rejected here (the failure names
+    // the arm, the metric, the baseline value, the observed value and the
+    // direction) rather than weighed against M2's wire budget or the clean arm.
+    let mut impaired_regressions = Vec::new();
+    for run in [hostile, lone] {
+        for (row, failure) in m1_impaired_baseline_rows(run) {
+            print_censoring_row(&row);
+            if let Some(failure) = failure {
+                impaired_regressions.push(failure);
+            }
+        }
+    }
     let pass = clean.summary.p99 <= M1_CEILING_MS
         && over250_count(&clean.samples) == 0
         && hostile.summary.p99 <= M1_HOSTILE_P99_GUARD_MS
         && over250_pct(&hostile.samples) <= M1_HOSTILE_OVER250_GUARD_PCT
         && lone.summary.p99 <= M1_LONE_P99_GUARD_MS
         && lone.summary.p999 <= M1_LONE_P999_GUARD_MS
-        && over250_pct(&lone.samples) <= M1_LONE_OVER250_GUARD_PCT;
+        && over250_pct(&lone.samples) <= M1_LONE_OVER250_GUARD_PCT
+        && impaired_regressions.is_empty();
     println!(
         "MANDATE M1 {} clean_p50={:.1} clean_p90={:.1} clean_p99={:.1} clean_p999={:.1} clean_max={:.1} clean_over250={} hostile_p50={:.1} hostile_p90={:.1} hostile_p99={:.1} hostile_p999={:.1} hostile_max={:.1} hostile_over250={} lone_p50={:.1} lone_p90={:.1} lone_p99={:.1} lone_p999={:.1} lone_max={:.1} lone_over250={} ceiling={:.1} hostile_p99_guard={:.1} hostile_over250_guard={:.1} lone_p99_guard={:.1} lone_p999_guard={:.1} lone_over250_guard={:.1}",
         verdict(pass),
@@ -1435,6 +1618,17 @@ async fn m1_interactive_tail_latency() {
         M1_LONE_OVER250_GUARD_PCT,
     );
 
+    // The deployed-baseline non-regression gate, and the **first** assertion of
+    // the mandate: it carries the tightest bound on each impaired arm (265 ms
+    // against the 900 ms guard, 199 ms against the 3200 ms guard), and the
+    // standing rule is that an impaired tail may not regress at all, so a
+    // candidate that bought M2's wire or the clean arm at the impaired tail's
+    // expense reports here rather than inside a superseded tripwire.
+    assert!(
+        impaired_regressions.is_empty(),
+        "[M1] the impaired tail regressed past the deployed rtp v0.0.98 baseline:\n{}",
+        impaired_regressions.join("\n"),
+    );
     assert!(
         clean.summary.p99 <= M1_CEILING_MS,
         "[M1] clean-arm p99 {:.1} ms exceeds the {M1_CEILING_MS} ms ceiling: the interactive tail must stay at the one-way floor on the mild 2% iid arm",

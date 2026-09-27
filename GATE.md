@@ -1196,6 +1196,146 @@ room, and its position at the edge is the offer window closing rather than the
 ladder being cut off. No arm was retuned and no arm was added, because none was
 needed: **the windows were already sufficient, and the battery could not tell.**
 
+### The deployed baseline the impaired tail must not regress past
+
+**M1 is a hard floor, not a point on a frontier.** An impaired arm's tail is
+not a cost to weigh against M2's wire budget or the clean arm: a candidate that
+raises any impaired arm's `p99` or `p999` past the band the deployed baseline's
+own repeats showed is **rejected**, and where a change improves the clean arm or
+M2 while raising an impaired tail against a change that does neither, the one
+that does neither is chosen. That rule is a **mechanism**, not a judgement:
+`mandate_smoke::m1_interactive_tail_latency` (default tier, the arm the M1
+mandate already asserts on — no arm, window, cadence, seed, tier or existing
+threshold moved) now carries a recorded per-arm baseline and fails by name when
+a candidate is worse on it.
+
+**The recorded baseline is the deployed `rtp v0.0.98` transport** (`rtp dev
+559fc2b3`: pacer seed `INIT_SEND_RATE = 1024` with the fresh-tail armour cover
+at 4/5 copies, `m = 6`), measured as **six full-window reps** of the very arms
+below on the rebased tree — same seeds, windows, cadence, impairment and bulk
+shape. `p99_ms`/`p999_ms` are those reps' **medians**; the bound is the same
+reps' **mean + three sample standard deviations**, rounded up to the next whole
+millisecond — a derived limit, not a round number, and one that the six
+baseline reps themselves all clear:
+
+| arm | `p99` median | `p99` reps | `p99` bound (mean+3sd) | `p999` median | `p999` reps | `p999` bound |
+| --- | --- | --- | --- | --- | --- | --- |
+| `hostile` | 166.7 ms | 152.3–218.4 | **265 ms** | 235.2 ms | 208.7–306.3 | **348 ms** |
+| `lone_tail` | 159.0 ms | 151.2–177.1 | **199 ms** | 349.7 ms | 198.6–937.3 | **1321 ms** |
+
+The same six reps record the rest of the baseline for the reader, and are
+asserted nowhere because each mandate already owns its own bound: **clean
+`p99` 26.5 ms** (reps 26.1–26.6, bound 27 ms), own-wire multiples **clean
+5.82x, hostile 6.56x, lone_tail 6.11x**, and the **M2 owner gate**
+(`rtp_mux_jitter::jitter_duallane_constitution_gate`, the 40 msg/s `both` arm)
+at **6.85x** — three reps reading 6.85/6.85/6.85 against its 6x budget, i.e.
+a live breach the deployed baseline itself carries. That breach is stated
+rather than repaired here because the working rule is M1 first: the revert
+restores the impaired tail at M2's expense, and the dimension that was supposed
+to pay for it does not (below).
+
+**The bound is a distributional limit and its sensitivity is the arms' own.**
+The `lone_tail` `p999` band is wide (its reps span 198.6–937.3 ms, 4.7x) because
+that arm's heaviest recovery episode lands inside a 15 s window or does not, so
+that assertion is a coarse tripwire; the two `p99` assertions carry the teeth,
+and `p999` still rejects a doubling of the ladder's height (the `>250 ms`
+shares, the wire and every other reading stay printed on the arm line). The
+band is **not** an artefact of the configuration the reps were taken in: four
+further runs of the same arms in the runner's own configuration (libtest's
+default threading, six concurrent tests — `m1_interactive_tail_latency` run
+three times without `--test-threads=1`, plus the full `tools/mandate-check` run)
+read `hostile p99` 221.8 / 156.9 / 128.0 / 127.8 ms, `hostile p999` 252.9 /
+214.6 / 170.3 / 156.9, `lone_tail p99` 155.1 / 184.4 / 175.2 / 148.0 and
+`lone_tail p999` 234.6 / 282.0 / 258.5 / 247.6 — every one inside the recorded
+bounds, the tightest being `lone_tail p99` at 184.4 ms against 199 ms. The
+gate prints one `[m1-baseline]` row per arm and metric — observation, recorded
+baseline, bound, rep count, the reps' own range and the verdict — so a
+borderline pass is visible in the run's log instead of being inferred from a
+verdict string.
+
+**Its vacuity demonstration, and what it says about the cover reduction.**
+The gate is red when the property it guards is broken, and the proof is a
+**deterministic input perturbation** rather than a draw:
+`MANDATE_SMOKE_FAULT=M1_IMPAIRED_slow` adds one fixed 300 ms one-way delay to
+the `hostile` **and** `lone_tail` links (the clean arm untouched, so a probe of
+the bound cannot read as a probe of the mandate ceiling), and the arm then
+reads
+
+```
+[m1-baseline] arm=hostile    metric=p99  observed=  1924.2 baseline_v0.0.98=   166.7 bound=   265.0 reps=6 baseline_reps_range=152.3..218.4 verdict=REGRESSED
+[m1-baseline] arm=hostile    metric=p999 observed=  1969.4 baseline_v0.0.98=   235.2 bound=   348.0 reps=6 baseline_reps_range=208.7..306.3 verdict=REGRESSED
+[m1-baseline] arm=lone_tail  metric=p99  observed=   720.4 baseline_v0.0.98=   159.0 bound=   199.0 reps=6 baseline_reps_range=151.2..177.1 verdict=REGRESSED
+[m1-baseline] arm=lone_tail  metric=p999 observed=   720.4 baseline_v0.0.98=   349.7 bound=  1321.0 reps=6 baseline_reps_range=198.6..937.3 verdict=OK
+[M1] the hostile arm's p99 is 1924.2 ms — WORSE than the deployed rtp v0.0.98 baseline (166.7 ms over 6 reps, whose range was 152.3-218.4 ms) beyond its derived bound 265.0 ms (those reps' mean + 3 sample standard deviations): +1054.3% against the recorded baseline. M1's impaired tail is a hard floor — it must not be traded for M2's wire budget or the clean arm, and a candidate that does is rejected here rather than absorbed inside a guard.
+```
+
+and the test fails with three of the four baseline metrics `REGRESSED`. The
+fault is a *level* shift, so the message the run shows is the one the standing
+rule names; the assertion is placed first among M1's impaired-arm assertions
+for the same reason (265 ms is the tightest bound any of them carries), so a
+candidate that regressed is reported against the deployed baseline rather than
+inside a superseded tripwire. No existing guard is loosened, removed or
+reordered: they remain, and still fire for the failures that move a share or a
+count without moving these percentiles.
+
+**The honest counterpart — the production lever itself.** The change the M2
+wire budget is *actually* bought with is the fresh-tail armour cover, and two
+runs with it removed (`FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY` /
+`..._NO_PARITY` 4/5 -> 0/0) read `lone_tail p99` 264.2 ms (past the 199 ms
+bound, `REGRESSED`) and 184.5 ms (inside it, `OK`): a **production** mutation of
+that family trips this gate on one run in two, which is exactly why the red
+proof above is a deterministic input fault and not a production change — a
+one-off red is not a vacuity proof. And the rejected cover reduction itself
+(cover 3/4, `m = 5`) is **not** rejected by this gate at all: its three reps on
+the same tree read `hostile p99` 197.7/170.0/159.3 (against the baseline's
+152.3–218.4), `hostile p999` 237.8/227.8/194.6, `lone_tail p99`
+204.7/166.1/174.0 and `lone_tail p999` 429.1/334.3/244.7, none past its bound.
+So the `+47 %` `hostile p99` cost recorded for that change in `rtp/GATE.md`
+(`127.2 -> 187.2 ms`) is a **single-rep pair**: eleven reps of its own baseline
+(eight serialized, four in the runner's contended configuration) span
+119.6–221.8 ms, and the `m = 5` reps span 159.3–204.7 ms, so the two
+distributions overlap. The gate is therefore a *band* on the impaired tail —
+it has teeth against a ladder's worth of degradation, and a one-rung cover
+reduction is **smaller than this arm's own run-to-run spread**, so it is
+recorded as undetectable here rather than chased by tightening the bound until
+it fails. Closing that sensitivity needs more observation per arm (a
+median-of-N or a longer window), which is a **new** arm under the perf-test
+dual mandate and not a retune of this one.
+
+**The seed dimension, swept and refused.** `rtp/GATE.md` records the seed
+(`INIT_SEND_RATE`) as the one dimension never swept between the two values that
+were (`128` and `1024`) and names the M2 breach as the higher seed admitting
+armour the budget does not allow. It was swept at the deployed cover
+(`m = 6`), one dimension per arm, on this workspace's `rtp` revision, with the
+full-window `mandate_smoke` arm set and the M2 owner gate run rather than
+inferred:
+
+| seed | M2 owner gate (40 msg/s) | clean `p99` | `hostile p99` / `p999` | `lone_tail p99` / `p999` | clean own-wire |
+| --- | --- | --- | --- | --- | --- |
+| 128 | **3.68x** PASS | 87.6 ms | 202.1 / 297.4 | 156.7 / 239.3 | 2.10x |
+| 208 | **5.95x** PASS | 84.4 ms | 241.8 / 302.4 | 161.4 / 347.9 | 1.89x |
+| 256 | 6.82x FAIL | 85.6 ms | 198.2 / 231.6 | 161.1 / 910.0 | 1.90x |
+| 384 | 6.84x FAIL | 79.1 ms | 201.7 / 262.4 | 196.4 / 636.2 | 2.19x |
+| 512 | 6.85x FAIL | 29.5 ms | 271.0 / 331.2 | 161.1 / 528.1 | 2.92x |
+| 768 | 6.85x FAIL | 27.9 ms | 203.0 / 288.6 | 138.8 / 220.2 | 4.37x |
+| **1024 (deployed)** | 6.85x FAIL | **26.5 ms** | 166.7 / 235.2 | 159.0 / 349.7 | 5.82x |
+
+The owner gate is a step function of the seed, not a slope: the `both` arm
+offers 40 msg/s x 6 datagrams = 240 pkt/s, so every seed at or above `240`
+admits the whole declared cover and reads 6.82–6.85x, while `208` truncates it
+to 5.95x and `128` to 3.68x. **No seed in the range clears both floors.** Every
+M2-passing seed (`<= 208`) pays a **3.2x clean-arm `p99` regression** (26.5 ->
+84.4 ms at `208`, 87.6 ms at `128`) for an impaired tail that is *not* better
+(the `hostile p99` at `208`/`128` is 241.8/202.1 ms, at or above the deployed
+median 166.7 ms), and every seed that holds the clean arm (`>= 512`) carries the
+deployed M2 breach unchanged. The refusal is therefore quantified rather than
+asserted: **the deployed seed is the only point the constitution selects**, the
+seed is not a lever for the M2 breach, and the lever that would reduce the wire
+without deepening the ladder — armouring only an actually unacked tail, since
+the 40 msg/s owner gate pipelines its messages so most of its fresh tails are
+not lone — is named in `rtp/GATE.md` as the change that is not attempted here
+and would need its own M1 measurement.
+
 ### M4: the interactive lane's split across several flows
 
 M1 and M2 each measure **one** interactive flow, so a mandate result obtained
@@ -2041,17 +2181,20 @@ this row carries no load: a `total` over these names would be invented
 arithmetic, and the grammar has no line for one. They belong to four
 different arms:
 
-- `MANDATE_SMOKE_FAULT` (`tests/mandate_smoke.rs:272`) selects a perturbation
-  of one smoke arm's input: `M1_latency`, `M1_FIELD_RTT_slow`,
+- `MANDATE_SMOKE_FAULT` (`tests/mandate_smoke.rs:428`) selects a perturbation
+  of one smoke arm's input: `M1_latency`, `M1_IMPAIRED_slow`,
+  `M1_FIELD_RTT_slow`,
   `M1_LOSS_MODEL_uncorrelated`, `M1_LOSS_MODEL_correlated`, `M2_wire`,
   `M2_delivery`, `M3_starve`, `M4_starve`, `M4_late`, `M4_drop`,
   `M4_CLEAN_LEVEL_double` and `M4_CLEAN_LEVEL_slow`. Unset in every real
   run — the runner never sets it. The value's prefix (`starts_with(mandate)`,
-  `:271-278`) names the arm whose input is perturbed, and each arm's own
+  `:431`) names the arm whose input is perturbed, and each arm's own
   matcher then tests the value it owns; an arm that does not own the selected
-  value leaves its input alone (`_ => {}`, `:398`). The two `M4_CLEAN_LEVEL_*`
+  value leaves its input alone (`_ => {}`, `:561`). The two `M4_CLEAN_LEVEL_*`
   values name the four-flow level arm's own namespace so that probing *its*
-  assertion cannot read as probing M4's.
+  assertion cannot read as probing M4's; `M1_IMPAIRED_slow` (one fixed 300 ms
+  one-way delay on the `hostile` and `lone_tail` links, clean arm untouched) is
+  the red proof of the deployed-baseline bound above.
 - `HOL_PROBE_FAULT` (`tests/hol_probe.rs:2377`) selects the two offering
   faults the concurrent frame-delivery arms' red proof uses: `serialize`
   (only the first flow may offer until its window closes) and `throttle`
