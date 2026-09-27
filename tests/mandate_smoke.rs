@@ -49,7 +49,9 @@
 //! they assert a *regression bound* derived from that measurement with
 //! documented headroom instead of a bound that is currently false. **M2**
 //! asserts, on `clean`, that the lane was **offered the known throughput**
-//! (`MSG_BYTES / CADENCE`, read from the measured `sent`), that it
+//! (`MSG_BYTES / CADENCE`, read from the measured `sent`, written on an
+//! absolute-deadline schedule so the host's timer cannot cut the offer and a
+//! shortfall means the lane would not take the load), that it
 //! **delivered** all of it (`delivery == 1.000`), and that its **latency did
 //! not degrade under that offer** (`p99 <= M2_NONDEGRADING_P99_MS`); the
 //! hostile and lone-tail arms keep their delivery floors as regression guards.
@@ -224,10 +226,16 @@ const M2_HOSTILE_DELIVERY_FLOOR: f64 = 0.995;
 /// M2 lone-tail delivery floor (measured 1.000).
 const M2_LONE_DELIVERY_FLOOR: f64 = 0.995;
 /// How far the measured offer count may fall below the arm's schedule before
-/// the lane is no longer being offered the mandate's known throughput. The
-/// cadence sender starts its first interval after the window opens and the
-/// measured runs land at 2395-2400 of 2400 messages (0.2 %), so 2 % is slack
-/// for scheduler jitter rather than a tolerance on the offer itself.
+/// the lane is no longer being offered the mandate's known throughput.
+///
+/// The tolerance is slack for **the transport refusing writes**, not for the
+/// sender's schedule: `offer_cadence_on_deadline` owes its schedule the message
+/// count by construction, so on an idle host the arms land on exactly 2400 of
+/// 2400 and a shortfall means the lane would not take the load. It was
+/// originally documented as slack for scheduler jitter, which was the wrong
+/// instrument: the wake-count sender it was written for lost whole ticks on a
+/// loaded host (2313 and 2300 of 2400 at load average 31), so the tolerance was
+/// silently absorbing the host's scheduling rather than any refusal.
 const M2_OFFER_TOLERANCE: f64 = 0.02;
 
 // ───────── the deployed baseline the impaired tail must not regress past ─────
@@ -534,7 +542,7 @@ fn out_dir() -> PathBuf {
 /// The deliberate-fault selector used only by the vacuity demonstrations:
 /// `M1_latency`, `M1_IMPAIRED_slow`, `M1_FIELD_RTT_slow`,
 /// `M1_LOSS_MODEL_uncorrelated`,
-/// `M1_LOSS_MODEL_correlated`, `M2_delivery`, `M3_starve`,
+/// `M1_LOSS_MODEL_correlated`, `M2_delivery`, `M2_offer`, `M3_starve`,
 /// `M4_starve`, `M4_late`, `M4_drop`, `M4_CLEAN_LEVEL_double` or
 /// `M4_CLEAN_LEVEL_slow`. Unset in every real
 /// run (the runner never sets it). Faults perturb an arm's *input* — the
@@ -571,8 +579,16 @@ const IMPAIRED_TAIL_FAULT_SHIFT_MS: u64 = 300;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Load {
-    Cadence,
-    RequestResponse { depth: usize },
+    /// One [`MSG_BYTES`] message every `CADENCE * cadence_divisor`. The offer is
+    /// the arm's *input*, so its schedule belongs to the arm; `cadence_divisor`
+    /// is 1 for every real arm and is what the `M2_offer` fault raises to offer
+    /// a fraction of the cadence the mandate names.
+    Cadence {
+        cadence_divisor: u32,
+    },
+    RequestResponse {
+        depth: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -653,7 +669,7 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
     let mut clean_c2s = link(41, OWD, JITTER, LOSS_2, 0);
     let mut clean_s2c = link(42, OWD, JITTER, LOSS_2, 0);
     let clean_bulk = true;
-    let clean_load = Load::Cadence;
+    let mut clean_cadence_divisor = 1u32;
     let clean_window = cadence_window();
     if let Some(fault) = clean_fault.as_deref() {
         match fault {
@@ -670,6 +686,12 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
                 clean_c2s.loss = loss_pct(90);
                 clean_s2c.loss = loss_pct(90);
             }
+            // Offer the clean arm a tenth of the cadence the mandate names:
+            // the lane is healthy and delivers everything it is offered, so the
+            // only clause that can fail is the offer — the vacuity
+            // demonstration for M2's offer floor, which is the premise that
+            // stops the latency assertion passing against an unloaded lane.
+            "M2_offer" => clean_cadence_divisor = 10,
             _ => {}
         }
     }
@@ -695,7 +717,9 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
             int_c2s: clean_c2s,
             int_s2c: clean_s2c,
             bulk: clean_bulk,
-            load: clean_load,
+            load: Load::Cadence {
+                cadence_divisor: clean_cadence_divisor,
+            },
             window: clean_window,
             msg_bytes: MSG_BYTES,
         },
@@ -704,7 +728,7 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
             int_c2s: impaired_link(41),
             int_s2c: impaired_link(42),
             bulk: true,
-            load: Load::Cadence,
+            load: Load::Cadence { cadence_divisor: 1 },
             window: cadence,
             msg_bytes: MSG_BYTES,
         },
@@ -844,6 +868,72 @@ async fn periodic_burst(
     written
 }
 
+/// Offer one timestamped [`MSG_BYTES`] message per `interval` over `run_for`
+/// on an **absolute-deadline schedule**, returning how many the transport
+/// accepted.
+///
+/// The arm's offer is M2's *input* — the known throughput the mandate names —
+/// so it must be a property of the schedule rather than of the test host's
+/// ability to wake a 200 Hz timer. The pinned cadence sender
+/// (`rtp::testkit::rtp::send_timestamped_messages`) drives the same cadence
+/// through `tokio::time::interval` with `MissedTickBehavior::Delay`, which
+/// **drops** a tick whenever the runtime wakes the task more than one cadence
+/// late, so the count the offer floor reads measures the host. Measured on this
+/// machine at load average 31 (16 spinners on 10 cores) that sender offered
+/// 2313 and 2300 of the 2400 messages its schedule requires, while the
+/// transport accepted **every** write it attempted (attempts == accepts, zero
+/// write errors, 6 ms of `write_all` await over a 12 s window, and latenesses
+/// at the window's quarter points of 139/268/324/435 ms and 138/232/358/500 ms
+/// — accumulating from the start rather than stalling once).
+/// So the shortfall was the sender's own wake schedule, not the lane refusing
+/// load, and the arm failed on host load rather than on the product.
+///
+/// This sender instead owes the schedule its full `floor(run_for / interval)`
+/// messages and, when a wake is late, writes the messages whose deadline has
+/// already passed back-to-back. The count is then host-independent, and a
+/// shortfall means the **transport refused the offer** — which is what the
+/// offer floor exists to catch. It ends no earlier than its schedule, by at
+/// most one wake's lateness.
+///
+/// The frame layout is the pinned encoder's, which the arm's sink decodes;
+/// `clean_delivered` (`received == sent`) fails loudly if the two ever drift.
+async fn offer_cadence_on_deadline(
+    write: &mut (impl AsyncWrite + Unpin),
+    base: Instant,
+    msg_bytes: usize,
+    interval: Duration,
+    run_for: Duration,
+) -> u64 {
+    assert!(msg_bytes >= 12, "message framing needs at least 12 bytes");
+    // Integer nanoseconds, so the schedule count is exact rather than a float
+    // floor that can land a message short.
+    let schedule = (run_for.as_nanos() / interval.as_nanos()) as u64;
+    let payload_bytes = msg_bytes - 12;
+    let payload: Vec<u8> = (0..payload_bytes).map(|i| (i % 251) as u8).collect();
+    let mut frame = Vec::with_capacity(msg_bytes);
+    let start = Instant::now();
+    let mut deadline = Duration::ZERO;
+    let mut sent = 0u64;
+    while sent < schedule {
+        while sent < schedule && start.elapsed() >= deadline {
+            let sent_us = base.elapsed().as_micros() as u64;
+            frame.clear();
+            frame.extend_from_slice(&((msg_bytes as u32).to_le_bytes()));
+            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(&sent_us.to_le_bytes());
+            if write.write_all(&frame).await.is_err() {
+                return sent;
+            }
+            sent += 1;
+            deadline += interval;
+        }
+        if sent < schedule {
+            tokio::time::sleep(deadline.saturating_sub(start.elapsed())).await;
+        }
+    }
+    sent
+}
+
 /// Run one dual-lane smoke arm and read back everything the three mandates
 /// need from it: the latency summary, the timeline (for the panel), the
 /// interactive lane's own client->server wire, the offered payload, and the
@@ -942,7 +1032,7 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
                     }),
                 );
                 match load {
-                    Load::Cadence => {
+                    Load::Cadence { cadence_divisor } => {
                         submit_test_task(
                             &task_tx_int,
                             Box::pin(async move {
@@ -957,11 +1047,11 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
                         let sent = if lat_write.write_all(b"L").await.is_err() {
                             0
                         } else {
-                            send_timestamped_messages(
+                            offer_cadence_on_deadline(
                                 &mut lat_write,
                                 base,
                                 msg_bytes,
-                                CADENCE,
+                                CADENCE * cadence_divisor,
                                 window,
                             )
                             .await
@@ -1014,7 +1104,7 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
             // arm.
             let collected = std::mem::take(&mut *collector_sink.lock().unwrap());
             let (samples, timeline) = match load {
-                Load::Cadence => {
+                Load::Cadence { .. } => {
                     let samples: Vec<f64> = collected.iter().map(|(_, l)| *l).collect();
                     (samples, collected)
                 }
@@ -2871,8 +2961,13 @@ fn cadence_offer_bps() -> f64 {
 }
 
 /// The number of messages a cadence arm's schedule offers over `window`.
+///
+/// Integer nanoseconds, matching [`offer_cadence_on_deadline`]'s own schedule
+/// count exactly: `window / CADENCE` in `f64` lands on 2399.9999999999995 for
+/// the arms' own 12 s / 5 ms, which is the same count to any reader but not the
+/// same number as the sender's schedule.
 fn cadence_offer_messages(window: Duration) -> f64 {
-    window.as_secs_f64() / CADENCE.as_secs_f64()
+    (window.as_nanos() / CADENCE.as_nanos()) as f64
 }
 
 fn m2_declaration() -> String {
@@ -2906,13 +3001,15 @@ fn m2_rows(runs: &[ArmRun]) -> Vec<(String, String, f64, f64)> {
 /// Mandate 2: the interactive lane is offered a **known throughput** and its
 /// latency does **not degrade** under that offer. The `clean` cadence arm
 /// asserts the mandate — the offered message count is its schedule (the
-/// input), it delivers all of it (`delivery == 1.000`), and its p99 stays at
-/// the link's floor ([`M2_NONDEGRADING_P99_MS`]) — so the goodput is inferred
-/// from the latency holding: a lane draining what it is offered cannot be
-/// accumulating a queue, and a lane whose goodput fell would have to show the
-/// backlog as latency or stop offering. The `hostile` cadence arm asserts the
-/// same known offer plus its delivery floor; the lone-tail arm keeps its
-/// delivery floor as a regression guard.
+/// input, written by [`offer_cadence_on_deadline`] so that it is the schedule's
+/// count and not the host's wake success), it delivers all of it (`delivery ==
+/// 1.000`), and its p99 stays at the link's floor
+/// ([`M2_NONDEGRADING_P99_MS`]) — so the goodput is inferred from the latency
+/// holding: a lane draining what it is offered cannot be accumulating a queue,
+/// and a lane whose goodput fell would have to show the backlog as latency or
+/// stop offering. The `hostile` cadence arm asserts the same known offer plus
+/// its delivery floor; the lone-tail arm keeps its delivery floor as a
+/// regression guard.
 #[tokio::test(flavor = "multi_thread")]
 async fn m2_offered_load_latency() {
     let _serial = SERIAL.lock().await;

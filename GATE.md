@@ -771,6 +771,32 @@ rate) as the within-run delivered/shaper-forwarded fraction, median of three.
 Those bounds and their derivations are the ones stated above; the smoke set
 does not restate them.
 
+The two cadence arms' offer is written by `mandate_smoke::offer_cadence_on_deadline`
+rather than by the pinned `rtp::testkit::rtp::send_timestamped_messages`, and that
+is a repair rather than a preference: the pinned sender drives its cadence
+through `tokio::time::interval` with `MissedTickBehavior::Delay`, which **drops** a
+tick whenever the runtime wakes the task more than one cadence late, so the count
+M2's offer floor reads was measuring the test host's scheduler rather than the
+lane. Measured at load average 22-39 the arms offered 2270-2347 (clean) and
+2281-2310 (hostile) of the 2400 messages their `WINDOW / CADENCE` schedule
+requires, and the transport accepted **every** write attempted — attempts equal
+accepts, zero write errors, 6-13 ms of `write_all` await across a 12 s window —
+so the lane was not refusing the load: lateness at the window's quarter points
+(139/268/324/435 ms and 138/232/358/500 ms) accumulated from the start instead of
+stalling once, which is a wake-count shortfall and not a start-up or an
+end-of-window stall. The deadline sender owes its schedule
+`floor(run_for / CADENCE)` messages and writes the deadlines a late wake has
+already passed back-to-back, so the count is host-independent and a shortfall now
+means **the transport refused the offer** — the only thing the floor was ever for.
+`M2_OFFER_TOLERANCE`'s 2 % is unchanged and now absorbs refused writes rather
+than scheduler jitter; the floor, the arms' windows, cadence and tiers are
+untouched. Its vacuity demonstration is the input fault
+`MANDATE_SMOKE_FAULT=M2_offer` (the clean arm offers a tenth of the cadence):
+`clean_offer_msgs=240` against the 2352 floor with `clean_delivery=1.000` and
+`clean_p99=36.3` inside its 100 ms bound, so the offer is the failing clause and
+nothing else. Do **not** put the cadence arms back on the wake-count sender to
+"restore the original instrument": the wake count was the defect.
+
 The same target carries a fourth asserting arm beside M4 —
 `mandate_smoke::m4_clean_lane_p99_ceiling`, default tier, 15.5 s — because the
 production shape runs four interactive flows over one long-lived mux session
@@ -2250,16 +2276,19 @@ this row carries no load: a `total` over these names would be invented
 arithmetic, and the grammar has no line for one. They belong to four
 different arms:
 
-- `MANDATE_SMOKE_FAULT` (`tests/mandate_smoke.rs:428`) selects a perturbation
+- `MANDATE_SMOKE_FAULT` (read by `mandate_smoke::fault`) selects a perturbation
   of one smoke arm's input: `M1_latency`, `M1_IMPAIRED_slow`,
   `M1_FIELD_RTT_slow`,
   `M1_LOSS_MODEL_uncorrelated`, `M1_LOSS_MODEL_correlated`,
-  `M2_delivery`, `M3_starve`, `M4_starve`, `M4_late`, `M4_drop`,
+  `M2_delivery`, `M2_offer`, `M3_starve`, `M4_starve`, `M4_late`, `M4_drop`,
   `M4_CLEAN_LEVEL_double` and `M4_CLEAN_LEVEL_slow`. Unset in every real
-  run — the runner never sets it. The value's prefix (`starts_with(mandate)`,
-  `:431`) names the arm whose input is perturbed, and each arm's own
+  run — the runner never sets it. The value's prefix (`starts_with(mandate)` in
+  `fault`) names the arm whose input is perturbed, and each arm's own
   matcher then tests the value it owns; an arm that does not own the selected
-  value leaves its input alone (`_ => {}`, `:561`). The two `M4_CLEAN_LEVEL_*`
+  value leaves its input alone (`_ => {}` in `mandate_arms`). `M2_offer` is
+  M2's offer floor made falsifiable: it multiplies the clean arm's cadence
+  interval by ten, so the lane is offered a tenth of the throughput the mandate
+  names — the one clause that can fail. The two `M4_CLEAN_LEVEL_*`
   values name the four-flow level arm's own namespace so that probing *its*
   assertion cannot read as probing M4's; `M1_IMPAIRED_slow` (one fixed 300 ms
   one-way delay on the `hostile` and `lone_tail` links, clean arm untouched) is
@@ -2285,7 +2314,7 @@ mux-fair-longrun = MUX_FAIR_WARMUP_SECS,MUX_FAIR_STEADY_SECS,MUX_FAIR_WINDOW_SEC
 rtp-longrun-arms = RTP_LONGRUN_SECS,RTP_LONGRUN_INTERVAL_SECS,RTP_LONGRUN_STREAMS,RTP_LONGRUN_LOSS_PCT,RTP_LONGRUN_LABEL | - | the multi-minute long-run arms' measurement window and CSV sampling cadence, over the production dual-lane composition: an aggregate interactive p50/p99/max and offered/forwarded wire series plus per-stream rows and the sender controller state, sampled every RTP_LONGRUN_INTERVAL_SECS across a RTP_LONGRUN_SECS window with RTP_LONGRUN_STREAMS interactive streams sharing the lane, RTP_LONGRUN_LOSS_PCT selecting the independent-loss regime and RTP_LONGRUN_LABEL naming the CSV run; the load records the single-flow reference arm's default shape, and the multi-flow arm's 180 s default is prose in the section above rather than folded into one total | longrun-drift@shape=cadence+scale=multi-minute+metric=p50-p99-max-series, longrun-fairness@arm=multi-flow+metric=per-stream-p99, longrun-bulk@scale=multi-minute+metric=goodput, longrun-repair@metric=fec-and-rtx-breakdown, longrun-rate@metric=rule-of-three+unit=interval | RTP_LONGRUN_SECS=300,RTP_LONGRUN_INTERVAL_SECS=10,RTP_LONGRUN_STREAMS=1,total=RTP_LONGRUN_SECS,wall=304.57s,bound=1.0e-1/interval
 hostile-goodput-probe = NETEM_PERF_WINDOW_SECONDS,NETEM_PERF_WARMUP_SECONDS,NETEM_PERF_LINK_PROFILE,NETEM_PERF_MSS_BYTES,NETEM_PERF_SEED,NETEM_PERF_REVISION,NETEM_PERF_DIAGNOSTIC_MODE,NETEM_PERF_FEC,RTP_RTX_DUP | - | the time-boxed counting-sink goodput window over the hostile link profiles: the window and its discarded warmup are the sizing pair, the profile selects the link (validated against the goodput probe's own list), the MSS and seed select the dial and its reproducible draw, the revision labels the PerfTrace artifact, NETEM_PERF_DIAGNOSTIC_MODE=1 makes the median sub-window goodput floor informational rather than asserted, and NETEM_PERF_FEC and RTP_RTX_DUP select the paired arms' FEC envelope and retransmission-armor treatment; the reported quantity is the median of the sub-window goodputs against the goodput floor, with every delivered byte verified by the sink | hostile-goodput@shape=counting-sink+window=30s+metric=median-subwindow-goodput, hostile-integrity@metric=every-delivered-byte-verified, probe-diagnostic-bypass@knob=NETEM_PERF_DIAGNOSTIC_MODE+effect=floor-becomes-informational, probe-treatment@knob=NETEM_PERF_FEC+mode=fec-off-or-on, probe-treatment@knob=RTP_RTX_DUP+mode=armor-off-or-on | NETEM_PERF_WINDOW_SECONDS=30,NETEM_PERF_WARMUP_SECONDS=20,total=NETEM_PERF_WINDOW_SECONDS+NETEM_PERF_WARMUP_SECONDS,wall=51s
 hostile-message-latency-probe = NETEM_PERF_WINDOW_SECONDS,NETEM_PERF_WARMUP_SECONDS,NETEM_PERF_LINK_PROFILE,NETEM_PERF_MSS_BYTES,NETEM_PERF_SEED,NETEM_PERF_REVISION,NETEM_PERF_FEC,RTP_RTX_DUP | - | the sparse-message one-way latency probe over the periodic hostile bottleneck profiles: 64 B timestamped messages every 100 ms for NETEM_PERF_WINDOW_SECONDS after a NETEM_PERF_WARMUP_SECONDS ramp, with netem sampled every 50 ms and a four-second straggler allowance, reporting one-way latency p50/p95/p99 and frame delivery; the profile is validated against the message probe's own periodic-only list, and NETEM_PERF_FEC and RTP_RTX_DUP select the paired arms' treatment as above | hostile-message@shape=timestamped-messages+window=30s+metric=one-way-p50-p95-p99, hostile-message-delivery@metric=delivered-frame-count, probe-treatment@knob=NETEM_PERF_FEC+mode=fec-off-or-on, probe-treatment@knob=RTP_RTX_DUP+mode=armor-off-or-on | NETEM_PERF_WINDOW_SECONDS=30,NETEM_PERF_WARMUP_SECONDS=5,total=NETEM_PERF_WINDOW_SECONDS+NETEM_PERF_WARMUP_SECONDS,wall=40s
-vacuity-fault-selectors = MANDATE_SMOKE_FAULT,HOL_PROBE_FAULT,SPIKE_SURVIVAL_FAULT,RTP_MUX_COLD_CONNECTION_FAULT | - | the red-proof input perturbations, not measurements: MANDATE_SMOKE_FAULT selects one smoke arm's perturbed input (a slowed or re-shaped link, or a starved or dropped flow), HOL_PROBE_FAULT the concurrent arms' offering serialization or throttle, SPIKE_SURVIVAL_FAULT the skipped spike, the mid-spike session churn or the late churn, and RTP_MUX_COLD_CONNECTION_FAULT the pre-fix sequential birth surrogate; each exists so the arm it perturbs can be shown to fail from the measurement path, each is unset in every real run, and none sizes anything, so this row's load is refused rather than invented | smoke-vacuity@fault=MANDATE_SMOKE_FAULT+targets=M1-M2-M3-M4, offer-vacuity@fault=HOL_PROBE_FAULT+targets=concurrent-offer-floor, spike-vacuity@fault=SPIKE_SURVIVAL_FAULT+targets=session-identity, birth-vacuity@fault=RTP_MUX_COLD_CONNECTION_FAULT+targets=dual-lane-birth
+vacuity-fault-selectors = MANDATE_SMOKE_FAULT,HOL_PROBE_FAULT,SPIKE_SURVIVAL_FAULT,RTP_MUX_COLD_CONNECTION_FAULT | - | the red-proof input perturbations, not measurements: MANDATE_SMOKE_FAULT selects one smoke arm's perturbed input (a slowed or re-shaped link, a starved or dropped flow, or an offer cut to a tenth of the cadence), HOL_PROBE_FAULT the concurrent arms' offering serialization or throttle, SPIKE_SURVIVAL_FAULT the skipped spike, the mid-spike session churn or the late churn, and RTP_MUX_COLD_CONNECTION_FAULT the pre-fix sequential birth surrogate; each exists so the arm it perturbs can be shown to fail from the measurement path, each is unset in every real run, and none sizes anything, so this row's load is refused rather than invented | smoke-vacuity@fault=MANDATE_SMOKE_FAULT+targets=M1-M2-M3-M4, offer-vacuity@fault=HOL_PROBE_FAULT+targets=concurrent-offer-floor, spike-vacuity@fault=SPIKE_SURVIVAL_FAULT+targets=session-identity, birth-vacuity@fault=RTP_MUX_COLD_CONNECTION_FAULT+targets=dual-lane-birth
 ```
 
 ## Opt-in targets outside this manifest
