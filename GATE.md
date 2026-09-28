@@ -4,17 +4,16 @@ This file is the authoritative scope of the rtp_mux scenario gate. `cargo test
 -p rtp_mux` silently skips every `#[ignore]`d scenario, so the gate is defined
 in tiers and the `gate-manifest` block below names every opt-in scenario and
 its tier. The manifest is machine-checked by the shared checker
-(`netem_test/tools/check-gate.py`, parameterized per crate), which fails if a
+(`netem-tools check-gate`, parameterized per crate), which fails if a
 scenario is added or removed without the manifest being updated, making an
 unnoticed `#[ignore]` skip impossible.
 
 Run the checker after adding, removing, or re-tiering any scenario. The
-checker lives in `netem_test/tools/check-gate.py` (run from the crate
-checkout via the sibling path; it resolves the sibling kit trees from the
-shared crates root):
+checker is `netem-tools check-gate` (run from the crate checkout; it resolves
+the sibling kit trees from the shared crates root):
 
 ```sh
-python3 ../netem_test/tools/check-gate.py \
+netem-tools check-gate \
   --crate . rtp_mux tests GATE.md
 ```
 
@@ -369,8 +368,8 @@ Two are **measured** for this declaration rather than read:
 --test-threads=1`, `real 156.33 s`) and is declared 157 s.
 `mandate_smoke::m3_bulk_goodput_fraction` is stated on the scale the
 checker's **measured side** uses, which is not the same scale as a serialized
-single-test invocation. `check-gate.py --mandate-check-json` compares a
-declared cost with `tools/mandate-check`'s stamp, and that runner invokes the
+single-test invocation. `netem-tools check-gate --mandate-check-json` compares
+a declared cost with `tools/mandate-check`'s stamp, and that runner invokes the
 `mandate_smoke` target with libtest's default threading, so the four smoke
 tests run four-way concurrent and the row's stamp carries whatever contention
 the scheduler gives it. Four such runs stamped it at 61.564 s, 111.474 s,
@@ -725,7 +724,7 @@ m1-four-flow-clean@flows=4+impairment=clean+metric=p99-ceiling = **closed** by `
 m1-four-flow-hostile@flows=4+impairment=hostile+metric=p99-ceiling = **closed** by `mandate_smoke::m4_hostile_lane_p99_ceiling` (default tier, 15.5 s, declared with its bound, its derivation, its three coverage cells and its two vacuity probes in the section `The four-flow hostile level` above). What the line records is that the production flow count's **hostile** tail had no level arm: M1's 250 ms ceiling is asserted on M1's one-flow clean arm, M4's `hostile` arm guards each flow against M1's loose 900 ms per-flow regression guard, and M4 reports the aggregate `hostile_p99_max` without asserting it — so the four `hostile_p99` bars of a passing battery sat above the 250 ms ceiling drawn on `M4-latency` while no gate named their level. The new arm asserts the four-flow hostile `hostile_p99_max` against `M4_HOSTILE_P99_CEILING_MS` (452 ms), derived as `mean + 4 sd` over the twenty healthy observations on record rather than picked or mirrored above the ceiling: the four-flow hostile tail measures `274.9-423.0 ms`, `1.10-1.69x` the M1 ceiling, so the bound **exceeds** the 250 ms ceiling by `1.81x` and the arm says so — the honest closure here is a bound where the measurement supports it plus the named hole, not a 250 ms assertion that is false on every run. The bound is `1.99x` tighter than M4's own guard, and the red proof shows the arm bites in the region between them: `MANDATE_SMOKE_FAULT=M4_HOSTILE_LEVEL_double` reads per-flow p99 `731.2/848.2/883.8/785.4` ms — every flow **inside** the 900 ms guard M4 asserts and every flow **outside** this arm's 452 ms ceiling — with delivery still `1.000` (a later invocation of the same probe read up to 1314.6 ms, past both bounds). The residual panel gap (the bound is not drawn as a line on `M4-latency`) has its own line above.
 cellular-request-response@lane=cellular-timeline+shape=request-response = the cellular timeline arms use the cadence shape only.
 policer@impairment=policer = a token-bucket policer (as opposed to the shaper and queue the harness models) is not in the impairment instrument, so no arm can cover it.
-m1-four-flow-hostile-level@flows=4+impairment=hostile+metric=p99-ceiling-panel = **named, not drawn.** The four-flow hostile level bound (`M4_HOSTILE_P99_CEILING_MS`, 452 ms, asserted by `mandate_smoke::m4_hostile_lane_p99_ceiling`) is on the same `hostile_p99` series `M4-latency` draws, but it is not drawn as a line: this tool's `series_guard_bounds` draws a per-series guard line only under a **single** declared bound, and a second declared bound on that panel suppressed the run's own `hostile_p99_guard=900` line and made the render refuse itself (the trial bound was 455 ms; the tool reported `mandate_plot: error: panel 'latency': its label names the guard 900, but the artifact draws 2 bound line(s) at [249.9, 455.1] and none of them is that guard`), measured by rendering the panel with the bound added. So the level bound is carried by the arm's own `[m4-hostile-level]` line and the section `The four-flow hostile level`, while `M4-latency` keeps drawing the declaration's 250 ms ceiling and the run's own `900 ms` guard labelled `governs series hostile_p99` and attributes the crossing to that guard rather than implying a breach. The gap is the **panel reading**, not the assertion: relaxing the `series_guard_bounds` single-bound precondition lives in `netem_test/tools/mandate_plot.py`, outside this crate. A reader who needs the level gate has it in the verdict line and in this file; a reader of the panel alone sees `900 ms`, which is M4's own arm guard and not the level.
+m1-four-flow-hostile-level@flows=4+impairment=hostile+metric=p99-ceiling-panel = **named, not drawn.** The four-flow hostile level bound (`M4_HOSTILE_P99_CEILING_MS`, 452 ms, asserted by `mandate_smoke::m4_hostile_lane_p99_ceiling`) is on the same `hostile_p99` series `M4-latency` draws, but it is not drawn as a line: this tool's `series_guard_bounds` draws a per-series guard line only under a **single** declared bound, and a second declared bound on that panel suppressed the run's own `hostile_p99_guard=900` line and made the render refuse itself (the trial bound was 455 ms; the tool reported `mandate_plot: error: panel 'latency': its label names the guard 900, but the artifact draws 2 bound line(s) at [249.9, 455.1] and none of them is that guard`), measured by rendering the panel with the bound added. So the level bound is carried by the arm's own `[m4-hostile-level]` line and the section `The four-flow hostile level`, while `M4-latency` keeps drawing the declaration's 250 ms ceiling and the run's own `900 ms` guard labelled `governs series hostile_p99` and attributes the crossing to that guard rather than implying a breach. The gap is the **panel reading**, not the assertion: relaxing the `series_guard_bounds` single-bound precondition lives in `netem-tools mandate-plot`, outside this crate. A reader who needs the level gate has it in the verdict line and in this file; a reader of the panel alone sees `900 ms`, which is M4's own arm guard and not the level.
 ```
 
 The concurrent row's vacuity demonstrations are `HOL_PROBE_FAULT=serialize`
@@ -1773,7 +1772,7 @@ line is not a one-line declaration change: this tool's `series_guard_bounds`
 draws a per-series guard line only under a **single** declared bound, and
 adding a second declared bound suppressed the 900 ms line and made the render refuse itself (the trial bound was 455 ms; the tool reported `its label names the guard 900, but the artifact draws 2 bound line(s) at [249.9, 455.1] and none of them is that guard`) — measured, by
 rendering `M4-latency` with the bound added. Relaxing that precondition lives
-in `netem_test/tools/mandate_plot.py`, outside this crate, and the M4 panel is
+in `netem-tools mandate-plot`, outside this crate, and the M4 panel is
 M4's arm's evidence while the level bound belongs to a different arm; drawing
 it there would imply M4's run asserts it. The panel therefore keeps
 **attributing** the crossing (the brief's second branch) and the level gate is
@@ -1823,11 +1822,11 @@ production shape).
 - **perf** — `#[ignore]`d, report-only measurement or long-run tooling; these
   produce numbers (or feed `tools/perf-loop`), they do not assert a gate
   floor. A `perf` scenario must not contain an assertion in its own body;
-  `check-gate.py` fails with the scenario name, its file, and the token if
-  one does. It must also not reach an assertion through a helper: the checker
-  derives the crate-local call-graph closure of every `perf` scenario and
-  requires every asserting helper it reaches to be declared report-only in the
-  `gate-perf-guard-helpers` block.
+  `netem-tools check-gate` fails with the scenario name, its file, and the
+  token if one does. It must also not reach an assertion through a helper: the
+  checker derives the crate-local call-graph closure of every `perf` scenario
+  and requires every asserting helper it reaches to be declared report-only in
+  the `gate-perf-guard-helpers` block.
 
 ## Default tier (runs in `cargo test -p rtp_mux`)
 
@@ -1850,7 +1849,8 @@ holding an adjacent interactive/bulk pair while the host's ephemeral ports are
 occupied — the invariant the connector's derived bulk destination depends on.
 
 The `gate-default-required` block names the asserting scenarios that must stay
-in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed.
+in this tier; `netem-tools check-gate` fails if one is re-`#[ignore]`d or
+removed.
 
 ```gate-default-required
 hol_probe::fec_gaming_treatment_has_bad_path_and_large_capacity_headroom
@@ -2442,8 +2442,8 @@ vacuity-fault-selectors = MANDATE_SMOKE_FAULT,HOL_PROBE_FAULT,SPIKE_SURVIVAL_FAU
 
 ## Opt-in targets outside this manifest
 
-`check-gate.py` covers only the rtp_mux scenario targets. The crate's own
-non-scenario targets (`bidirectional`, `duplex`, `explorer`, `lane_rejection`,
+`netem-tools check-gate` covers only the rtp_mux scenario targets. The crate's
+own non-scenario targets (`bidirectional`, `duplex`, `explorer`, `lane_rejection`,
 `session_stats`, `xsession` and the `support/**` plumbing) run in the default
 tier and are not gated as scenarios. The harness crate has its own gate
 (`netem_test/tests/GATE.md`) and keeps the perf-loop lane-role authority.
