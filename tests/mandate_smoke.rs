@@ -99,7 +99,7 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -111,6 +111,7 @@ use netem_test::kit::presets::gilbert_elliott_loss;
 use netem_test::kit::stats::{HolSummary, summarize};
 use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
 use netem_test::{LossModel, NetemConfig, NetemPair};
+use rtp::metrics::{MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver};
 use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
@@ -773,6 +774,13 @@ struct ArmRun {
     /// (`delayed`). The loss a model names is a claim about the link, and this
     /// is the link confirming or contradicting it.
     int_c2s_counters: netem_test::Counters,
+    /// The interactive lane's own send-path evidence, tapped from rtp's metrics
+    /// events and cumulative counters when the arm was run with an observer.
+    /// [`CoverWire::default`] (all zero) is the exact meaning of "this arm was
+    /// not observed", so a reader must not read a zero as a measurement.
+    cover: CoverWire,
+    /// Whether the arm ran with [`cover_wire_observer`] attached.
+    cover_observed: bool,
     /// The s2c direction's counters, for the same reading on the return path.
     int_s2c_counters: netem_test::Counters,
     /// The payload the arm offered, `sent * msg_bytes`: M2's *input*, printed
@@ -955,6 +963,124 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
 /// unchanged; this entry point exists so a *lever* probe can measure an
 /// alternative lane policy on the very same arm without retuning it.
 async fn run_arm_with(spec: ArmSpec, int_rtp: LaneRtpConfig) -> ArmRun {
+    run_arm_observed(spec, int_rtp, None).await
+}
+
+/// The interactive lane's own send-path evidence for one arm: what the lane's
+/// transmission actually put on the wire, read from rtp's own metrics events
+/// and cumulative counters -- never restated from a constant.
+///
+/// `armor_duplicates` counts `RetransmissionArmorDuplicate` observations, each
+/// of which is one armour copy datagram the lane *actually wrote* (rtp logs the
+/// event only after the underlay send succeeds). `rungs` is the newest
+/// snapshot's `retransmission_counters.attempts + tail_probes`: the send
+/// space's own count of the transmissions it fired as repairs, one per rung,
+/// whether a tail-loss probe or a full-RTO selection (that is exactly the pair
+/// `pkt_send_space::the_lone_tail_ladder_is_measured_from_the_wire_and_steps_by_the_repair_floor`
+/// reads off the same counters). `parity_sent` is the newest snapshot's
+/// `fec.parity_sent`, the parity datagrams the FEC flush actually emitted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CoverWire {
+    armor_duplicates: u64,
+    rungs: u64,
+    parity_sent: u64,
+    /// FEC groups the flush actually emitted parity for, and the histogram of
+    /// their data-symbol counts (`1`, `2-4`, `5-7`, `8`). Printed so the parity
+    /// datum count is explained by the groups it came from rather than read as
+    /// a per-message constant.
+    groups_flushed: u64,
+    group_sizes: [u64; 4],
+}
+
+/// The cell [`cover_wire_observer`] writes and the arm reads once its run is
+/// over. Cumulative counters are recorded as a running maximum, so a reading
+/// cannot regress when the underlay is momentarily backpressured.
+#[derive(Default)]
+struct CoverTaps {
+    armor_duplicates: AtomicU64,
+    rungs: AtomicU64,
+    parity_sent: AtomicU64,
+    groups_flushed: AtomicU64,
+    group_sizes: [AtomicU64; 4],
+}
+
+impl CoverTaps {
+    fn snapshot(&self) -> CoverWire {
+        CoverWire {
+            armor_duplicates: self.armor_duplicates.load(Ordering::Relaxed),
+            rungs: self.rungs.load(Ordering::Relaxed),
+            parity_sent: self.parity_sent.load(Ordering::Relaxed),
+            groups_flushed: self.groups_flushed.load(Ordering::Relaxed),
+            group_sizes: self
+                .group_sizes
+                .each_ref()
+                .map(|slot| slot.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// An observer that taps the interactive lane's per-message wire.
+///
+/// A state snapshot is captured only for the events the decomposition needs --
+/// the armour duplicate (one per copy datagram, so the copy count is the event
+/// count) and the two application-write events (`SendFrameBuffer` on the
+/// frame-delivery lane every interactive arm here runs, and `SendDataBuffer`
+/// on the byte-stream lane; both are where the transport takes the snapshot
+/// that carries the cumulative repair and parity counters) -- while the
+/// high-rate packet attempts take no snapshot at all: the transport counts
+/// those itself, so an observer that scanned send state for each of them would
+/// pay a cost the measurement does not need. RTT samples are skipped entirely.
+fn cover_wire_observer() -> (MetricsObserver, Arc<CoverTaps>) {
+    let taps = Arc::new(CoverTaps::default());
+    let observer = MetricsObserver::selective(
+        |event, _elapsed| match event {
+            MetricsEvent::RetransmissionArmorDuplicate
+            | MetricsEvent::SendFrameBuffer
+            | MetricsEvent::SendDataBuffer => MetricsInterest::Snapshot,
+            MetricsEvent::RttSample => MetricsInterest::Skip,
+            _ => MetricsInterest::EventOnly,
+        },
+        {
+            let taps = Arc::clone(&taps);
+            move |observation: MetricsObservation| {
+                if observation.event == MetricsEvent::RetransmissionArmorDuplicate {
+                    taps.armor_duplicates.fetch_add(1, Ordering::Relaxed);
+                }
+                let Some(snapshot) = observation.snapshot else {
+                    return;
+                };
+                let counters = snapshot.retransmission_counters;
+                taps.rungs
+                    .fetch_max(counters.attempts + counters.tail_probes, Ordering::Relaxed);
+                if let Some(fec) = snapshot.fec_counters {
+                    taps.parity_sent
+                        .fetch_max(fec.parity_sent, Ordering::Relaxed);
+                    taps.groups_flushed
+                        .fetch_max(fec.groups_flushed, Ordering::Relaxed);
+                    let buckets = fec.flushed_group_sizes;
+                    for (slot, value) in taps.group_sizes.iter().zip([
+                        buckets.one,
+                        buckets.two_to_four,
+                        buckets.five_to_seven,
+                        buckets.full_eight,
+                    ]) {
+                        slot.fetch_max(value, Ordering::Relaxed);
+                    }
+                }
+            }
+        },
+    );
+    (observer, taps)
+}
+
+/// [`run_arm_with`] with an optional metrics observer on the interactive lane.
+/// `None` reproduces `run_arm_with` exactly, which is why every arm that does
+/// not ask for the decomposition is measured on the connection it always was.
+async fn run_arm_observed(
+    spec: ArmSpec,
+    int_rtp: LaneRtpConfig,
+    observed: Option<(MetricsObserver, Arc<CoverTaps>)>,
+) -> ArmRun {
     let ArmSpec {
         name,
         int_c2s,
@@ -1002,7 +1128,7 @@ async fn run_arm_with(spec: ArmSpec, int_rtp: LaneRtpConfig) -> ArmRun {
                 bulk_pair.client_addr(),
                 int_rtp,
                 bulk_rtp,
-                None,
+                observed.as_ref().map(|(observer, _)| observer.clone()),
                 None,
             )
             .await
@@ -1155,6 +1281,14 @@ async fn run_arm_with(spec: ArmSpec, int_rtp: LaneRtpConfig) -> ArmRun {
         bulk_sink_bytes,
         bulk_wire_bytes,
     ) = outcome;
+    // Read the taps only after the run: the observer's last snapshot is the
+    // newest cumulative counters the lane published, and a reading taken while
+    // the arm was still running would under-count its own tail.
+    let cover_observed = observed.is_some();
+    let cover = observed
+        .as_ref()
+        .map(|(_, taps)| taps.snapshot())
+        .unwrap_or_default();
     let received = samples.len() as u64;
     let bulk_active_secs = if bulk {
         (window.saturating_sub(BULK_RAMP)).as_secs_f64()
@@ -1177,6 +1311,8 @@ async fn run_arm_with(spec: ArmSpec, int_rtp: LaneRtpConfig) -> ArmRun {
         int_c2s_wire_bytes,
         int_c2s_packets,
         int_c2s_counters,
+        cover,
+        cover_observed,
         int_s2c_counters,
         offered_bytes,
         bulk_sink_bytes,
@@ -1396,8 +1532,19 @@ fn verdict(pass: bool) -> &'static str {
 
 /// Datagrams one interactive tail transmission emits: the primary plus its
 /// armour copies and the message-sized parity symbol. The value is the
-/// fresh-tail armour's `primary + 5 copies` cover (`m = 6`), fixed by `rtp`'s
-/// armour configuration and recorded in `rtp/GATE.md`.
+/// fresh-tail armour's `primary + 5 copies` cover (`m = 6`), **derived** from
+/// `rtp`'s armour configuration and recorded in `rtp/GATE.md` -- it is a
+/// declaration about the pinned transport, not a reading of any run in this
+/// file.
+///
+/// `m1_lone_tail_cover_wire` is the arm that measures it, and its measurement
+/// does **not** reproduce this number: on the pinned `rtp v0.0.101` the
+/// deployment's own lone-tail lane writes `1 + 3.84 copies + 1.99 parity`
+/// datagrams per transmission, and its FEC flush emits ~2 single-symbol parity
+/// groups per message rather than the one this budget assumes. The constant is
+/// left at its declared value because retuning it would retune the rung-count
+/// law below, which is a frozen arm; the measurement is recorded beside the
+/// derivation instead of silently replacing it.
 const TAIL_DATAGRAMS_PER_TRANSMISSION: u64 = 6;
 
 /// The repair ladder's steady rung interval: rtp's post-probe repair-deadline
@@ -1428,7 +1575,11 @@ const MAX_CLIMB_GAP_MS: f64 = LADDER_STEP_MS;
 /// The arm's own ladder inputs, every one read from the arm's configuration or
 /// from its own counters — none assumed and none tuned.
 struct LadderInputs {
-    /// Datagrams one tail transmission emits.
+    /// Datagrams one tail transmission emits -- **derived**, not measured:
+    /// [`TAIL_DATAGRAMS_PER_TRANSMISSION`], which `m1_lone_tail_cover_wire`
+    /// measures and does not reproduce. Every field of the row this feeds is a
+    /// prediction *from* this declared value, so the row's `rungs=` is the
+    /// law's output and not a reading of the arm.
     datagrams_per_transmission: u64,
     /// The steady rung interval, ms.
     step_ms: f64,
@@ -1714,7 +1865,7 @@ fn report_censoring(arm: &str, spec: &ArmSpec, run: &ArmRun) {
          rise_run={rise:<3} edge_gap_ms={gap:8.1} screen={screen:<9} verdict={verdict:<21} \
          max={max:8.1} burst={burst:8.1} rungs={rungs:>3} step={step:.0} rtt={rtt:.0} \
          required={required:8.1} room={room:9.1} window_holds={holds:<5} lone_tail={lone} \
-         datagrams={datagrams}\n",
+         datagrams={datagrams}(derived)\n",
         n = run.timeline.len(),
         last = reading.final_ms,
         redge = reading.rungs_at_edge,
@@ -5343,4 +5494,260 @@ async fn m1_hostile_tail_lever() {
             run.summary.delivery_pct,
         );
     }
+}
+
+// ─────── the lone tail's cover, measured from the run instead of assumed ─────
+//
+// `TAIL_DATAGRAMS_PER_TRANSMISSION` (6) is the cover every rung-law in this file
+// is calibrated on: the rung-distribution arm's predicted frequency, the
+// censoring row's `rungs=` field and the window arithmetic all restate it. Until
+// this arm, no run in this crate could say what the interactive lane actually
+// writes per message, so the constant was a premise no measurement in this file
+// could contradict -- and `rtp/GATE.md` records the consequence for the cover
+// decision: "no existing hostile arm can observe `m`".
+//
+// This probe observes it. For a stated burst shape and link -- the M1 lone-tail
+// arm, one unacked 256 B message at a time over the hostile GE link -- it reads
+// the interactive lane's per-message wire from rtp's own send path rather than
+// from the constant:
+//
+//   * the armour copy datagrams the lane wrote, from the
+//     `RetransmissionArmorDuplicate` event (rtp emits exactly one per copy
+//     datagram, after the underlay send succeeds);
+//   * the parity datagrams its FEC flush emitted, from `fec.parity_sent`;
+//   * the repairs it fired, from `retransmission_counters.attempts +
+//     tail_probes` -- the same pair the crate's wire-measured ladder replay
+//     reads, one per rung whether a tail-loss probe or a full-RTO selection.
+//
+// The c2s link's own accepted-datagram count is the cross-check: the send path
+// cannot have written more datagrams than the link carried, and the residual
+// between the two is the ACK/control traffic the interactive messages share
+// their direction with.
+//
+// One dimension is varied from the deployed policy: the lane's FEC tuning (the
+// parity count, and whether the interactive tail is force-flushed at all), which
+// is the only cover knob `rtp_mux` owns. The armour *copy* count is `rtp`'s, so
+// this crate cannot move it; what the sweep shows is what each policy's cover
+// costs, what the tail is, and whether the rung repairs it fires match the law
+// the constant encodes.
+
+/// One cover-wire arm: the M1 lone-tail shape and link, with the lane policy
+/// named. The other dimension -- the impairment, the load shape, the window --
+/// is the M1 lone-tail arm's own, taken from [`mandate_arms`] rather than
+/// restated.
+fn cover_wire_arms() -> Vec<(&'static str, ArmSpec, rtp::FecTuning)> {
+    let lone = mandate_arms("M1")
+        .into_iter()
+        .nth(2)
+        .expect("the M1 arm set carries the lone_tail arm at index 2");
+    vec![
+        // The deployment's policy: force-flush the interactive tail, one parity.
+        ("deployed", lone.clone(), prompt_tuning()),
+        // The stock policy: no force-flush, so the armour never qualifies.
+        ("stock", lone.clone(), rtp::FecTuning::default()),
+        // A larger parity at the same force-flush: the one cover increase this
+        // crate owns.
+        (
+            "parity3",
+            lone,
+            rtp::FecTuning {
+                instream_flush: true,
+                small_group_parity_count: 3,
+            },
+        ),
+    ]
+}
+
+/// The interactive lane's per-message wire, decomposed from one run's own send
+/// path: `(transmissions, datagrams, copies, parity)`.
+///
+/// `transmissions` is the messages the arm offered plus the rungs the send space
+/// fired: every fresh message is one transmission, and every repair of one is
+/// another. `datagrams` is what those transmissions wrote -- one primary each,
+/// plus their armour copies and their parity symbols -- summed from the events
+/// and counters the transport published, never from the per-message budget the
+/// constants name.
+/// The upper bound on the link's *unaccounted* datagrams, per offered message:
+/// the ACK/control traffic the interactive messages share their direction with.
+/// Measured across the arm's reps it runs `1.2-2.0` on every policy, so `3` is a
+/// tripwire with ~1.5x headroom rather than a target -- a decomposition that
+/// lost a term (or a lane emitting control traffic its messages do not explain)
+/// widens the gap past it.
+const RESIDUAL_DATAGRAMS_PER_MESSAGE: u64 = 3;
+
+fn cover_wire_decomposition(run: &ArmRun) -> (u64, u64, u64, u64) {
+    let messages = run.summary.sent;
+    let transmissions = messages + run.cover.rungs;
+    let datagrams = transmissions + run.cover.armor_duplicates + run.cover.parity_sent;
+    (
+        transmissions,
+        datagrams,
+        run.cover.armor_duplicates,
+        run.cover.parity_sent,
+    )
+}
+
+/// The lone tail's cover, measured. `full` tier and `#[ignore]`d: it is three
+/// full request/response windows, and it measures the lane's mechanism rather
+/// than asserting a mandate.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "lone-tail cover measured from the run; three ~15 s arms; run with --ignored --nocapture --test-threads=1"]
+async fn m1_lone_tail_cover_wire() {
+    let _serial = SERIAL.lock().await;
+    let mut rows: Vec<(String, ArmRun)> = Vec::new();
+    for (label, spec, tuning) in cover_wire_arms() {
+        let (observer, taps) = cover_wire_observer();
+        let lane = LaneRtpConfig::frame_reordering(true, tuning);
+        let run = with_timeout(
+            ARM_DEADLINE,
+            label,
+            run_arm_observed(spec, lane, Some((observer, taps))),
+        )
+        .await;
+        rows.push((label.to_owned(), run));
+    }
+    for (label, run) in &rows {
+        let (transmissions, datagrams, _copies, _parity) = cover_wire_decomposition(run);
+        let summary = &run.summary;
+        let row = format!(
+            "[lone-cover {label:<9}] messages={messages:>4} rungs={rungs:>3} \
+             transmissions={transmissions:>4} datagrams={datagrams:>5} copies={copies:>4} \
+             parity={parity:>5} groups={groups:>4} group_sizes={sizes:?} \
+             cover_per_tx={cover:.3} wire_datagrams={wire:>5} residual={residual:>4} \
+             wire_x={wx:5.2} p50={p50:7.1} p99={p99:8.1} max={max:8.1} over250={o25:>4} \
+             del={del:.3} wall={wall:.1}s\n",
+            messages = summary.sent,
+            rungs = run.cover.rungs,
+            copies = run.cover.armor_duplicates,
+            parity = run.cover.parity_sent,
+            groups = run.cover.groups_flushed,
+            sizes = run.cover.group_sizes,
+            wire = run.int_c2s_packets,
+            cover = if transmissions == 0 {
+                0.0
+            } else {
+                datagrams as f64 / transmissions as f64
+            },
+            residual = run.int_c2s_packets as i64 - datagrams as i64,
+            wx = if run.offered_bytes == 0 {
+                0.0
+            } else {
+                run.int_c2s_wire_bytes as f64 / run.offered_bytes as f64
+            },
+            p50 = summary.p50,
+            p99 = summary.p99,
+            max = summary.max,
+            o25 = over250_count(&run.samples),
+            del = summary.delivery_pct,
+            wall = run.wall.as_secs_f64(),
+        );
+        let mut stderr = std::io::stderr().lock();
+        let _ = std::io::Write::write_all(&mut stderr, row.as_bytes());
+    }
+
+    // Instrument sanity: every arm was observed and measured something.
+    for (label, run) in &rows {
+        assert!(
+            run.cover_observed,
+            "[lone-cover] the {label} arm ran without its metrics observer, so its cover row would report the default zero as if it were a measurement",
+        );
+        assert!(
+            !run.samples.is_empty() && run.summary.sent > 0,
+            "[lone-cover] the {label} arm offered {} message(s) and measured {} sample(s): a probe that returns nothing cannot say what the cover is",
+            run.summary.sent,
+            run.samples.len(),
+        );
+        assert!(
+            run.summary.delivery_pct >= M2_HOSTILE_DELIVERY_FLOOR,
+            "[lone-cover] the {label} arm delivered {:.3} of its offer, under the {M2_HOSTILE_DELIVERY_FLOOR} floor: it measured a starved lane, not the cover it varies",
+            run.summary.delivery_pct,
+        );
+    }
+
+    // The decomposition is a decomposition: the send path's own datagram count
+    // cannot exceed what the link accepted, and the remainder it does not
+    // account for is the small ACK/control traffic the interactive messages
+    // share their direction with -- bounded, on this lane, by a handful of
+    // datagrams per message. This is the assertion that makes the reading a wire
+    // measurement rather than an oracle over its own arithmetic: a mis-read
+    // counter (attempts that emitted nothing, a parity counted twice) pushes the
+    // attributable total past the link's own count, and an unexplained gap wider
+    // than the control share means the decomposition is missing a term.
+    for (label, run) in &rows {
+        let (transmissions, datagrams, copies, parity) = cover_wire_decomposition(run);
+        assert!(
+            datagrams <= run.int_c2s_packets,
+            "[lone-cover] the {label} arm's send path reports {datagrams} datagrams \
+             ({transmissions} transmissions + {copies} armour copies + {parity} parity) but its own \
+             c2s link accepted only {}: the decomposition counts datagrams the wire never carried",
+            run.int_c2s_packets,
+        );
+        let residual = run.int_c2s_packets - datagrams;
+        assert!(
+            residual <= RESIDUAL_DATAGRAMS_PER_MESSAGE * run.summary.sent,
+            "[lone-cover] the {label} arm's c2s link carried {} datagram(s) and its send path \
+             accounts for {datagrams}, leaving {residual} ({:.2} per offered message) against the \
+             {RESIDUAL_DATAGRAMS_PER_MESSAGE}-per-message control share: the decomposition is \
+             missing a term, or the lane is sending control traffic its messages do not explain",
+            run.int_c2s_packets,
+            residual as f64 / run.summary.sent.max(1) as f64,
+        );
+    }
+
+    // The withdrawn-cover control: the stock policy never force-flushes the
+    // interactive tail, so it writes no armour copy at all. If copies appear
+    // here, the event is not the armour's and the deployment's copy count cannot
+    // be read from it.
+    let (_, stock) = rows
+        .iter()
+        .find(|(label, _)| label == "stock")
+        .expect("the cover sweep always carries the stock arm");
+    assert_eq!(
+        stock.cover.armor_duplicates, 0,
+        "[lone-cover] the stock policy (no force-flush) wrote {} armour copy datagram(s), so the \
+         `RetransmissionArmorDuplicate` event is not the armour's own and the deployed arm's copy \
+         count cannot be read from it",
+        stock.cover.armor_duplicates,
+    );
+
+    // The sweep moved the observable quantity: a force-flushed tail writes more
+    // datagrams per message than one that is not. This is a measurement of the
+    // lever, not a bound on it.
+    let (_, deployed) = rows
+        .iter()
+        .find(|(label, _)| label == "deployed")
+        .expect("the cover sweep always carries the deployed arm");
+    let (deployed_tx, deployed_datagrams, _, _) = cover_wire_decomposition(deployed);
+    let (stock_tx, stock_datagrams, _, _) = cover_wire_decomposition(stock);
+    let deployed_cover = deployed_datagrams as f64 / deployed_tx.max(1) as f64;
+    let stock_cover = stock_datagrams as f64 / stock_tx.max(1) as f64;
+    assert!(
+        deployed_cover > stock_cover,
+        "[lone-cover] the deployed policy writes {deployed_cover:.3} datagrams per transmission \
+         and the stock policy {stock_cover:.3}: the sweep did not move the cover it varies, so the \
+         three rows are one reading",
+    );
+
+    // The deployed policy's armour must be present and doing work. Both halves
+    // have teeth: a cover that silently withdrew (the copy event stops firing,
+    // or the eligibility test stops matching the interactive frame) drives the
+    // first red, and an armour that no longer absorbs any burst drives the
+    // second -- the repair rate would converge on the unarmoured policy's.
+    assert!(
+        deployed.cover.armor_duplicates > 0,
+        "[lone-cover] the deployed policy wrote no armour copy datagram in {} transmissions, so \
+         the cover the deployment ships is not on the wire and the copies it reports are the \
+         event's, not the armour's",
+        deployed_tx,
+    );
+    let deployed_rung_rate = deployed.cover.rungs as f64 / deployed_tx.max(1) as f64;
+    let stock_rung_rate = stock.cover.rungs as f64 / stock_tx.max(1) as f64;
+    assert!(
+        deployed_rung_rate < stock_rung_rate,
+        "[lone-cover] the deployed policy needed a repair on {:.3} of its transmissions and the \
+         unarmoured policy on {:.3}: the armour did not absorb any burst its stock counterpart \
+         could not, so the cover is not what its own copy count says",
+        deployed_rung_rate,
+        stock_rung_rate,
+    );
 }

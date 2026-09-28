@@ -294,6 +294,7 @@ spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable = standard 
 spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect = standard | 9 | orthogonal@spike-survival | spike-survival@spike=field-3205ms-round-trip+lanes=dual+impairment=owd95-floor+metric=delay-and-session-identity
 mandate_smoke::m1_hostile_tail_decomposition = full | 110 | baseline@hostile-tail | hostile-tail@arm-set=mechanism-decomposition+metric=p50-p99-max-and-wire
 mandate_smoke::m1_hostile_tail_lever = full | 132 | orthogonal@hostile-tail | hostile-tail@arm-set=lane-policy-sweep+metric=p50-p99-max-and-wire
+mandate_smoke::m1_lone_tail_cover_wire = full | 60 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-ge5pct-jitter100ms+metric=cover-decomposition-and-rungs
 ```
 
 Declared sums are `default` 149 s, `standard` 41 s, `full` 1871 s and `perf`
@@ -619,7 +620,7 @@ it — it does, on an absent id).
 ```gate-budgets
 default = 300
 standard = 600
-full = 2150
+full = 2210
 perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.clean-band = mandate_smoke::probe_m4_clean_band_composition
@@ -707,7 +708,7 @@ interactive-scaling@flows=4+offer=concurrent+impairment=clean-or-GE1-or-hostile 
 interactive-scaling@flows=8+offer=concurrent = the sink attributes samples by first-byte tag (A, C..H after the reserved `b'B'`), so seven flows is the tag range's limit and an eight-flow row has no per-flow attribution; the four-flow rung is the largest this instrument can measure.
 attribution@baseline-family=interactive = the family is now declared (its four cells renamed `interactive-cadence@…` off `M1`/`M2`), but two of its rows are composites: `jitter_interactive_with_bulk` varies two declared dimensions from the solo reference (rate: none -> 1MiBps; load: none -> bulk-burst-2MiB-per-3s) and `jitter_interactive_bulk_and_loss` three (loss, rate, load), so no existing arm attributes them; an arm that adds the bulk burst on an uncapped link (load alone), or caps an idle link (rate alone), is what closes this.
 attribution@baseline-family=m3-bulk = the family is now declared (its three cells renamed `m3-bulk@…` off `M3`), but `jitter_bulk_idle_restart_arm` varies four declared dimensions from the smoke reference (rate: 1MiBps -> 2Mbps-c2s; load: saturated -> idle-restart-bursts-512KiB; window: 6s -> 34s; metric: capacity-fraction -> delivered-goodput), so no existing arm attributes it; a one-axis idle-restart arm on the family's own 1 MiB/s saturated link is what closes this.
-attribution@baseline-family=lone-tail = the family is declared (its cells renamed `lone-tail@…` off `M1`) with the request/response pair. `mandate_smoke::m1_lone_tail_field_rtt` still varies two declared dimensions from the family's **reference** (depth: 1-and-2 -> 1; impairment: owd25-iid2pct-iid6pct-ge5pct-jitter5-100-200ms -> owd100-ge5pct-jitter100ms), so it keeps the `composite` label that says its two dimensions move together *against that reference*. What it no longer is, is unattributable: `mandate_smoke::m1_lone_tail_field_rtt_depth_sweep` is declared beside it at `depth=1-and-2` on the same field impairment, so it is exactly one declared dimension (`depth`) from the field row, and that is the repair this line asked for — a field-scale arm that sweeps depth. The sweep is measured, not asserted from a document: 37.194 s for both depths, its own libtest stamp, declared 38 s, and each depth carries the field row's own two guards (depth 1: 183 samples, delivery 1.000, p99 425.9 ms, 6.011 % over 250 ms; depth 2: 222 samples, delivery 1.000, p99 395.5 ms, 6.757 %), both inside the 1500 ms p99 guard and the 15 % over-250 share. Its vacuity demonstration is the same input fault the field row uses, `MANDATE_SMOKE_FAULT=M1_FIELD_RTT_slow`, which drives both guards past their bounds (depth 1's p99 reads 2198.6 ms and 100 % of samples over 250 ms) — so the sweep is a gate, not a printed table. The two rows the pending declaration filed here, `jitter_cellular_timeline_arms` and `jitter_nonloss_impairments`, are **not** declared into this family and are declared instead under the cadence-shaped `non-loss-impairment` family below, because renaming their cells to `lone-tail@…` would state a request/response coverage neither arm has.
+attribution@baseline-family=lone-tail = the family is declared (its cells renamed `lone-tail@…` off `M1`) with the request/response pair. `mandate_smoke::m1_lone_tail_field_rtt` still varies two declared dimensions from the family's **reference** (depth: 1-and-2 -> 1; impairment: owd25-iid2pct-iid6pct-ge5pct-jitter5-100-200ms -> owd100-ge5pct-jitter100ms), so it keeps the `composite` label that says its two dimensions move together *against that reference*. What it no longer is, is unattributable: `mandate_smoke::m1_lone_tail_field_rtt_depth_sweep` is declared beside it at `depth=1-and-2` on the same field impairment, so it is exactly one declared dimension (`depth`) from the field row, and that is the repair this line asked for — a field-scale arm that sweeps depth. The sweep is measured, not asserted from a document: 37.194 s for both depths, its own libtest stamp, declared 38 s, and each depth carries the field row's own two guards (depth 1: 183 samples, delivery 1.000, p99 425.9 ms, 6.011 % over 250 ms; depth 2: 222 samples, delivery 1.000, p99 395.5 ms, 6.757 %), both inside the 1500 ms p99 guard and the 15 % over-250 share. Its vacuity demonstration is the same input fault the field row uses, `MANDATE_SMOKE_FAULT=M1_FIELD_RTT_slow`, which drives both guards past their bounds (depth 1's p99 reads 2198.6 ms and 100 % of samples over 250 ms) — so the sweep is a gate, not a printed table. The two rows the pending declaration filed here, `jitter_cellular_timeline_arms` and `jitter_nonloss_impairments`, are **not** declared into this family and are declared instead under the cadence-shaped `non-loss-impairment` family below, because renaming their cells to `lone-tail@…` would state a request/response coverage neither arm has. `mandate_smoke::m1_lone_tail_cover_wire` is a third composite in this family and for the same reason: it measures the M1 lone-tail arm at `depth=1` on its own `owd25-ge5pct-jitter100ms` link, so against the family's reference it moves `depth`, `impairment` and `metric` together. What it varies from the **arm** it is built on -- the M1 lone-tail arm, taken from `mandate_arms` rather than restated -- is one dimension, the interactive lane's FEC tuning, and that is the dimension the three arms attribute their readings to. Its measurement also closes this family's sibling gap: the armour cover `m` was until now a cell no arm could observe, and the row reports it from the run.
 attribution@baseline-family=decomposition = `jitter_frame_reorder_decomposition` carries `frame-reorder` and `jitter_decomposition` carries `loss-vs-queue`, so the family spans two names; the repair is to rename `jitter_decomposition`'s cell `frame-reorder@…` or to split the family, and because `jitter_decomposition` is two declared dimensions (arms, jitter) from its sibling, a single-axis decomposition arm beside it is the other half of the repair.
 attribution@baseline-family=dual-lane = the family is now declared: all six of its rows carry `hol-dual-lane*` cells, the rename moved `jitter_duallane_arms`'s cell into that namespace with no change to the arm, and the five `hol_probe` dual-lane topology rows are declared on their own libtest stamps (20/20/20/20/17 s). Four of the six vary several declared dimensions from the reference `hol_probe::dual_lane_asym_frame_delivers_and_tears_down`, so no existing arm attributes them: `hol_rtt100_ge5_shared_dual_lane_frame_delivery` varies bulk, metric; `hol_rtt100_ge5_dual_lane_two_interactive_frame_diag` flows, metric; `hol_rtt100_ge5_dual_lane_two_interactive_stock_diag` flows, interactive, metric; and `jitter_duallane_arms` impairment, metric, reorder. A single-axis dual-lane arm beside the reference (the second interactive stream alone, or the interactive lane's frame mode alone, or the sixth row's matched bulk load on the reference's own link) is what closes this. The one-dimensional member is `hol_rtt100_ge5_shared_dual_lane_asym_frame_diag`, which is the `hol-dual-lane` arm already carrying the reference's whole config: the two differ only in the metric each asserts (liveness versus delivery-and-teardown), which is why it is the family's orthogonal member rather than a fifth gap.
 attribution@baseline-family=fairness = the proposed family spans five cell names (`M4`, `fairness-sweep`, `fairness-longrun`, `dual-lane-longrun`, `multi-flow-longrun`) across two tiers; the repair is to split it into the three contexts it measures (`fairness-sweep`, `fairness-longrun`, `dual-lane-longrun`) and to rename the M4 arm's cell `fairness-m4@…`, since the M4 arm is a four-flow fairness arm and the longruns are multi-minute measurements, not the same reference's members.
@@ -1903,13 +1904,124 @@ them cost `110 + 132 = 242 s`, measured on libtest's own stamps. Coverage
 cells: `hostile-tail@arm-set=mechanism-decomposition+metric=p50-p99-max-and-wire`
 (the one-dimension arms above, a stated baseline being the M1 hostile arm) and
 `hostile-tail@arm-set=lane-policy-sweep+metric=p50-p99-max-and-wire` (the lane
-policy, one dimension from that baseline). Cells deliberately **not** covered,
+policy, one dimension from that baseline). A cell deliberately **not** covered,
 with the reason: the four-flow split (M4's own arm and the two level arms own
-it; this probe is one flow), and the armour cover `m` and the ladder's rung
-deadlines (both `rtp`'s, reached by `rtp/GATE.md`'s armour probes). The `full`
-ceiling is raised `1900 -> 2150` as a declared change: `1871 + 242 = 2113 s`, and
-`2150` is the smallest ceiling that admits the measured sum with room for the
-still-undeclared rows.
+it; this probe is one flow). The armour cover `m` was the second such cell, on
+the ground that it is `rtp`'s and reached only by `rtp/GATE.md`'s armour probes
+-- which recorded the consequence for the cover decision as "no existing
+hostile arm can observe `m`". It is now observed from this crate by
+`m1_lone_tail_cover_wire` (below), so the cell is covered and the refusal it
+protected is restated against a measured quantity. The ladder's rung deadlines
+remain `rtp`'s. The `full` ceiling is raised `1900 -> 2150` as a declared
+change: `1871 + 242 = 2113 s`, and `2150` is the smallest ceiling that admits
+the measured sum with room for the still-undeclared rows.
+
+### The lone tail's cover, measured from the run
+
+`mandate_smoke::m1_lone_tail_cover_wire` (full, 60 s) is the arm that makes the
+armour cover `m` observable from a real run. It runs the M1 lone-tail arm three
+times -- the one dimension it varies is the interactive lane's FEC tuning, the
+only cover knob this crate owns -- and reads each arm's per-message wire from
+the transport's own send path rather than from a constant:
+
+* `RetransmissionArmorDuplicate` events: one per armour copy datagram the lane
+  actually wrote, logged by the transport only after the underlay send
+  succeeds;
+* `fec.parity_sent`, with the flushed-group-size histogram that explains the
+  count: the parity datagrams the FEC flush emitted, and how many data symbols
+  each group it flushed for carried;
+* `retransmission_counters.attempts + tail_probes`: the transmissions the send
+  space fired as repairs -- one per rung, whether a tail-loss probe or a
+  full-RTO selection, the same pair the wire-measured ladder replay in `rtp`
+  reads off its own firing sequence.
+
+The c2s link's own accepted-datagram count is the cross-check, and the arm's
+gate is that the send path cannot have written more datagrams than the link
+carried; the residual between the two is the small ACK/control traffic the
+interactive messages share their direction with.
+
+**Measured.** Four reps of the three-arm sweep on the pinned `rtp v0.0.101`,
+15 s request/response windows, libtest `--test-threads=1`, `uptime` one-minute
+load `2.2-6.7` across the set (each rep's own load is on its line in the run
+log); the table is the median of the four. `datagrams/tx` is the primary plus
+its copies plus its parity per transmission, summed from the events and
+counters above; `c2s/message` is the link's own datagram count per offered
+message, so it also carries the ACK/control traffic.
+
+| policy | datagrams/tx | copies/tx | parity/tx | groups/message | c2s/message | repairs/tx | wire_x | p99 | max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `deployed` (`instream_flush`, parity 1) | **6.75** | 3.90 | 1.87 | 1.91 | 8.72 | 2.6 % | 6.74x | 177.2 | 1157.5 |
+| `stock` (`FecTuning::default()`) | 2.25 | 0 | 1.25 | 1.41 | 3.80 | 11.4 % | 2.24x | 240.7 | 2299.5 |
+| `parity3` (force-flush, parity 3) | 9.48 | 3.88 | 4.56 | 1.64 | 11.47 | 2.5 % | 7.99x | 181.0 | 550.9 |
+
+**What the newly-visible quantity says about the cover.** The deployment's cover
+is the minimum on the measured tail, and neither direction around it is better.
+*Down*: withdrawing the armour (`stock`, `6.75 -> 2.25` datagrams per
+transmission, the lane's wire cut to a third) raises the lone-tail p99
+`177.2 -> 240.7 ms` and multiplies the repair rate by `4.3x` (`2.6 % -> 11.4 %`
+of transmissions) -- the burst the armour absorbs becomes a rung. *Up*: a third
+parity (`parity3`, `6.75 -> 9.48`) does **not** lower the p99 (`181.0` against
+`177.2`, inside the deployed arm's own `141.4-201.5 ms` rep range) and costs
+`19 %` more wire. **The refusal `rtp/GATE.md` records therefore survives the
+observability it lacked**, and the quantity's own value strengthens it: the lane
+spends *more* than the constant it was argued from, and what it buys is the
+tail.
+
+**The constant is refuted by the same measurement.**
+`TAIL_DATAGRAMS_PER_TRANSMISSION` declares six datagrams per transmission
+(`1 + 4 copies + 1 parity`, or `1 + 5 copies` with the loss gate closed). The
+deployed arm measures `6.75`: one primary, `3.90` armour copies and `1.87`
+parity (the three sum to `6.77`; the table's figures are medians of ratios, not
+a sum). The parity is nearly twice the declared one because the FEC flush emits
+`1.91` single-symbol groups per message rather than one -- the flushed-group
+histogram reads `[2035, 3, 1, 0]` to `[2213, 6, 0, 0]` across the four reps,
+i.e. almost every group carries exactly one data symbol. The constant is left
+at its declared value, because retuning it would retune
+`m1_lone_tail_rung_distribution`'s law, which is a frozen arm; instead the
+value is now **labelled derived wherever it is printed** (the censoring row's
+`datagrams=6(derived)`, the field's own doc), so no reader takes a prediction
+from it for a measurement of the lane.
+
+**The arm the constant calibrates still passes, and its band is what absorbs
+the gap.** `mandate_smoke::m1_lone_tail_rung_distribution` reads
+`observed ge1 = 11` rounds against its corrected law's `14.79` over four 15 s
+windows (`74.1 s` of libtest's own time, `uptime` load `1.70-2.93`), inside its
+`0.25x-3.0x` band `[3.70, 44.37]` -- so the arm is a tripwire on a collapsed
+cover, not a measurement of the cover. The two instruments agree where they
+overlap: the send space's own counters put the deployed arm's repair rate at
+`2.6 %` of transmissions and the rung-distribution arm's latency samples put it
+at `2.75 %` of rounds.
+
+**The arm's gate.** It asserts its own instrument (every arm observed, offered
+and delivered), the decomposition's two wire bounds (the send path's datagrams
+may not exceed the link's own count, and the count it cannot account for -- the
+ACK/control share of the lane's own c2s datagrams -- may not exceed three per
+offered message; measured across the reps it runs `1.2-2.0`), the withdrawn-cover
+control (the stock policy, the only arm with no force-flush, writes no armour
+copy at all -- so the copy count really is the armour's), that the deployed
+policy's armour is present and doing work (`copies > 0`, and a repair rate below
+the unarmoured policy's), and that the sweep moved the quantity it varies.
+
+Both halves of the armour assertion and the wire identity were shown to fail,
+each from a mutation that removes the property rather than re-expressing it, the
+mutated line printed between the edit and the verdict and the pair of counters
+counted by occurrence (one each) before and after:
+
+* the deployed policy's tuning replaced with the stock one; the arm failed *"the
+deployed policy wrote no armour copy datagram in 233 transmissions"*, with the
+mutated `deployed` row reading `copies=0, cover_per_tx=2.309` against the
+unmutated `6.75`;
+* `3 * messages` added to the attributable datagram count; the arm failed *"the
+deployed arm's send path reports 9794 datagrams (1003 transmissions + 3639
+armour copies + 2218 parity) but its own c2s link accepted only 8897"*.
+
+The restores were verified byte-identical to the pre-probe copy and the tree
+re-formatted before the gates below were run.
+
+**Cost.** `56.0-56.4 s` of libtest's own time for the three `~18.6 s` arms, over
+four reps; declared 60 s. The `full` ceiling is raised `2150 -> 2210` as a
+declared change: `2113 + 60 = 2173 s`, and `2210` is the smallest ceiling that
+admits the sum with room for the tier's still-undeclared rows.
 
 ### The four-flow hostile level: `m4_hostile_lane_p99_ceiling`
 
@@ -2188,6 +2300,7 @@ mandate_smoke::m1_lone_tail_field_rtt = full
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep = full
 mandate_smoke::m1_lone_tail_loss_model = full
 mandate_smoke::m1_lone_tail_rung_distribution = full
+mandate_smoke::m1_lone_tail_cover_wire = full
 mandate_smoke::probe_m4_clean_band_composition = perf
 mandate_smoke::probe_m4_clean_band_composition_noloss = perf
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
@@ -2341,6 +2454,7 @@ mandate_smoke::m1_interactive_tail_latency
 spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect
 spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable
 mandate_smoke::m1_lone_tail_rung_distribution
+mandate_smoke::m1_lone_tail_cover_wire
 mandate_smoke::m1_hostile_tail_decomposition
 mandate_smoke::m1_hostile_tail_lever
 mandate_smoke::m2_offered_load_latency
