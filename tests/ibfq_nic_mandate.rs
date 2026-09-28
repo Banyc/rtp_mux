@@ -1,4 +1,4 @@
-//! A/B/C: does putting a per-NIC interactive/bulk fair queue under the
+//! A/B/C: does putting a per-egress-path interactive/bulk fair queue under the
 //! dual-lane client degrade the tri-mandate?
 //!
 //! Three arms, interleaved rep-by-rep in one process so host-load drift hits
@@ -10,7 +10,7 @@
 //!   (`dual_mux_client_connect_lane_rtp_via`): two lanes straight onto their
 //!   two sockets.
 //! * `ibfq` — the same topology with both lanes' sends arbitrated by one
-//!   [`rtp::nic::NicScheduler`]: strict interactive-before-bulk, no rate.
+//!   [`rtp::cc::CcSignalHub`]: strict interactive-before-bulk, no rate.
 //!
 //! Evidence goes to `$IBFQ_AB_DIR` (default `target/ibfq-ab`):
 //! `ab-samples.csv` (arm, rep, one-way latency ms), `ab-reps.csv` (per-rep
@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use netem_test::kit::stats::{HolSummary, summarize};
 use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, TestTaskSubmitter, submit_test_task};
-use netem_test::{NetemConfig, NetemPair};
-use rtp::nic::{Class, NicEndpoint, NicScheduler};
+use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
+use rtp::cc::CcSignalHub;
 use rtp::testkit::rtp::send_timestamped_messages;
 use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
@@ -49,26 +49,32 @@ const GRACE: Duration = Duration::from_secs(1);
 /// A reporting nominal for the bulk-goodput column, not a rate the arbiter
 /// enforces (it has none): it only keeps the column comparable across arms.
 const LINK_BYTES_PER_SEC: f64 = 1024.0 * 1024.0;
+/// The shared bottleneck both lanes' client→server traffic passes through.
+/// This is the *instrument*, not the arbiter: the arbiter has no rate. It makes
+/// the two lanes genuinely contend for one queue, which the per-lane pairs of
+/// the earlier arm did not.
+const SHAPER_RATE_BPS: u64 = 8_388_608; // 1 MiB/s
+const SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
 const BULK_CHUNK: usize = 64 * 1024;
 const REPS: usize = 3;
-const ARMS: [Arm; 2] = [Arm::Baseline, Arm::Ibfq];
+const ARMS: [Arm; 2] = [Arm::Baseline, Arm::Cc];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
     Baseline,
-    Ibfq,
+    Cc,
 }
 
 impl Arm {
     fn name(self) -> &'static str {
         match self {
             Arm::Baseline => "baseline",
-            Arm::Ibfq => "ibfq",
+            Arm::Cc => "cc_link",
         }
     }
-    /// Whether this arm routes both lanes through one per-NIC arbiter.
+    /// Whether this arm wires both lanes through one per-egress-path signal router.
     fn use_scheduler(self) -> bool {
-        matches!(self, Arm::Ibfq)
+        matches!(self, Arm::Cc)
     }
 }
 
@@ -109,21 +115,30 @@ fn lane_connect_config(lane: LaneRtpConfig) -> rtp::udp::ConnectConfig<'static> 
 type BoxedRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 
-async fn connect_lane_over_nic(
+async fn connect_lane_over_cc_link(
     tx: &TestTaskSubmitter,
-    scheduler: &NicScheduler,
-    class: Class,
+    scheduler: Option<&CcSignalHub>,
+    class: mux::LaneClass,
     addr: SocketAddr,
     lane: LaneRtpConfig,
 ) -> (BoxedRead, BoxedWrite) {
-    let ep = NicEndpoint::bind(scheduler.clone(), class, "127.0.0.1:0".parse().unwrap())
+    let mut config = lane_connect_config(lane);
+    if let Some(scheduler) = scheduler {
+        // The transport resolves the lane's `(src, dst)` path group itself.
+        let role = match class {
+            mux::LaneClass::Interactive => rtp::cc::CcRole::Interactive,
+            mux::LaneClass::Bulk => rtp::cc::CcRole::Bulk,
+        };
+        config.cc_link = Some(rtp::cc::CcLink::new(scheduler.clone(), role));
+    }
+    let rtp::udp::Connected {
+        read,
+        write,
+        supervisor,
+        ..
+    } = rtp::udp::connect_with("127.0.0.1:0", addr, config)
         .await
-        .expect("bind NIC endpoint");
-    ep.connect(addr).await.expect("connect NIC endpoint");
-    let layer = ep
-        .into_rtp_layer(lane_connect_config(lane))
-        .expect("build rtp layer over the NIC halves");
-    let (read, write, supervisor) = rtp::socket::socket(layer, None);
+        .expect("connect lane");
     submit_test_task(
         tx,
         Box::pin(async move {
@@ -137,10 +152,10 @@ async fn connect_lane_over_nic(
 }
 
 /// Mirrors `dual_mux_client_connect_lane_rtp_via`, but both lanes' sends pass
-/// through one shared [`NicScheduler`].
-async fn connect_over_nic(
+/// through one shared [`CcSignalHub`].
+async fn connect_over_cc_link(
     tx: &TestTaskSubmitter,
-    scheduler: NicScheduler,
+    scheduler: CcSignalHub,
     int_addr: SocketAddr,
     bulk_addr: SocketAddr,
     int_rtp: LaneRtpConfig,
@@ -158,8 +173,14 @@ async fn connect_over_nic(
     };
     let nonce = mux::PairingNonce::generate();
     let group = mux::GroupToken::generate();
-    let (int_reader, mut int_writer) =
-        connect_lane_over_nic(tx, &scheduler, Class::Interactive, int_addr, int_rtp).await;
+    let (int_reader, mut int_writer) = connect_lane_over_cc_link(
+        tx,
+        Some(&scheduler),
+        mux::LaneClass::Interactive,
+        int_addr,
+        int_rtp,
+    )
+    .await;
     mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
@@ -167,8 +188,14 @@ async fn connect_over_nic(
         .flush()
         .await
         .map_err(|e| mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(e.kind())))?;
-    let (bulk_reader, mut bulk_writer) =
-        connect_lane_over_nic(tx, &scheduler, Class::Bulk, bulk_addr, bulk_rtp).await;
+    let (bulk_reader, mut bulk_writer) = connect_lane_over_cc_link(
+        tx,
+        Some(&scheduler),
+        mux::LaneClass::Bulk,
+        bulk_addr,
+        bulk_rtp,
+    )
+    .await;
     mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
@@ -200,7 +227,7 @@ async fn connect_over_nic(
             if let Some(result) = super_spawner.join_next().await
                 && let Err(err) = result
             {
-                panic!("NIC dual-mux session supervision failed: {err:?}");
+                panic!("egress path dual-mux session supervision failed: {err:?}");
             }
         }),
     );
@@ -211,13 +238,30 @@ struct Run {
     summary: HolSummary,
     goodput_fraction: f64,
     samples: Vec<f64>,
+    /// Shared bottleneck queue depth (bytes) sampled every 5 ms.
+    backlog_p50: u64,
+    backlog_p99: u64,
+    backlog_max: u64,
+    /// Samples (of the same cadence) in which the bulk class was told an
+    /// interactive lane shared its egress path.
+    signal_shared: u64,
+}
+
+/// Percentile of a byte sample set (nearest-rank).
+fn pct(xs: &[u64], p: f64) -> u64 {
+    if xs.is_empty() {
+        return 0;
+    }
+    let mut s = xs.to_vec();
+    s.sort_unstable();
+    s[((s.len() as f64 * p) as usize).min(s.len() - 1)]
 }
 
 async fn run_arm(arm: Arm) -> Run {
     let base = Instant::now();
     // Strict priority, no rate: the arbiter decides order only, so the
     // baseline arm (no arbiter) is the control.
-    let scheduler = arm.use_scheduler().then(NicScheduler::new);
+    let scheduler = arm.use_scheduler().then(CcSignalHub::new);
     let mut tasks = TestScope::new();
     let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
     tasks
@@ -230,10 +274,53 @@ async fn run_arm(arm: Arm) -> Run {
                 )
                 .await
                 .unwrap();
-            let int_pair = NetemPair::spawn(int_addr, link(41), link(42)).unwrap();
-            let bulk_pair = NetemPair::spawn(bulk_addr, link(43), link(44)).unwrap();
+            // Both lanes' client→server traffic shares one bottleneck queue,
+            // so the bulk lane can actually stand in front of the interactive
+            // lane — the contention the arbiter exists to order.
+            let scheduler_probe = scheduler.clone();
+            let c2s = BottleneckShaper::new(SHAPER_RATE_BPS, SHAPER_LIMIT_BYTES);
+            let int_pair =
+                NetemPair::spawn_shared(int_addr, link(41), link(42), Some(c2s.clone()), None)
+                    .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(bulk_addr, link(43), link(44), Some(c2s.clone()), None)
+                    .unwrap();
+            // Sample the *shared bottleneck queue* the arbiter exists to bound.
+            // The interactive percentile alone cannot say whether a gate kept
+            // the queue short or merely moved which datagrams sat in a full one.
+            let backlog = Arc::new(Mutex::new(Vec::<u64>::new()));
+            let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let signal_shared = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let bulk_probe = scheduler_probe.as_ref().map(|scheduler| {
+                let ip = std::net::Ipv4Addr::LOCALHOST.into();
+                scheduler.group(ip, ip).bulk()
+            });
+            {
+                let backlog = Arc::clone(&backlog);
+                let sampling = Arc::clone(&sampling);
+                let shared = Arc::clone(&signal_shared);
+                let probe = bulk_probe.clone();
+                let shaper = c2s.clone();
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        while sampling.load(Ordering::Relaxed) {
+                            backlog
+                                .lock()
+                                .unwrap()
+                                .push(shaper.backlog_bytes(Instant::now()));
+                            if let Some(probe) = &probe
+                                && probe.is_shared()
+                            {
+                                shared.fetch_add(1, Ordering::Relaxed);
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    }),
+                );
+            }
             let (opener, _accepter) = match scheduler {
-                Some(scheduler) => connect_over_nic(
+                Some(scheduler) => connect_over_cc_link(
                     &task_tx,
                     scheduler,
                     int_pair.client_addr(),
@@ -310,6 +397,8 @@ async fn run_arm(arm: Arm) -> Run {
             tokio::time::sleep(GRACE).await;
             let bulk_bytes = bulk_sink.load(Ordering::Relaxed) - bulk_before;
             let samples = samples.lock().unwrap().clone();
+            sampling.store(false, Ordering::Relaxed);
+            let backlog = backlog.lock().unwrap().clone();
             let received = samples.len() as u64;
             let summary = summarize(samples.clone(), sent, received, bulk_bytes, bulk_secs);
             let goodput_fraction = (bulk_bytes as f64 / bulk_secs) / LINK_BYTES_PER_SEC;
@@ -317,6 +406,10 @@ async fn run_arm(arm: Arm) -> Run {
                 summary,
                 goodput_fraction,
                 samples,
+                backlog_p50: pct(&backlog, 0.50),
+                backlog_p99: pct(&backlog, 0.99),
+                backlog_max: backlog.iter().copied().max().unwrap_or(0),
+                signal_shared: signal_shared.load(Ordering::Relaxed),
             }
         })
         .await
@@ -352,6 +445,7 @@ async fn ibfq_nic_ab_against_the_untouched_dual_lane() {
     let dir = std::env::var("IBFQ_AB_DIR").unwrap_or_else(|_| "target/ibfq-ab".to_string());
     std::fs::create_dir_all(&dir).unwrap();
     let mut reps: Vec<(Arm, usize, HolSummary, f64)> = Vec::new();
+    let mut backlogs: Vec<(Arm, u64)> = Vec::new();
     let mut pooled: Vec<(Arm, Vec<f64>)> = ARMS.iter().map(|a| (*a, Vec::new())).collect();
     let mut samples_csv = String::from("arm,rep,latency_ms\n");
     for rep in 0..REPS {
@@ -367,7 +461,7 @@ async fn ibfq_nic_ab_against_the_untouched_dual_lane() {
                 .1
                 .extend_from_slice(&run.samples);
             eprintln!(
-                "[ab] {:>13} rep{rep}  p50 {:5.1} p90 {:5.1} p99 {:5.1} max {:6.1}  delivery {:.3}  bulk {:.3}x  n {}",
+                "[ab] {:>13} rep{rep}  p50 {:5.1} p90 {:5.1} p99 {:5.1} max {:6.1}  delivery {:.3}  bulk {:.3}x  backlog p50/p99/max {}/{} /{} B  shared {}  n {}",
                 arm.name(),
                 run.summary.p50,
                 run.summary.p90,
@@ -375,9 +469,14 @@ async fn ibfq_nic_ab_against_the_untouched_dual_lane() {
                 run.summary.max,
                 run.summary.delivery_pct,
                 run.goodput_fraction,
+                run.backlog_p50,
+                run.backlog_p99,
+                run.backlog_max,
+                run.signal_shared,
                 run.samples.len(),
             );
             reps.push((arm, rep, run.summary, run.goodput_fraction));
+            backlogs.push((arm, run.backlog_p99));
         }
     }
 
@@ -417,9 +516,22 @@ async fn ibfq_nic_ab_against_the_untouched_dual_lane() {
         )
     };
     let p99 = |arm: Arm| stat(arm, |s| s.p99);
+    let backlog_p99 = |arm: Arm| {
+        median(
+            backlogs
+                .iter()
+                .filter(|(a, _)| *a == arm)
+                .map(|(_, b)| *b as f64)
+                .collect(),
+        )
+    };
 
     let mut cdf_ascii = String::new();
-    let _ = writeln!(cdf_ascii, "percentile   baseline        ibfq");
+    let _ = write!(cdf_ascii, "percentile");
+    for arm in ARMS {
+        let _ = write!(cdf_ascii, "{:>14}", arm.name());
+    }
+    let _ = writeln!(cdf_ascii);
     for pct in [50.0, 90.0, 99.0, 100.0] {
         let _ = write!(cdf_ascii, "{pct:>9.0}%");
         for arm in ARMS {
@@ -444,33 +556,44 @@ async fn ibfq_nic_ab_against_the_untouched_dual_lane() {
     }
     eprintln!("[ab] pooled CDF (interactive one-way latency, ms):\n{cdf_ascii}");
     eprintln!(
-        "[ab] median p99   baseline {:.1}  ibfq {:.1} ms\n\
-         [ab] median bulk  baseline {:.3}  ibfq {:.3} x link",
+        "[ab] median p99   baseline {:.1}  cc_link {:.1} ms\n\
+         [ab] median bulk  baseline {:.3}  cc_link {:.3} x link\n\
+         [ab] median backlog p99  baseline {:.0}  cc_link {:.0} B",
         p99(Arm::Baseline),
-        p99(Arm::Ibfq),
+        p99(Arm::Cc),
         bulk(Arm::Baseline),
-        bulk(Arm::Ibfq),
+        bulk(Arm::Cc),
+        backlog_p99(Arm::Baseline),
+        backlog_p99(Arm::Cc),
     );
 
     render_cdf_svg(&dir, &pooled, &reps);
     eprintln!("[ab] panels: {dir}/ab-cdf.svg  data: {dir}/ab-reps.csv, {dir}/ab-samples.csv");
 
-    // The arbiter must not degrade the interactive tail against the
-    // untouched path.
+    // ── The mechanism's own purpose: bound the shared *tail* queue (not
+    // merely the median) while keeping bulk. A gate can only move the median
+    // because its reaction is one RTT behind; feeding the interactive lane's
+    // queue to the bulk *controller* is what should reach the tail.
     assert!(
-        p99(Arm::Ibfq) <= p99(Arm::Baseline) * 1.25,
-        "ibfq p99 {:.1} ms exceeds baseline {:.1} ms by >25%: the arbiter degraded M1",
-        p99(Arm::Ibfq),
-        p99(Arm::Baseline),
+        backlog_p99(Arm::Cc) <= backlog_p99(Arm::Baseline) * 0.5,
+        "the cross-lane signal did not bound the shared tail queue (cc_link p99 backlog {:.0} B vs \
+         baseline {:.0} B): the interactive tail cannot improve while the buffer stays full",
+        backlog_p99(Arm::Cc),
+        backlog_p99(Arm::Baseline),
     );
-    // And it must not cap throughput: bulk runs at the link's own rate, so its
-    // goodput must stay in the same class as the untouched path.
+    // And it must not cap throughput — the user's hard constraint.
     assert!(
-        bulk(Arm::Ibfq) >= bulk(Arm::Baseline) * 0.5,
-        "ibfq bulk goodput {:.3} x nominal fell below half the baseline {:.3}: the arbiter \
-         throttled bulk",
-        bulk(Arm::Ibfq),
+        bulk(Arm::Cc) >= bulk(Arm::Baseline) * 0.9,
+        "the cross-lane signal capped bulk goodput ({:.3} vs {:.3} x nominal)",
+        bulk(Arm::Cc),
         bulk(Arm::Baseline),
+    );
+    // The interactive tail itself must move — the point of the mechanism.
+    assert!(
+        p99(Arm::Cc) <= p99(Arm::Baseline),
+        "the cross-lane signal did not improve the interactive p99 ({:.1} vs {:.1} ms)",
+        p99(Arm::Cc),
+        p99(Arm::Baseline),
     );
 }
 
@@ -494,7 +617,7 @@ fn render_cdf_svg(dir: &str, pooled: &[(Arm, Vec<f64>)], reps: &[(Arm, usize, Ho
     let _ = writeln!(svg, "<rect width=\"{w}\" height=\"{h}\" fill=\"white\"/>");
     let _ = writeln!(
         svg,
-        "<text x=\"{left}\" y=\"22\" font-size=\"14\">interactive one-way latency CDF — baseline vs ibfq (x clamped to {x_max:.0} ms)</text>"
+        "<text x=\"{left}\" y=\"22\" font-size=\"14\">interactive one-way latency CDF — baseline vs cc_link (x clamped to {x_max:.0} ms)</text>"
     );
     for pct in [0.0, 25.0, 50.0, 75.0, 100.0] {
         let yy = y(pct);

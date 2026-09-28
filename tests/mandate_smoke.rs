@@ -110,10 +110,11 @@ use netem_test::kit::payload::{cyclic_payload, with_timeout};
 use netem_test::kit::presets::gilbert_elliott_loss;
 use netem_test::kit::stats::{HolSummary, summarize};
 use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
-use netem_test::{LossModel, NetemConfig, NetemPair};
+use netem_test::{BottleneckShaper, LossModel, NetemConfig, NetemPair};
 use rtp::metrics::{MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver};
 use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
+    dual_mux_client_connect_lane_rtp_via_cc_link,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
 use rtp_mux::testkit::mux_over_rtp::send_timestamped_messages;
@@ -160,6 +161,11 @@ const BULK_PERIOD: Duration = Duration::from_secs(3);
 const BULK_RAMP: Duration = Duration::from_millis(1500);
 /// The bulk lane's configured capacity, the M3 denominator.
 const M3_CAPACITY_BPS: u64 = 8 * 1024 * 1024;
+
+/// The one uplink bottleneck both lanes' writes cross on a `shared_shaper` arm: the
+/// operator's own Minecraft trace's mid-range capacity (1 MiB/s). The shaper is
+/// the *instrument*; the CC signal has no rate of its own.
+const SHARED_UP_RATE_BPS: u64 = 8_388_608;
 /// The saturating bulk window (full / quick tier).
 const BULK_WINDOW: Duration = Duration::from_secs(6);
 const QUICK_BULK_WINDOW: Duration = Duration::from_secs(2);
@@ -659,9 +665,20 @@ struct ArmSpec {
     int_c2s: NetemConfig,
     int_s2c: NetemConfig,
     bulk: bool,
+    /// Push the bulk lane back to back instead of on the 2 MiB / 3 s clock.
+    /// `false` is every existing arm; the Minecraft arm saturates.
+    saturating_bulk: bool,
     load: Load,
     window: Duration,
     msg_bytes: usize,
+    /// The interactive cadence. `CADENCE` for every existing arm; the
+    /// Minecraft shape's 300 B / 20 ms sets its own.
+    cadence: Duration,
+    /// Route both lanes through one shared downstream `BottleneckShaper`, so
+    /// they contend for one queue the way they do on a real egress.
+    shared_shaper: bool,
+    /// Attach both lanes to one congestion-signalling hub (the mechanism arm).
+    cc_link: Option<rtp::cc::CcSignalHub>,
 }
 
 /// One impairment direction: fixed delay + jitter, an independent-loss
@@ -717,9 +734,13 @@ fn field_rtt_arm() -> ArmSpec {
         int_c2s: shift(field_rtt_link(41)),
         int_s2c: shift(field_rtt_link(42)),
         bulk: false,
+        saturating_bulk: false,
         load: Load::RequestResponse { depth: 1 },
         window: rr_window(),
         msg_bytes: MSG_BYTES,
+        cadence: CADENCE,
+        shared_shaper: false,
+        cc_link: None,
     }
 }
 
@@ -779,29 +800,41 @@ fn mandate_arms(mandate: &str) -> Vec<ArmSpec> {
             int_c2s: clean_c2s,
             int_s2c: clean_s2c,
             bulk: clean_bulk,
+            saturating_bulk: false,
             load: Load::Cadence {
                 cadence_divisor: clean_cadence_divisor,
             },
             window: clean_window,
             msg_bytes: MSG_BYTES,
+            cadence: CADENCE,
+            shared_shaper: false,
+            cc_link: None,
         },
         ArmSpec {
             name: "hostile",
             int_c2s: impaired_link(41),
             int_s2c: impaired_link(42),
             bulk: true,
+            saturating_bulk: false,
             load: Load::Cadence { cadence_divisor: 1 },
             window: cadence,
             msg_bytes: MSG_BYTES,
+            cadence: CADENCE,
+            shared_shaper: false,
+            cc_link: None,
         },
         ArmSpec {
             name: "lone_tail",
             int_c2s: impaired_link(41),
             int_s2c: impaired_link(42),
             bulk: false,
+            saturating_bulk: false,
             load: Load::RequestResponse { depth: 1 },
             window: rr_window(),
             msg_bytes: MSG_BYTES,
+            cadence: CADENCE,
+            shared_shaper: false,
+            cc_link: None,
         },
     ]
 }
@@ -1140,9 +1173,13 @@ async fn run_arm_observed(
         int_c2s,
         int_s2c,
         bulk,
+        saturating_bulk,
         load,
         window,
         msg_bytes,
+        cadence,
+        shared_shaper,
+        cc_link,
     } = spec;
     let wall = Instant::now();
     let bulk_rtp = LaneRtpConfig::production_bulk();
@@ -1161,22 +1198,51 @@ async fn run_arm_observed(
                 )
                 .await
                 .unwrap();
-            let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
-            let bulk_pair = NetemPair::spawn(
-                bulk_addr,
-                if bulk {
-                    bulk_c2s.clone()
-                } else {
-                    bulk_off.clone()
-                },
-                if bulk {
-                    bulk_s2c.clone()
-                } else {
-                    bulk_off.clone()
-                },
-            )
-            .unwrap();
-            let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via(
+            // One downstream queue both lanes cross, when the arm asks for it:
+            // the shared-buffer contention the CC signal exists to order.
+            let shared_uplink = shared_shaper.then(|| BottleneckShaper::new(SHARED_UP_RATE_BPS, 0));
+            let mut bulk_c2s_link = if bulk {
+                bulk_c2s.clone()
+            } else {
+                bulk_off.clone()
+            };
+            let bulk_s2c_link = if bulk {
+                bulk_s2c.clone()
+            } else {
+                bulk_off.clone()
+            };
+            let mut int_c2s_link = int_c2s.clone();
+            if shared_shaper {
+                // The shared shaper *is* the uplink rate where both lanes' writes
+                // contend; a per-link rate on the same direction is a
+                // double-shape the instrument refuses.
+                int_c2s_link.rate = 0;
+                bulk_c2s_link.rate = 0;
+            }
+            let int_pair = match &shared_uplink {
+                Some(up) => NetemPair::spawn_shared(
+                    int_addr,
+                    int_c2s_link.clone(),
+                    int_s2c.clone(),
+                    Some(up.clone()),
+                    None,
+                )
+                .unwrap(),
+                None => NetemPair::spawn(int_addr, int_c2s_link.clone(), int_s2c.clone()).unwrap(),
+            };
+            let bulk_pair = match &shared_uplink {
+                Some(up) => NetemPair::spawn_shared(
+                    bulk_addr,
+                    bulk_c2s_link.clone(),
+                    bulk_s2c_link.clone(),
+                    Some(up.clone()),
+                    None,
+                )
+                .unwrap(),
+                None => NetemPair::spawn(bulk_addr, bulk_c2s_link.clone(), bulk_s2c_link.clone())
+                    .unwrap(),
+            };
+            let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via_cc_link(
                 &task_tx,
                 int_pair.client_addr(),
                 bulk_pair.client_addr(),
@@ -1184,6 +1250,7 @@ async fn run_arm_observed(
                 bulk_rtp,
                 observed.as_ref().map(|(observer, _)| observer.clone()),
                 None,
+                cc_link,
             )
             .await
             .unwrap();
@@ -1246,7 +1313,7 @@ async fn run_arm_observed(
                                 &mut lat_write,
                                 base,
                                 msg_bytes,
-                                CADENCE * cadence_divisor,
+                                cadence * cadence_divisor,
                                 window,
                             )
                             .await
@@ -1275,15 +1342,29 @@ async fn run_arm_observed(
                     return 0;
                 }
                 let payload = cyclic_payload(BULK_BURST_BYTES);
-                periodic_burst(
-                    &mut write,
-                    &payload,
-                    BULK_BURST_BYTES,
-                    BULK_PERIOD,
-                    BULK_RAMP,
-                    window,
-                )
-                .await
+                if saturating_bulk {
+                    // Back to back, no clock: the offer is whatever the window
+                    // admits, so the shared queue is the limit the arm measures.
+                    let deadline = Instant::now() + window;
+                    let mut written = 0u64;
+                    while Instant::now() < deadline {
+                        if write.write_all(&payload).await.is_err() {
+                            break;
+                        }
+                        written += BULK_BURST_BYTES as u64;
+                    }
+                    written
+                } else {
+                    periodic_burst(
+                        &mut write,
+                        &payload,
+                        BULK_BURST_BYTES,
+                        BULK_PERIOD,
+                        BULK_RAMP,
+                        window,
+                    )
+                    .await
+                }
             };
             let ((sent, rtts), _bulk_written) = tokio::join!(interactive, bulk_fut);
 
@@ -5523,9 +5604,13 @@ fn hostile_decomposition_arms() -> Vec<ArmSpec> {
             int_c2s,
             int_s2c,
             bulk,
+            saturating_bulk: false,
             load,
             window,
             msg_bytes: MSG_BYTES,
+            cadence: CADENCE,
+            shared_shaper: false,
+            cc_link: None,
         };
     vec![
         // baseline: the M1 hostile arm, unchanged.
@@ -6007,5 +6092,84 @@ async fn m1_lone_tail_cover_wire() {
          could not, so the cover is not what its own copy count says",
         deployed_rung_rate,
         stock_rung_rate,
+    );
+}
+
+// ───────── the cross-connection CC signal, in the Minecraft shape ─────────
+
+/// The mechanism arm. Every dimension is the mandate baseline except the two
+/// the Minecraft shape names — a realistic interactive cadence (300 B / 20 ms)
+/// and a **saturating downstream** bulk — and the one under test: whether the
+/// cross-connection CC signal is wired (`Some(hub)` vs `None`). Both lanes cross
+/// one shared 1 MiB/s downstream bottleneck, so a difference attributes to the
+/// signal.
+fn mc_nic_arm(name: &'static str, cc_link: Option<rtp::cc::CcSignalHub>) -> ArmSpec {
+    ArmSpec {
+        name,
+        int_c2s: link(41, OWD, JITTER, LOSS_2, 0),
+        int_s2c: link(42, OWD, JITTER, LOSS_2, 0),
+        bulk: true,
+        saturating_bulk: true,
+        load: Load::Cadence { cadence_divisor: 1 },
+        window: cadence_window(),
+        msg_bytes: 300,
+        cadence: Duration::from_millis(20),
+        shared_shaper: true,
+        cc_link,
+    }
+}
+
+/// M1 under the Minecraft shape: with the CC signal the interactive tail must
+/// not worsen, and the bulk lane must not be capped — the user's hard
+/// constraint, asserted on the bulk sink's own delivered bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "opt-in: the Minecraft-shape CC-signal arm prints [mandate-smoke mc_*] rows \
+            without a MANDATE line, so it belongs to a declared perf-tier arm rather than \
+            the always-run M1-M4 set; run with --ignored --nocapture"]
+async fn m1_nic_minecraft_saturating_downstream() {
+    let plain = run_arm(mc_nic_arm("mc_plain", None)).await;
+    print_arm(&plain);
+    let signalled = run_arm(mc_nic_arm(
+        "mc_signalled",
+        Some(rtp::cc::CcSignalHub::new()),
+    ))
+    .await;
+    print_arm(&signalled);
+    let (p, s) = (&plain.summary, &signalled.summary);
+    eprintln!(
+        "[mc-cc] interactive one-way   plain p50 {:6.1} p90 {:6.1} p99 {:6.1} max {:6.1}\n\
+         [mc-cc]                       cc    p50 {:6.1} p90 {:6.1} p99 {:6.1} max {:6.1}",
+        p.p50, p.p90, p.p99, p.max, s.p50, s.p90, s.p99, s.max,
+    );
+    eprintln!(
+        "[mc-cc] interactive delivery  plain {:.4}  cc {:.4}   bulk sink bytes  plain {}  cc {}",
+        p.delivery_pct, s.delivery_pct, plain.bulk_sink_bytes, signalled.bulk_sink_bytes,
+    );
+    // The mandate bound, plus a regression tripwire against the untouched arm.
+    // A single rep each is p99-noisy, so the *bound* is the assertion and the
+    // printed pair is the evidence; the mechanism's own verdict is in the
+    // p90/p99/max it prints beside the plain arm.
+    assert!(
+        s.p99 <= M1_CEILING_MS,
+        "the CC signal's interactive p99 {:.1} ms breaches the mandate ceiling {M1_CEILING_MS}",
+        s.p99,
+    );
+    assert!(
+        s.p99 <= p.p99 * 1.25,
+        "the CC signal worsened the interactive p99 ({:.1} vs {:.1} ms)",
+        s.p99,
+        p.p99,
+    );
+    assert!(
+        s.delivery_pct >= p.delivery_pct * 0.99,
+        "the CC signal capped the interactive lane's delivery ({:.4} vs {:.4})",
+        s.delivery_pct,
+        p.delivery_pct,
+    );
+    assert!(
+        signalled.bulk_sink_bytes >= plain.bulk_sink_bytes * 9 / 10,
+        "the CC signal capped the bulk lane ({} vs {} bytes delivered)",
+        signalled.bulk_sink_bytes,
+        plain.bulk_sink_bytes,
     );
 }

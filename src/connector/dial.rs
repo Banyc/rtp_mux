@@ -37,10 +37,10 @@ pub(crate) struct DualLaneSettings {
     pub bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     pub handshake: bool,
     pub obfuscation_key: Option<crate::ObfuscationKey>,
-    /// Optional per-NIC scheduler both lanes egress through (the same instance
-    /// the caller shares across connections on that NIC). `None` keeps the
+    /// Optional per-egress-path scheduler both lanes egress through (the same instance
+    /// the caller shares across connections on that egress path). `None` keeps the
     /// stock per-socket behaviour.
-    pub nic: Option<rtp::nic::NicScheduler>,
+    pub cc_link: Option<rtp::cc::CcSignalHub>,
 }
 
 pub(crate) struct ConnectedDualLaneBirth {
@@ -163,7 +163,7 @@ async fn connect_dual_lane_once(
         bulk_metrics_observer,
         handshake,
         obfuscation_key,
-        nic,
+        cc_link,
     } = settings;
     let bind_addr = bind(addr);
     let bulk_addr = bulk_addr(addr)?;
@@ -191,15 +191,18 @@ async fn connect_dual_lane_once(
             ..base
         },
     );
-    if let Some(scheduler) = &nic {
-        interactive_config.nic = Some(rtp::nic::NicLink {
-            scheduler: scheduler.clone(),
-            class: rtp::nic::Class::Interactive,
-        });
-        bulk_config.nic = Some(rtp::nic::NicLink {
-            scheduler: scheduler.clone(),
-            class: rtp::nic::Class::Bulk,
-        });
+    if let Some(scheduler) = &cc_link {
+        // The transport resolves each lane's `(src, dst)` path group from its
+        // own socket, so the scheduler travels with the lane and the pair is
+        // not guessed here.
+        interactive_config.cc_link = Some(rtp::cc::CcLink::new(
+            scheduler.clone(),
+            rtp::cc::CcRole::Interactive,
+        ));
+        bulk_config.cc_link = Some(rtp::cc::CcLink::new(
+            scheduler.clone(),
+            rtp::cc::CcRole::Bulk,
+        ));
     }
     // The two lanes are independent connections to independent addresses;
     // dial them together.  Dialing them one after the other adds the second
@@ -208,13 +211,13 @@ async fn connect_dual_lane_once(
     // which is most of a cold connection's cost on a long-RTT path.
     let interactive = async {
         match socket {
-            // A pre-bound socket cannot carry the NIC's `NicLink` (the
-            // scheduler owns the socket), so the NIC path dials by address.
-            Some(socket) if interactive_config.nic.is_none() => {
+            // The egress path is a congestion-signal router, not a socket owner, so a
+            // pre-bound socket carries it like any other connection.
+            Some(socket) => {
                 rtp::udp::FrameDeliveryIo::connect_with_socket(socket, addr, interactive_config)
                     .await
             }
-            _ => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, interactive_config).await,
+            None => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, interactive_config).await,
         }
     };
     let bulk = rtp::udp::FrameDeliveryIo::connect(

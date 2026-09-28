@@ -227,6 +227,7 @@ rtp_mux_jitter::jitter_interactive_with_loss = perf | 35 | orthogonal@interactiv
 rtp_mux_jitter::jitter_interactive_with_bulk = perf | 65 | composite(rate,load)@interactive | interactive-cadence@lane=interactive+flows=1+shape=cadence+loss=none+rate=1MiBps+load=bulk-burst-2MiB-per-3s+metric=latency-percentiles
 rtp_mux_jitter::jitter_interactive_bulk_and_loss = perf | 35 | composite(loss,rate,load)@interactive | interactive-cadence@lane=interactive+flows=1+shape=cadence+loss=2pct-iid+rate=1MiBps+load=bulk-burst-2MiB-per-3s+metric=latency-percentiles
 mandate_smoke::m3_bulk_goodput_fraction = default | 108 | baseline@m3-bulk | m3-bulk@lane=bulk+rate=1MiBps+load=saturated+window=6s+metric=capacity-fraction
+mandate_smoke::m1_nic_minecraft_saturating_downstream = perf | 33 | composite(bulk-mode,shared-shaper,mechanism)@mc-nic | mc-nic@lane=dual+shape=cadence+scale=300B+period=20ms+bulk=saturating+shaper=shared-uplink+mechanism=cc-signal+metric=p99-and-max
 dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction = full | 45 | orthogonal@m3-bulk | m3-bulk@lane=bulk+rate=1MiBps+load=saturated+window=15s+metric=capacity-fraction
 rtp_mux_jitter::jitter_bulk_idle_restart_arm = perf | 35 | composite(rate,load,window,metric)@m3-bulk | m3-bulk@lane=bulk+rate=2Mbps-c2s+load=idle-restart-bursts-512KiB+window=34s+metric=delivered-goodput
 rtp_mux_jitter::jitter_latency_dimension_arms = perf | 385 | baseline@latency-sweep | latency-sweep@sweep=shared-capacity-ack-path-cellular+metric=latency-percentiles-and-goodput
@@ -766,7 +767,7 @@ evidence files (`M1/M2/M3/M4.json`/`.csv`):
 
 ```sh
 cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture
-cd crates/netem_test && tools/mandate-check --producer-path rtp_mux=../rtp_mux
+cd crates/rtp_mux && tools/mandate-check --producer-path rtp_mux=../rtp_mux
 ```
 
 It is a smoke set **alongside** the gates above, not a replacement: it neither
@@ -2255,7 +2256,7 @@ window. Cells provided:
 `M4-hostile-level@instrument=degenerate-percentile`. Each cell varies **one**
 declared dimension from a stated baseline, M4's own hostile arm
 (`M4@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share`
-in `tools/mandate-arms.json`): the flows, impairment, lanes, shape and load are
+in `rtp_mux/mandate-arms.json`): the flows, impairment, lanes, shape and load are
 held fixed and what the arm adds is the `p99-ceiling` level (and the
 `no-starvation` read that keeps a level met by starving a flow from counting);
 the `degenerate-percentile` cell is the instrument sanity, not a bound. Cells

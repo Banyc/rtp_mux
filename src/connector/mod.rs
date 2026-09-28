@@ -53,12 +53,12 @@ pub struct RtpMuxConnectorConfig {
     pub handshake: bool,
     pub obfuscation_key: Option<crate::ObfuscationKey>,
     pub explorer: ExplorerConfig,
-    /// Optional per-NIC egress scheduler both lanes send through. The caller
-    /// constructs one per NIC (or several independent ones) and passes the
-    /// **same** instance to every connector on that NIC, so the interactive
+    /// Optional per-egress-path egress scheduler both lanes send through. The caller
+    /// constructs one per egress path (or several independent ones) and passes the
+    /// **same** instance to every connector on that egress path, so the interactive
     /// and bulk lanes — and every other connection — are arbitrated together.
     /// `None` keeps the stock per-socket behaviour.
-    pub nic: Option<rtp::nic::NicScheduler>,
+    pub cc_link: Option<rtp::cc::CcSignalHub>,
 }
 
 impl RtpMuxConnectorConfig {
@@ -75,7 +75,7 @@ impl RtpMuxConnectorConfig {
             handshake: true,
             obfuscation_key: None,
             explorer: ExplorerConfig::default(),
-            nic: None,
+            cc_link: None,
         }
     }
 
@@ -124,7 +124,7 @@ impl From<RtpMuxConnectorConfig> for DualLaneSettings {
             handshake,
             obfuscation_key,
             explorer: _,
-            nic,
+            cc_link,
         } = config;
         Self {
             bind,
@@ -135,7 +135,7 @@ impl From<RtpMuxConnectorConfig> for DualLaneSettings {
             bulk_metrics_observer,
             handshake,
             obfuscation_key,
-            nic,
+            cc_link,
         }
     }
 }

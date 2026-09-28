@@ -216,6 +216,7 @@ use netem_test::kit::payload::{cyclic_payload, with_timeout};
 use netem_test::kit::stats::percentile;
 use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
+use rtp::cc::CcSignalHub;
 use rtp_mux::{
     BindSelector, BulkAddrSelector, ExplorerConfig, LaneClass, RtpMuxConnector,
     RtpMuxConnectorConfig, RtpMuxServer, RtpMuxServerConfig, ServerStream, SessionSpawner,
@@ -1014,7 +1015,13 @@ fn fraction_used(nonzero: &AtomicU64, samples: &AtomicU64) -> f64 {
 /// One run: one long-lived connector session, the production server behind two
 /// netem proxies, and one saturating bulk direction. Every stream is opened
 /// once off the session and carried for the run's whole window.
-async fn run_mc(seed: u64, win: Duration, dir: Direction, fault: Option<&str>) -> McRun {
+async fn run_mc(
+    seed: u64,
+    win: Duration,
+    dir: Direction,
+    fault: Option<&str>,
+    cc_link: Option<CcSignalHub>,
+) -> McRun {
     let shift = fault_shift(fault);
     let want_bulk = fault != Some("no_bulk");
     let bulk_wrong_lane = fault == Some("bulk_interactive");
@@ -1027,7 +1034,13 @@ async fn run_mc(seed: u64, win: Duration, dir: Direction, fault: Option<&str>) -
     let outcome = tasks
         .run(async {
             // ── the production server, on the public path ─────────────────
-            let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default())
+            let server = RtpMuxServer::bind(
+                "127.0.0.1:0",
+                RtpMuxServerConfig {
+                    cc_link: cc_link.clone(),
+                    ..RtpMuxServerConfig::default()
+                },
+            )
                 .await
                 .unwrap();
             let int_server = server.listener().local_addr();
@@ -1081,6 +1094,7 @@ async fn run_mc(seed: u64, win: Duration, dir: Direction, fault: Option<&str>) -
             let bulk_addr: BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
             let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
                 bulk_addr,
+                cc_link,
                 explorer: ExplorerConfig {
                     enabled: false,
                     ..ExplorerConfig::default()
@@ -1338,7 +1352,7 @@ async fn run_arm(dir: Direction, win: Duration, count: usize) -> Vec<McRun> {
         let run = with_timeout(
             MC_RUN_TIMEOUT,
             "minecraft_contested run",
-            run_mc(seed, win, dir, fault.as_deref()),
+            run_mc(seed, win, dir, fault.as_deref(), None),
         )
         .await;
         print_run(dir, index, &run, win);
@@ -1717,4 +1731,70 @@ async fn mc_bulk_direction_decomposition() {
             quantiles(&p.rtt).3,
         );
     }
+}
+
+/// Does the egress path's cross-lane congestion signal help a *realistic*
+/// Minecraft-shaped interactive lane behind a saturating downstream bulk
+/// without capping bulk? Baseline and signal arms interleave run-by-run on the
+/// same seeds, so host drift hits them alike.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "Minecraft-shaped interactive lane behind a saturating downstream bulk; 2 arms x MC_RUNS \
+            runs; run with --ignored --nocapture --test-threads=1"]
+async fn mc_nic_cross_lane_signal() {
+    let win = window();
+    let count = runs();
+    let fault = fault();
+    let mut base = Vec::new();
+    let mut signal = Vec::new();
+    for index in 0..count {
+        let seed = 900 + 17 * index as u64;
+        let b = with_timeout(
+            MC_RUN_TIMEOUT,
+            "mc cc_link baseline",
+            run_mc(seed, win, Direction::Downstream, fault.as_deref(), None),
+        )
+        .await;
+        print_run(Direction::Downstream, index, &b, win);
+        base.push(b);
+        let scheduler = CcSignalHub::new();
+        let n = with_timeout(
+            MC_RUN_TIMEOUT,
+            "mc cc_link signal",
+            run_mc(
+                seed,
+                win,
+                Direction::Downstream,
+                fault.as_deref(),
+                Some(scheduler),
+            ),
+        )
+        .await;
+        signal.push(n);
+    }
+    let pb = pool(&base);
+    let pn = pool(&signal);
+    let (b50, b90, b99, bmax) = quantiles(&pb.rtt);
+    let (n50, n90, n99, nmax) = quantiles(&pn.rtt);
+    eprintln!(
+        "[cc_link-mc] interactive rtt   baseline p50 {b50:6.1} p90 {b90:6.1} p99 {b99:6.1} max {bmax:6.1}\n\
+         [cc_link-mc]                   signal   p50 {n50:6.1} p90 {n90:6.1} p99 {n99:6.1} max {nmax:6.1}"
+    );
+    eprintln!(
+        "[cc_link-mc] bulk delivered   baseline {:.3}  signal {:.3}",
+        pb.delivered_fraction, pn.delivered_fraction
+    );
+    eprintln!(
+        "[cc_link-mc] down backlog     baseline {:.3}  signal {:.3}",
+        pb.down_backlog, pn.down_backlog
+    );
+    assert!(
+        pn.delivered_fraction >= pb.delivered_fraction * 0.9,
+        "the cross-lane signal capped bulk delivery ({:.3} vs {:.3})",
+        pn.delivered_fraction,
+        pb.delivered_fraction
+    );
+    assert!(
+        n99 <= b99,
+        "the cross-lane signal did not improve the interactive rtt p99 ({n99:.1} vs {b99:.1} ms)"
+    );
 }

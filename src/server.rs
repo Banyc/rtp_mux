@@ -60,8 +60,8 @@ pub struct RtpMuxServer {
     interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     handshake: bool,
-    /// Optional per-NIC scheduler both lanes' egress is admitted through.
-    nic: Option<rtp::nic::NicScheduler>,
+    /// Optional per-egress-path scheduler both lanes' egress is admitted through.
+    cc_link: Option<rtp::cc::CcSignalHub>,
 }
 
 enum BirthHeartbeatFailure {
@@ -85,7 +85,7 @@ pub enum ServeError {
 }
 
 /// Settings for [`RtpMuxServer::bind`]: the datagram-obfuscation key and an
-/// optional per-NIC egress scheduler.
+/// optional per-egress-path egress scheduler.
 #[derive(Debug, Clone, Default)]
 pub struct RtpMuxServerConfig {
     /// When set, every RTP datagram is prefixed with a 24-byte random nonce
@@ -96,11 +96,11 @@ pub struct RtpMuxServerConfig {
     /// probes with the same key, so a passive observer cannot tell probes
     /// from data.
     pub obfuscation_key: Option<crate::ObfuscationKey>,
-    /// Optional per-NIC egress scheduler both lanes send through. The caller
-    /// constructs one per NIC and passes the **same** instance to every
-    /// server (and connector) on that NIC. `None` keeps the stock per-socket
+    /// Optional per-egress-path egress scheduler both lanes send through. The caller
+    /// constructs one per egress path and passes the **same** instance to every
+    /// server (and connector) on that egress path. `None` keeps the stock per-socket
     /// behaviour.
-    pub nic: Option<rtp::nic::NicScheduler>,
+    pub cc_link: Option<rtp::cc::CcSignalHub>,
 }
 
 /// Interactive ports the acquisition may draw while the port adjacent to each
@@ -126,7 +126,7 @@ impl RtpMuxServer {
     ) -> io::Result<Self> {
         let RtpMuxServerConfig {
             obfuscation_key: key,
-            nic,
+            cc_link,
         } = config;
         let key_bytes = key.map(crate::ObfuscationKey::into_bytes);
         let requested = resolve_bind_addrs(addr).await?;
@@ -137,7 +137,8 @@ impl RtpMuxServer {
                 .await
             {
                 Ok((interactive_listener, bulk_listener)) => {
-                    return Ok(Self::new(interactive_listener, bulk_listener).with_nic(nic.clone()));
+                    return Ok(Self::new(interactive_listener, bulk_listener)
+                        .with_cc_link(cc_link.clone()));
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -157,25 +158,25 @@ impl RtpMuxServer {
             interactive_metrics_observer: None,
             bulk_metrics_observer: None,
             handshake: true,
-            nic: None,
+            cc_link: None,
         }
     }
 
-    /// Attach the per-NIC egress scheduler both lanes are admitted through.
-    /// The caller shares one instance per NIC with the connector so all of
-    /// that NIC's connections are arbitrated together.
-    pub fn with_nic(mut self, nic: Option<rtp::nic::NicScheduler>) -> Self {
-        self.nic = nic;
+    /// Attach the per-egress-path egress scheduler both lanes are admitted through.
+    /// The caller shares one instance per egress path with the connector so all of
+    /// that egress path's connections are arbitrated together.
+    pub fn with_cc_link(mut self, cc_link: Option<rtp::cc::CcSignalHub>) -> Self {
+        self.cc_link = cc_link;
         self
     }
 
-    /// Build one lane's accept config, injecting the per-NIC scheduler when
+    /// Build one lane's accept config, injecting the per-egress-path scheduler when
     /// one is configured. Takes the fields rather than `&self` so the
     /// `select!` loop can hold `&mut self.mux` at the same time.
     fn lane_accept_config(
         interactive_fec_tuning: rtp::FecTuning,
         interactive_instream_group_fec: bool,
-        nic: Option<&rtp::nic::NicScheduler>,
+        cc_link: Option<&rtp::cc::CcSignalHub>,
         lane: LaneClass,
         metrics_observer: Option<rtp::metrics::MetricsObserver>,
     ) -> rtp::udp::AcceptConfig {
@@ -187,14 +188,14 @@ impl RtpMuxServer {
                 metrics_observer,
             },
         );
-        if let Some(scheduler) = nic {
-            config.nic = Some(rtp::nic::NicLink {
-                scheduler: scheduler.clone(),
-                class: match lane {
-                    LaneClass::Interactive => rtp::nic::Class::Interactive,
-                    LaneClass::Bulk => rtp::nic::Class::Bulk,
-                },
-            });
+        if let Some(scheduler) = cc_link {
+            let role = match lane {
+                LaneClass::Interactive => rtp::cc::CcRole::Interactive,
+                LaneClass::Bulk => rtp::cc::CcRole::Bulk,
+            };
+            // The transport resolves the path group from the accepted socket's
+            // own `(src, dst)`, so the peer only has to be known where it is.
+            config.cc_link = Some(rtp::cc::CcLink::new(scheduler.clone(), role));
         }
         config
     }
@@ -410,7 +411,7 @@ impl RtpMuxServer {
                     Self::lane_accept_config(
                         self.interactive_fec_tuning,
                         self.interactive_instream_group_fec,
-                        self.nic.as_ref(),
+                        self.cc_link.as_ref(),
                         LaneClass::Interactive,
                         self.interactive_metrics_observer.clone(),
                     ),
@@ -423,7 +424,7 @@ impl RtpMuxServer {
                     Self::lane_accept_config(
                         self.interactive_fec_tuning,
                         self.interactive_instream_group_fec,
-                        self.nic.as_ref(),
+                        self.cc_link.as_ref(),
                         LaneClass::Bulk,
                         self.bulk_metrics_observer.clone(),
                     ),

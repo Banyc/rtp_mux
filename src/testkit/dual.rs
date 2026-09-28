@@ -1576,7 +1576,11 @@ pub async fn dual_mux_client_connect_with_lane_modes_via(
 /// fast-forward (with an explicit FEC tuning), while the bulk lane is an
 /// independent connection that can stay byte-stream and FEC-free — the
 /// deployment's dual-lane topology.
-pub async fn dual_mux_client_connect_lane_rtp_via(
+/// [`dual_mux_client_connect_lane_rtp_via`] with an optional per-egress
+/// congestion-signalling hub. The transport derives each lane's `(src, dst)`
+/// path group from its own socket, so the caller passes the hub and the role,
+/// not a resolved group.
+pub async fn dual_mux_client_connect_lane_rtp_via_cc_link(
     tx: &TestTaskSubmitter,
     int_proxy_addr: std::net::SocketAddr,
     bulk_proxy_addr: std::net::SocketAddr,
@@ -1584,6 +1588,7 @@ pub async fn dual_mux_client_connect_lane_rtp_via(
     bulk_rtp: LaneRtpConfig,
     int_observer: Option<rtp::metrics::MetricsObserver>,
     bulk_observer: Option<rtp::metrics::MetricsObserver>,
+    cc_link: Option<rtp::cc::CcSignalHub>,
 ) -> Result<(mux::DualStreamOpener, mux::DualStreamAccepter), mux::DualMuxError> {
     let int_config = mux::MuxConfig {
         initiation: mux::Initiation::Client,
@@ -1603,9 +1608,13 @@ pub async fn dual_mux_client_connect_lane_rtp_via(
         addr: std::net::SocketAddr,
         lane: LaneRtpConfig,
         observer: Option<rtp::metrics::MetricsObserver>,
+        cc_link: Option<(rtp::cc::CcSignalHub, rtp::cc::CcRole)>,
     ) -> (BoxedRead, BoxedWrite) {
         let addr = addr.to_string();
-        let config = lane_connect_config(lane, observer);
+        let mut config = lane_connect_config(lane, observer);
+        if let Some((hub, role)) = cc_link {
+            config.cc_link = Some(rtp::cc::CcLink::new(hub, role));
+        }
         if lane.frame_mode.enabled {
             let connected = rtp::udp::FrameDeliveryIo::connect("0.0.0.0:0", &addr, config)
                 .await
@@ -1638,8 +1647,16 @@ pub async fn dual_mux_client_connect_lane_rtp_via(
     let mut super_spawner = JoinSet::new();
     let nonce = mux::PairingNonce::generate();
     let group = mux::GroupToken::generate();
-    let (int_reader, mut int_writer) =
-        connect_lane(tx, int_proxy_addr, int_rtp, int_observer).await;
+    let (int_reader, mut int_writer) = connect_lane(
+        tx,
+        int_proxy_addr,
+        int_rtp,
+        int_observer,
+        cc_link
+            .clone()
+            .map(|hub| (hub, rtp::cc::CcRole::Interactive)),
+    )
+    .await;
     mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
@@ -1647,8 +1664,14 @@ pub async fn dual_mux_client_connect_lane_rtp_via(
         .flush()
         .await
         .map_err(|e| mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(e.kind())))?;
-    let (bulk_reader, mut bulk_writer) =
-        connect_lane(tx, bulk_proxy_addr, bulk_rtp, bulk_observer).await;
+    let (bulk_reader, mut bulk_writer) = connect_lane(
+        tx,
+        bulk_proxy_addr,
+        bulk_rtp,
+        bulk_observer,
+        cc_link.map(|hub| (hub, rtp::cc::CcRole::Bulk)),
+    )
+    .await;
     mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
@@ -1693,6 +1716,30 @@ pub async fn dual_mux_client_connect_lane_rtp_via(
         }),
     );
     Ok((opener, accepter))
+}
+
+/// [`dual_mux_client_connect_lane_rtp_via_cc_link`] without a signalling hub: the
+/// untouched production client.
+pub async fn dual_mux_client_connect_lane_rtp_via(
+    tx: &TestTaskSubmitter,
+    int_proxy_addr: std::net::SocketAddr,
+    bulk_proxy_addr: std::net::SocketAddr,
+    int_rtp: LaneRtpConfig,
+    bulk_rtp: LaneRtpConfig,
+    int_observer: Option<rtp::metrics::MetricsObserver>,
+    bulk_observer: Option<rtp::metrics::MetricsObserver>,
+) -> Result<(mux::DualStreamOpener, mux::DualStreamAccepter), mux::DualMuxError> {
+    dual_mux_client_connect_lane_rtp_via_cc_link(
+        tx,
+        int_proxy_addr,
+        bulk_proxy_addr,
+        int_rtp,
+        bulk_rtp,
+        int_observer,
+        bulk_observer,
+        None,
+    )
+    .await
 }
 
 // ─────────────── dual‑lane frame‑delivery server helpers ───────────────
