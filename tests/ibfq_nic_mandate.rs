@@ -9,9 +9,8 @@
 //! * `baseline` — the untouched production dual-lane client
 //!   (`dual_mux_client_connect_lane_rtp_via`): two lanes straight onto their
 //!   two sockets.
-//! * `ibfq-priority` — the same topology with both lanes' sends arbitrated by
-//!   one [`ibfq::NicScheduler`] under `Policy::Priority`.
-//! * `ibfq-fifo` — the same queue under arrival order (the control).
+//! * `ibfq` — the same topology with both lanes' sends arbitrated by one
+//!   [`rtp::nic::NicScheduler`]: strict interactive-before-bulk, no rate.
 //!
 //! Evidence goes to `$IBFQ_AB_DIR` (default `target/ibfq-ab`):
 //! `ab-samples.csv` (arm, rep, one-way latency ms), `ab-reps.csv` (per-rep
@@ -32,7 +31,7 @@ use std::time::{Duration, Instant};
 use netem_test::kit::stats::{HolSummary, summarize};
 use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, TestTaskSubmitter, submit_test_task};
 use netem_test::{NetemConfig, NetemPair};
-use rtp::nic::{Class, NicConfig, NicEndpoint, NicScheduler, Policy};
+use rtp::nic::{Class, NicEndpoint, NicScheduler};
 use rtp::testkit::rtp::send_timestamped_messages;
 use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
@@ -47,35 +46,29 @@ const MSG_BYTES: usize = 256;
 const CADENCE: Duration = Duration::from_millis(25);
 const RUN_FOR: Duration = Duration::from_secs(8);
 const GRACE: Duration = Duration::from_secs(1);
+/// A reporting nominal for the bulk-goodput column, not a rate the arbiter
+/// enforces (it has none): it only keeps the column comparable across arms.
 const LINK_BYTES_PER_SEC: f64 = 1024.0 * 1024.0;
-const RESERVE_BYTES_PER_SEC: f64 = LINK_BYTES_PER_SEC / 4.0;
 const BULK_CHUNK: usize = 64 * 1024;
 const REPS: usize = 3;
-const ARMS: [Arm; 3] = [Arm::Baseline, Arm::IbfqPriority, Arm::IbfqFifo];
+const ARMS: [Arm; 2] = [Arm::Baseline, Arm::Ibfq];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
     Baseline,
-    IbfqPriority,
-    IbfqFifo,
+    Ibfq,
 }
 
 impl Arm {
     fn name(self) -> &'static str {
         match self {
             Arm::Baseline => "baseline",
-            Arm::IbfqPriority => "ibfq-priority",
-            Arm::IbfqFifo => "ibfq-fifo",
+            Arm::Ibfq => "ibfq",
         }
     }
-    fn policy(self) -> Option<Policy> {
-        match self {
-            Arm::Baseline => None,
-            Arm::IbfqPriority => Some(Policy::Priority {
-                interactive_reserve_bytes_per_sec: RESERVE_BYTES_PER_SEC,
-            }),
-            Arm::IbfqFifo => Some(Policy::Fifo),
-        }
+    /// Whether this arm routes both lanes through one per-NIC arbiter.
+    fn use_scheduler(self) -> bool {
+        matches!(self, Arm::Ibfq)
     }
 }
 
@@ -222,12 +215,9 @@ struct Run {
 
 async fn run_arm(arm: Arm) -> Run {
     let base = Instant::now();
-    let scheduler = arm.policy().map(|policy| {
-        NicScheduler::new(NicConfig {
-            link_rate_bytes_per_sec: LINK_BYTES_PER_SEC,
-            policy,
-        })
-    });
+    // Strict priority, no rate: the arbiter decides order only, so the
+    // baseline arm (no arbiter) is the control.
+    let scheduler = arm.use_scheduler().then(NicScheduler::new);
     let mut tasks = TestScope::new();
     let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
     tasks
@@ -429,10 +419,7 @@ async fn ibfq_nic_ab_against_the_untouched_dual_lane() {
     let p99 = |arm: Arm| stat(arm, |s| s.p99);
 
     let mut cdf_ascii = String::new();
-    let _ = writeln!(
-        cdf_ascii,
-        "percentile   baseline   ibfq-priority   ibfq-fifo"
-    );
+    let _ = writeln!(cdf_ascii, "percentile   baseline        ibfq");
     for pct in [50.0, 90.0, 99.0, 100.0] {
         let _ = write!(cdf_ascii, "{pct:>9.0}%");
         for arm in ARMS {
@@ -457,35 +444,33 @@ async fn ibfq_nic_ab_against_the_untouched_dual_lane() {
     }
     eprintln!("[ab] pooled CDF (interactive one-way latency, ms):\n{cdf_ascii}");
     eprintln!(
-        "[ab] median p99   baseline {:.1}  ibfq-priority {:.1}  ibfq-fifo {:.1} ms\n\
-         [ab] median bulk  baseline {:.3}  ibfq-priority {:.3}  ibfq-fifo {:.3} x link",
+        "[ab] median p99   baseline {:.1}  ibfq {:.1} ms\n\
+         [ab] median bulk  baseline {:.3}  ibfq {:.3} x link",
         p99(Arm::Baseline),
-        p99(Arm::IbfqPriority),
-        p99(Arm::IbfqFifo),
+        p99(Arm::Ibfq),
         bulk(Arm::Baseline),
-        bulk(Arm::IbfqPriority),
-        bulk(Arm::IbfqFifo),
+        bulk(Arm::Ibfq),
     );
 
     render_cdf_svg(&dir, &pooled, &reps);
     eprintln!("[ab] panels: {dir}/ab-cdf.svg  data: {dir}/ab-reps.csv, {dir}/ab-samples.csv");
 
+    // The arbiter must not degrade the interactive tail against the
+    // untouched path.
     assert!(
-        p99(Arm::IbfqPriority) <= p99(Arm::Baseline) * 1.25,
-        "ibfq-priority p99 {:.1} ms exceeds baseline {:.1} ms by >25%: the queue degraded M1",
-        p99(Arm::IbfqPriority),
+        p99(Arm::Ibfq) <= p99(Arm::Baseline) * 1.25,
+        "ibfq p99 {:.1} ms exceeds baseline {:.1} ms by >25%: the arbiter degraded M1",
+        p99(Arm::Ibfq),
         p99(Arm::Baseline),
     );
+    // And it must not cap throughput: bulk runs at the link's own rate, so its
+    // goodput must stay in the same class as the untouched path.
     assert!(
-        bulk(Arm::IbfqPriority) >= 0.35,
-        "ibfq-priority bulk goodput {:.3} x link fell below the 0.35 M3 floor",
-        bulk(Arm::IbfqPriority),
-    );
-    assert!(
-        p99(Arm::IbfqPriority) < p99(Arm::IbfqFifo),
-        "priority p99 {:.1} ms did not beat fifo p99 {:.1} ms",
-        p99(Arm::IbfqPriority),
-        p99(Arm::IbfqFifo),
+        bulk(Arm::Ibfq) >= bulk(Arm::Baseline) * 0.5,
+        "ibfq bulk goodput {:.3} x nominal fell below half the baseline {:.3}: the arbiter \
+         throttled bulk",
+        bulk(Arm::Ibfq),
+        bulk(Arm::Baseline),
     );
 }
 
