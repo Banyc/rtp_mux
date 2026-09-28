@@ -274,7 +274,7 @@ const M1_LONE_OVER250_GUARD_PCT: f64 = 8.0;
 /// RTT-derived value, so the arm only gets *smaller* as the RTT grows.
 const FIELD_RTT_OWD: Duration = Duration::from_millis(100);
 /// M1 field-RTT lone-tail p99 guard. The band spans the two revisions this
-/// crate has run: on the pinned `rtp v0.0.94` three 15 s runs measured p99
+/// crate has run: on `rtp v0.0.94` (the pin at the time) three 15 s runs measured p99
 /// 427-719 ms, and on the landed `rtp` dev (`bdacf5c0`) four runs measured
 /// 293-432 ms. The guard clears the top of the *pinned* band at ~2.1x, so a
 /// change that doubles the arm's tail fails on either revision. It is a
@@ -1673,7 +1673,7 @@ fn verdict(pass: bool) -> &'static str {
 /// file.
 ///
 /// `m1_lone_tail_cover_wire` is the arm that measures it, and its measurement
-/// does **not** reproduce this number: on the pinned `rtp v0.0.101` the
+/// does **not** reproduce this number: on `rtp v0.0.101` (the pin at the time) the
 /// deployment's own lone-tail lane writes `1 + 3.84 copies + 1.99 parity`
 /// datagrams per transmission, and its FEC flush emits ~2 single-symbol parity
 /// groups per message rather than the one this budget assumes. The constant is
@@ -4044,8 +4044,8 @@ const M4_CLEAN_P99_CEILING_MS: f64 = M1_CEILING_MS;
 /// uses for the impaired tail (`rtp_mux/GATE.md`, "The deployed baseline the
 /// impaired tail must not regress past"): `mean + 4` sample standard
 /// deviations over the healthy reps on record. The reps are the eighteen
-/// full-window reps of M4's own `hostile` arm measured on this crate's pinned
-/// `rtp v0.0.98` (`274.9`, `296.9`, `297.1`, `301.0`, `308.0`, `315.6`,
+/// full-window reps of M4's own `hostile` arm measured on `rtp v0.0.98` (the
+/// pin at the time) (`274.9`, `296.9`, `297.1`, `301.0`, `308.0`, `315.6`,
 /// `315.7`, `316.5`, `323.5`, `324.1`, `331.1`, `334.4`, `334.6`, `341.8`,
 /// `345.1`, `345.9`, `351.8`, `358.3`), the harness baseline's recorded
 /// `hostile_p99_max=306.5`
