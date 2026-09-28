@@ -1686,6 +1686,126 @@ for it is `m = 5`, which the window-adequacy arithmetic admits (5 rungs,
 admitting it is a **new arm with a longer window**, declared here in `rtp_mux`,
 not a retune of an existing one, and it is not taken in this change.
 
+### The fair-latency bound, read at the quantile it is a property of: `m4_clean_lane_fair_latency`
+
+`M4_LATENCY_SPREAD_BOUND` (2x) claims a **lane** property: with equal offers
+and per-flow delivery at 1.000, no flow's latency may be `M4_LATENCY_SPREAD_BOUND`
+times another's, because that would mean one flow's service is ordered
+preferentially. It was asserted on `max p99 / min p99` on the clean arm, and
+**it had no red proof at all**: the two `M4_CLEAN_LEVEL_*` probes shift the
+whole link and leave all four flows equal, so the assertion had never been
+shown to fail on a preferentially-served lane.
+
+The assertion was also reading a statistic that is **not** a lane property once
+the lane's start-up transient is gone. On the stock seed the four flows' p99s
+all sat on the shared transient's own body, which is what held the ratio at
+`1.007-1.072`; with the transient removed each flow's p99 is the link floor plus
+**that flow's** 24th-largest uncovered-loss stall, and on this lane's 2 % iid
+link those 24 samples are rare-event draws. Measured over five interleaved
+clean-level reps at the lane-scoped seed (`rtp_mux_it163` run `ab`): per-flow
+p99 `29.0-33.2 ms` on four reps and `44.6-58.9 ms` on two, i.e. one rep in five
+at `2.247` on a lane whose delivery is `1.000` on every flow and whose p50 is
+`23.0 ms` on every flow. A bound that fires on a count draw is not coverage.
+
+`mandate_smoke::m4_clean_lane_fair_latency` is the **new** arm beside M4 (M4 and
+both level arms keep their windows, cadences, tiers and thresholds): it takes
+`fairness_arms("M4")`'s clean arm — the same `link(41/42, OWD, JITTER, LOSS_2,
+0)` link, the same four tagged flows, the same cadence and window — and asserts
+the same `M4_LATENCY_SPREAD_BOUND` on the per-flow **p90**, which is the
+quantile the transient moves and a rare-event count does not.
+
+| quantity | measured | bound |
+| --- | --- | --- |
+| per-flow p90 spread, `max p90 / min p90` | `1.006-1.144` over 13 reps at both seeds (stock: `1.006-1.098`; lane-scoped seed: `1.109-1.118`) | `<= 2.0` (`M4_LATENCY_SPREAD_BOUND`, not retuned) |
+| per-flow delivery | `1.000` on every flow of every run, including both vacuity probes | `>= 0.995` (`M4_DELIVERY_FLOOR`, not restated) |
+| `samples > 0`, spread finite and positive | `9593` delivered in the recorded run | asserted (instrument sanity) |
+
+One authority for the quantile is `fair_latency_spread`, which the M4 arm's own
+assertion and `m4_clean_lane_p99_ceiling` now read as well, so the three
+fair-latency sites cannot drift. The move is a change of **statistic** only: no
+window, cadence, tier, arm input or bound value changed in any existing arm.
+
+**Vacuity, at the magnitude the property names.** `MANDATE_SMOKE_FAULT=M4_FAIR_LATENCY_hold`
+holds the last flow's messages `M4_FAIR_LATENCY_HOLD_MS` (`30 ms`, the smallest
+whole value above `(bound - 1) x floor`) between their send timestamp and their
+write, which is the sender-side simulation of a lane ordering one flow's
+traffic last. Measured at the lane-scoped seed: per-flow p90
+`[23.4, 23.5, 25.2, 55.1]` — spread **2.366** — with delivery still `1.000` on
+every flow, and the arm fails naming the observed spread. At the stock seed it
+reads `2.117` (`[29.2, 34.3, 39.4, 61.8]`). The probe namespace is its own
+(`M4_FAIR_LATENCY_*`) so a probe of this bound cannot read as a probe of M4's.
+
+Cost and coverage. Default tier (not `#[ignore]`d) beside M4, taking the smoke
+set's shared `SERIAL` guard. Measured cost **15.5 s** on the 12 s window
+(`15.52 s` by libtest's stamp), the same cost as the two level arms. Cells
+provided: `M4-level@flows=4+impairment=clean+metric=fair-latency-p90` (the arm),
+`M4-level@flows=4+impairment=clean+metric=no-starvation` (the delivery floor),
+`M4-level@instrument=degenerate-percentile`. Its one varying dimension from the
+stated baseline `m4_clean_lane_p99_ceiling` is the **quantile** the shared bound
+is read at. Cells deliberately **not** covered, with the reason: a starvation
+that delayed only a flow's rare messages and left its p90 at the floor. On this
+lane that regime is indistinguishable from the iid loss draw that moves p99 by a
+factor of 2-3 between identical runs, so no per-flow tail statistic can bound it;
+the cells that do are the aggregate ceiling (`M4_CLEAN_P99_CEILING_MS`), the
+per-flow delivery floor and the share imbalance (`M4_IMBALANCE_BOUND`), all
+asserted on this same run. A p999 or max spread was measured and rejected: it
+ranges `1.08-2.82` across the same reps, i.e. noisier than the p99 draw.
+
+### The interactive lane's pacer seed is a lane policy, not a crate constant
+
+The four-flow production lane's clean and hostile tails were a **start-up
+transient**, not steady state: reading M4's own per-flow samples, every slow
+sample falls in `t=1.6-3.2 s`, and the lane is at its floor from then on. The
+driver is the pacer's initial rate against the lane's offer — `INIT_SEND_RATE`
+seeds the pacer at `1024` while the four-flow production offer is ~`4.5k`
+packets/second (four flows at `256 B` / `5 ms`, each message costing `1 +
+copies` tokens for its fresh-tail armour) — so until the congestion ramp
+overtakes the offer the send stage is full and every message waits its FIFO
+turn.
+
+Interleaved A/B on this crate's own arms (five reps each, load `2.2-4.3` at
+`uptime`'s 1-minute average):
+
+| arm | stock seed `1024` | lane seed `4096` |
+| --- | --- | --- |
+| four-flow clean level `p99_max` | `157.0-179.8 ms` | `29.0-33.2 ms` |
+| four-flow hostile level `p99_max` | `285.5-441.1 ms` (mean `320.9`) | `168.9-222.8 ms` (mean `192.7`) |
+| M1 clean `p99` | `26.4/26.5/26.5` | `25.6/25.6/28.2` |
+| M1 hostile `p99` | `217.7/205.3/207.3` | `136.7/177.8/135.3` |
+| M1 lone-tail `p99` | `171.6/177.5/154.8` | `150.5/173.1/164.5` |
+| M1 clean `over250` count | `0/0/0` | `0/0/0` |
+| four-flow clean own-wire | `5.814x` of the offer | `6.771-6.821x` |
+
+The hostile tail moves from **above** the product's 250 ms ceiling to below it,
+which is the point of the change; the clean tail drops to the floor; and no M1
+percentile rises beyond its own run-to-run spread. The clean arm's own c2s wire
+rises `5.81x -> 6.81x` of the offered payload: at the stock seed the pacer is
+still throttling the declared fresh-tail cover on the clean arm, and at the lane
+seed the whole declared cover reaches the wire — the same `~6.8x` the field
+configuration measures in the jitter regime, and the wire is a printed diagnostic
+in every arm (`m2_offered_load_latency` asserts the offer, `1.000` delivery and
+a floor-relative p99, not a ratio).
+
+**Why the seed is scoped to the lane.** A *global* `INIT_SEND_RATE` of `4096`
+was measured and is **refused**: it breaks `rtp`'s default tier. On the same
+tree and the same quiet-host window, `rtp::rtp_mss::rtp_tiny_mss_survives_mild_loss`
+— a 100 KiB echo at a 256 B MSS over a 5 % loss link — fails **3/30** runs at a
+global `4096` and **0/30** at `1024`, and seven `rtp` unit-test ramp preambles
+asserted against simulated links that saturate at `5955-7520 pkt/s` (measured:
+`ramp_rate=7519.4`, `peak=7139.97`, `warm=5955.42`) fail by construction. The
+lane-scoped seed leaves every one of those on the stock value: `cargo test
+--release -p rtp` is green with the seven preambles **untouched**, and the
+tiny-MSS arm keeps its `0/30`.
+
+The mapping is one authority, `lane_transport::initial_send_rate(LaneClass)`
+(`INTERACTIVE_INITIAL_SEND_RATE = 4096.0` for `Interactive`, `None` for `Bulk`),
+read by the layer kit's `LaneRtpConfig` so a scenario's arm seeds exactly the
+lane the deployment seeds. `rtp` carries the mechanism only: an optional
+per-connection seed on the connect/accept config
+(`UnreliableLayer::initial_send_rate`, installed by
+`ReliableLayer::seed_send_rate` at construction) whose default — every caller
+that declares no offer — is `None`, i.e. the crate's unchanged stock constant.
+
 ### The four-flow hostile level: `m4_hostile_lane_p99_ceiling`
 
 The four-flow **clean** level above closes the clean shape's ceiling gap, but
@@ -1863,6 +1983,7 @@ mandate_smoke::m2_offered_load_latency
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness
 mandate_smoke::m4_clean_lane_p99_ceiling
+mandate_smoke::m4_clean_lane_fair_latency
 mandate_smoke::m4_hostile_lane_p99_ceiling
 mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
 mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
@@ -2115,6 +2236,7 @@ mandate_smoke::m2_offered_load_latency
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness
 mandate_smoke::m4_clean_lane_p99_ceiling
+mandate_smoke::m4_clean_lane_fair_latency
 mandate_smoke::m4_hostile_lane_p99_ceiling
 ```
 

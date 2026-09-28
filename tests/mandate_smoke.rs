@@ -74,9 +74,12 @@
 //! **no starvation** (every flow delivers what it is offered) and **fair
 //! share** (no flow's share of the lane's delivered bytes departs from the
 //! equal share by more than [`M4_IMBALANCE_BOUND`]) — plus a fair-latency bound
-//! (no flow's p99 exceeds the best flow's p99 by more than
+//! (no flow's p90 exceeds the best flow's p90 by more than
 //! [`M4_LATENCY_SPREAD_BOUND`] on the clean arm, the dimension the share
-//! statistic cannot see; the hostile arm keeps M1's absolute guard).
+//! statistic cannot see; the hostile arm keeps M1's absolute guard). The p90 is
+//! the quantile that statistic is read at and the reason is on the constant:
+//! the p99 ratio is a quotient of two rare-event counts once the start-up
+//! transient is gone.
 //!
 //! "Delivers what it is offered" is read as a **delivery** claim and not as a
 //! latency one: a flow's samples are split by when the sink observed them —
@@ -95,8 +98,10 @@
 //! pointer, not a restatement.
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
@@ -3448,19 +3453,67 @@ const M4_LATE_POLL: Duration = Duration::from_millis(25);
 /// frame-edge ramp cannot reach it.
 const M4_IMBALANCE_BOUND: f64 = 0.01;
 
-/// The fair-latency bound: the worst flow's p99 may not exceed the best flow's
-/// p99 by more than this factor, asserted on the **clean** arm. Derived from
-/// M4's own measurement (GATE.md): over the 36 clean-arm runs the bound is
-/// derived from (both windows) the worst spread was `1.20x`, so the bound is
-/// `1.67x` the worst measured spread. It asserts the dimension the share
-/// statistic cannot see: with equal offers and per-flow delivery at 1.000, a
-/// scheduler that favours one flow's *ordering* rather than its goodput would
-/// show up here and not in the shares. It is deliberately **not** asserted on
-/// the hostile arm, where the per-flow p99 differences are a GE loss
-/// realization rather than a scheduler property: that arm measured a spread of
-/// up to `2.93x` across 10 runs, so an asserted spread there would measure
-/// which flow caught the burst. The hostile arm keeps M1's absolute guard.
+/// The fair-latency bound: the worst flow's **90th-percentile** one-way
+/// latency may not exceed the best flow's by more than this factor, asserted on
+/// the **clean** arm. One authority for the quantile is
+/// [`fair_latency_spread`].
+///
+/// **Why the p90 and not the p99.** The bound claims a *lane property*: the
+/// lane's service is not ordered preferentially towards one flow. On the
+/// pre-transient clean lane the p99 was a usable proxy, because every flow's
+/// p99 sat on the shared start-up transient's own level. Once the transient is
+/// gone (pacer seed 4096, `rtp/GATE.md`) each flow's p99 is the `floor +` the
+/// size of *that flow's* 24th-largest sample, and on this lane's 2 % iid link
+/// those 24 samples are rare-event draws: measured per-flow p99 at seed 4096
+/// over 13 reps spans `26.2-99.2 ms` within a single arm while every flow's
+/// p50 stays at `21.2-23.4 ms`, so `max p99 / min p99` is a ratio of two small
+/// integer counts and reached `2.25` with **delivery 1.000 on every flow** and
+/// no scheduler asymmetry at all. A bound that fires on a count draw is not
+/// coverage. The p90 is the quantile the transient moves and the rare-event
+/// count does not: at seed 1024 it sits inside the transient (`137.7-158.8 ms`,
+/// spread `1.006-1.098`) and at 4096 on the floor (`23.6-29.7 ms`, spread
+/// `1.10-1.14`), so over both seeds and 13 reps the measured spread is
+/// `1.006-1.144` -- 1.75x inside this bound -- while a flow whose ordering is
+/// genuinely deprioritised moves its whole body and fails it (the
+/// `M4_FAIR_LATENCY_hold` probe below fails at `+30 ms` of one-flow hold).
+/// The p99 spread is deliberately **not** asserted anywhere: it is the count
+/// draw described above, and `m4_clean_lane_fair_latency`'s doc records what
+/// that leaves uncovered.
+///
+/// It asserts the dimension the share statistic cannot see: with equal offers
+/// and per-flow delivery at 1.000, a scheduler that favours one flow's
+/// *ordering* rather than its goodput would show up here and not in the shares.
+/// It is deliberately **not** asserted on the hostile arm, where the per-flow
+/// differences are a GE loss realization rather than a scheduler property: that
+/// arm measured a spread of up to `2.93x` across 10 runs, so an asserted spread
+/// there would measure which flow caught the burst. The hostile arm keeps M1's
+/// absolute guard.
 const M4_LATENCY_SPREAD_BOUND: f64 = 2.0;
+
+/// The fair-latency statistic: one arm's worst flow's **p90** one-way latency
+/// over its best flow's. One authority for the quantile [`M4_LATENCY_SPREAD_BOUND`]
+/// bounds, so the fair-latency arms cannot drift apart.
+///
+/// A flow that delivered nothing has no p90 (`summarize` yields NaN); report 0
+/// so a verdict line stays machine-parseable. The per-flow delivery floor is
+/// what names such a run, and it fires before this statistic is reached.
+fn fair_latency_spread(run: &FairRun) -> f64 {
+    let floor = run
+        .flows
+        .iter()
+        .map(|flow| flow.summary.p90)
+        .fold(f64::INFINITY, f64::min);
+    let ceiling = run
+        .flows
+        .iter()
+        .map(|flow| flow.summary.p90)
+        .fold(0.0, f64::max);
+    if floor.is_finite() && floor > 0.0 {
+        ceiling / floor
+    } else {
+        0.0
+    }
+}
 
 /// The bound the four-flow **clean level** arm asserts: the production flow
 /// count must meet the same interactive ceiling M1 asserts for one flow. One
@@ -3535,6 +3588,14 @@ struct FairArmSpec {
     /// The preferential-service fault injection: every flow but the first
     /// starts offering this long into the window (zero in every real run).
     stagger: Duration,
+    /// The **fair-latency** fault injection: the flow at this index has every
+    /// offered message held this long between its send timestamp and its write
+    /// to the lane ([`HoldWriter`]), so the sink observes that flow's messages
+    /// as served later than the others -- the sender-side simulation of a lane
+    /// that orders one flow's traffic preferentially. `None` in every real run,
+    /// and only ever set by [`m4_clean_lane_fair_latency`]'s own fault
+    /// namespace, so no other arm's behaviour moves.
+    hold: Option<(usize, Duration)>,
 }
 
 /// One flow's measured outcome: what it offered, what the lane delivered for
@@ -3658,6 +3719,7 @@ fn fairness_arms(mandate: &str) -> Vec<FairArmSpec> {
             int_s2c: clean_s2c,
             window: fairness_window(),
             stagger,
+            hold: None,
         },
         FairArmSpec {
             name: "hostile",
@@ -3665,8 +3727,65 @@ fn fairness_arms(mandate: &str) -> Vec<FairArmSpec> {
             int_s2c: hostile_link(42),
             window: fairness_window(),
             stagger: Duration::ZERO,
+            hold: None,
         },
     ]
+}
+
+/// A write half that holds every write by a fixed delay before it reaches the
+/// lane, so a message's **send timestamp** (taken by
+/// [`send_timestamped_messages`] before its `write_all`) and its arrival are
+/// separated by that delay, and the sink measures it as one-way latency. It is
+/// the fair-latency fault's injector: the flagged flow's messages are observed
+/// as served `held_for` later than the others, which is what a lane ordering
+/// one flow's traffic last would look like at the sink. It changes no other
+/// arm: every real run leaves
+/// [`FairArmSpec::hold`] `None` and the wrapper is never constructed.
+struct HoldWriter<'a, W> {
+    inner: &'a mut W,
+    held_for: Duration,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<'a, W> HoldWriter<'a, W> {
+    fn new(inner: &'a mut W, held_for: Duration) -> Self {
+        Self {
+            inner,
+            held_for,
+            sleep: None,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for HoldWriter<'_, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if let Some(sleep) = this.sleep.as_mut() {
+            if sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.sleep = None;
+        } else {
+            this.sleep = Some(Box::pin(tokio::time::sleep(this.held_for)));
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        Pin::new(&mut *this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut *this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut *this.inner).poll_shutdown(cx)
+    }
 }
 
 /// Run one fairness arm: `M4_FLOWS` interactive streams on ONE interactive
@@ -3689,6 +3808,7 @@ async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
         int_s2c,
         window,
         stagger,
+        hold,
     } = spec;
     let wall = Instant::now();
     let int_rtp = LaneRtpConfig::frame_reordering(true, prompt_tuning());
@@ -3761,6 +3881,9 @@ async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
                 streams.push((m4_flow_tag(flow), write));
             }
 
+            // The fair-latency fault's own flow, if any: that one flow's write
+            // half is wrapped so every offered message waits `held_for` between
+            // its send timestamp and its write ([`HoldWriter`]).
             // Tag first, then offer every flow *concurrently*: the arm is N
             // flows multiplexed on one lane, not N sequential sweeps. In every
             // real run `delay` is zero and every flow offers for the whole
@@ -3775,11 +3898,24 @@ async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
                 let delay = if index == 0 { Duration::ZERO } else { stagger };
                 let run_for = window.saturating_sub(delay);
                 let write = &mut *write;
+                let held_for = hold
+                    .filter(|(held_index, _)| *held_index == index)
+                    .map(|(_, d)| d);
                 futs.push(async move {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
-                    send_timestamped_messages(write, base, MSG_BYTES, CADENCE, run_for).await
+                    match held_for {
+                        Some(held_for) => {
+                            let mut held = HoldWriter::new(write, held_for);
+                            send_timestamped_messages(&mut held, base, MSG_BYTES, CADENCE, run_for)
+                                .await
+                        }
+                        None => {
+                            send_timestamped_messages(write, base, MSG_BYTES, CADENCE, run_for)
+                                .await
+                        }
+                    }
                 });
             }
             let sent_per_flow: Vec<u64> = join_all(futs).await;
@@ -4023,8 +4159,8 @@ fn m4_rows(runs: &[FairRun]) -> Vec<(String, String, f64, f64)> {
 /// Mandate 4: the interactive lane's split across several flows. Every flow
 /// must deliver what it is offered (no starvation), no flow's share of the
 /// lane's delivered bytes may depart from the equal share by more than
-/// [`M4_IMBALANCE_BOUND`] (fair share), the clean arm's worst flow's p99 may
-/// not exceed the best flow's p99 by more than [`M4_LATENCY_SPREAD_BOUND`]
+/// [`M4_IMBALANCE_BOUND`] (fair share), the clean arm's worst flow's p90 may
+/// not exceed the best flow's p90 by more than [`M4_LATENCY_SPREAD_BOUND`] (`fair_latency_spread`)
 /// (fair latency), and no hostile-arm flow's p99 may cross M1's hostile guard. The absolute
 /// interactive ceiling is **not** re-asserted per flow here: the 4-flow arm
 /// measures p99 179-231 ms, 0.72-0.92 of M1's 250 ms ceiling, so an absolute
@@ -4062,10 +4198,10 @@ async fn m4_interactive_lane_fairness() {
             .map(|f| f.summary.delivery_pct)
             .fold(f64::INFINITY, f64::min)
     };
-    let p99_floor_of = |run: &FairRun| {
+    let p90_floor_of = |run: &FairRun| {
         run.flows
             .iter()
-            .map(|f| f.summary.p99)
+            .map(|f| f.summary.p90)
             .fold(f64::INFINITY, f64::min)
     };
     let p99_ceiling_of =
@@ -4074,21 +4210,13 @@ async fn m4_interactive_lane_fairness() {
         |run: &FairRun| run.flows.iter().map(|f| f.summary.p50).fold(0.0, f64::max);
     let clean_floor = delivery_floor_of(clean);
     let hostile_floor = delivery_floor_of(hostile);
-    // A flow that delivered nothing has no p99, so the spread is undefined
-    // (`summarize` yields NaN). Report 0 instead of NaN so the verdict line
-    // stays machine-parseable: the per-flow delivery floor is what names such a
-    // run, and it fires before this statistic is even reached.
-    let spread_of = |run: &FairRun| {
-        let floor = p99_floor_of(run);
-        let ceiling = p99_ceiling_of(run);
-        if floor.is_finite() && floor > 0.0 {
-            ceiling / floor
-        } else {
-            0.0
-        }
-    };
-    let clean_spread = spread_of(clean);
-    let hostile_spread = spread_of(hostile);
+    // The fair-latency statistic is [`fair_latency_spread`] -- one authority
+    // for the quantile, shared with the two four-flow level arms and with
+    // [`m4_clean_lane_fair_latency`]. Both arms' spreads are reported; only the
+    // clean arm's is asserted (the hostile per-flow p90 differences are a GE
+    // loss realization, not a scheduler property).
+    let clean_spread = fair_latency_spread(clean);
+    let hostile_spread = fair_latency_spread(hostile);
     let clean_p99_max = p99_ceiling_of(clean);
     let clean_p50_max = p50_ceiling_of(clean);
     let hostile_p99_max = p99_ceiling_of(hostile);
@@ -4102,7 +4230,7 @@ async fn m4_interactive_lane_fairness() {
         && clean_spread <= M4_LATENCY_SPREAD_BOUND
         && hostile_p99_max <= M1_HOSTILE_P99_GUARD_MS;
     println!(
-        "MANDATE M4 {} flows={} clean_delivery_min={:.3} hostile_delivery_min={:.3} clean_share_min={:.4} clean_share_max={:.4} hostile_share_min={:.4} hostile_share_max={:.4} clean_imbalance={:.4} hostile_imbalance={:.4} imbalance_bound={:.3} fair_share={:.4} delivery_floor={:.3} clean_sent={} clean_on_time={} clean_late={} clean_lost={} hostile_sent={} hostile_on_time={} hostile_late={} hostile_lost={} late_horizon_s={:.1} clean_p99_spread={:.3} hostile_p99_spread={:.3} spread_bound={:.1} clean_p50_max={:.1} clean_p99_max={:.1} hostile_p99_max={:.1} ceiling={:.1} hostile_p99_guard={:.1} window_s={:.1} wall_s={:.1}",
+        "MANDATE M4 {} flows={} clean_delivery_min={:.3} hostile_delivery_min={:.3} clean_share_min={:.4} clean_share_max={:.4} hostile_share_min={:.4} hostile_share_max={:.4} clean_imbalance={:.4} hostile_imbalance={:.4} imbalance_bound={:.3} fair_share={:.4} delivery_floor={:.3} clean_sent={} clean_on_time={} clean_late={} clean_lost={} hostile_sent={} hostile_on_time={} hostile_late={} hostile_lost={} late_horizon_s={:.1} clean_p90_spread={:.3} hostile_p90_spread={:.3} spread_bound={:.1} clean_p50_max={:.1} clean_p99_max={:.1} hostile_p99_max={:.1} ceiling={:.1} hostile_p99_guard={:.1} window_s={:.1} wall_s={:.1}",
         verdict(pass),
         M4_FLOWS,
         clean_floor,
@@ -4187,12 +4315,12 @@ async fn m4_interactive_lane_fairness() {
     );
     for (index, flow) in clean.flows.iter().enumerate() {
         assert!(
-            flow.summary.p99 <= p99_floor_of(clean) * M4_LATENCY_SPREAD_BOUND,
-            "[M4] clean-arm flow {} (tag {}) p99 {:.1} ms is more than {M4_LATENCY_SPREAD_BOUND}x the best flow's p99 {:.1} ms (p50 {:.1}, max {:.1}), over the fair-latency bound -- one flow's tail is being served preferentially",
+            flow.summary.p90 <= p90_floor_of(clean) * M4_LATENCY_SPREAD_BOUND,
+            "[M4] clean-arm flow {} (tag {}) p90 {:.1} ms is more than {M4_LATENCY_SPREAD_BOUND}x the best flow's p90 {:.1} ms (p50 {:.1}, max {:.1}), over the fair-latency bound -- one flow's latency body is being served preferentially",
             index + 1,
             flow.tag as char,
-            flow.summary.p99,
-            p99_floor_of(clean),
+            flow.summary.p90,
+            p90_floor_of(clean),
             flow.summary.p50,
             flow.summary.max,
         );
@@ -4292,15 +4420,11 @@ async fn m4_clean_lane_p99_ceiling() {
         .map(|f| f.summary.delivery_pct)
         .fold(f64::INFINITY, f64::min);
     let samples: u64 = run.flows.iter().map(|f| f.summary.received).sum();
-    // A flow that delivered nothing has no p99, so the spread is undefined
-    // (`summarize` yields NaN). Report 0 instead of NaN so this arm's line
-    // stays machine-parseable: the per-flow delivery floor is what names such a
-    // run, and it is asserted below.
-    let spread = if p99_min.is_finite() && p99_min > 0.0 {
-        p99_max / p99_min
-    } else {
-        0.0
-    };
+    // The fair-latency statistic is [`fair_latency_spread`] -- the same
+    // authority the M4 arm and [`m4_clean_lane_fair_latency`] read. It is the
+    // p90 ratio, not the p99 ratio: see [`M4_LATENCY_SPREAD_BOUND`] for the
+    // measurement that makes the p99 ratio a count draw on this lane.
+    let spread = fair_latency_spread(&run);
     let pass = samples > 0
         && delivery_min >= M4_DELIVERY_FLOOR
         && spread <= M4_LATENCY_SPREAD_BOUND
@@ -4345,13 +4469,154 @@ async fn m4_clean_lane_p99_ceiling() {
     );
     assert!(
         spread <= M4_LATENCY_SPREAD_BOUND,
-        "[M4 level] clean-arm p99 spread {spread:.3} exceeds the {M4_LATENCY_SPREAD_BOUND} fair-latency bound (per-flow p99 {:?}): the aggregate level must be met by every flow on the lane, not by three fast flows carrying one slow one",
-        run.flows.iter().map(|f| f.summary.p99).collect::<Vec<_>>(),
+        "[M4 level] clean-arm fair-latency spread {spread:.3} exceeds the {M4_LATENCY_SPREAD_BOUND} bound (per-flow p90 {:?}): the aggregate level must be met by every flow on the lane, not by three fast flows carrying one slow one",
+        run.flows.iter().map(|f| f.summary.p90).collect::<Vec<_>>(),
     );
     assert!(
         p99_max <= M4_CLEAN_P99_CEILING_MS,
         "[M4 level] the four-flow clean lane's p99 {p99_max:.1} ms exceeds the {M4_CLEAN_P99_CEILING_MS} ms interactive ceiling (p50 {p50_max:.1}, per-flow p99 {:?}): the production shape runs {M4_FLOWS} flows on the one interactive lane, and it must meet the same ceiling M1 asserts for one -- a multi-flow tail breach is a product regression even though M1's one-flow arm cannot see it",
         run.flows.iter().map(|f| f.summary.p99).collect::<Vec<_>>(),
+    );
+}
+
+// ────────── M4 fair latency: the starved-flow bound, made to bite ────────────
+
+/// How long the fair-latency fault holds the flagged flow's messages. Sized
+/// from the bound it must cross: the arm's own one-way floor is `OWD` = 25 ms
+/// (measured p90 `23.6-29.7 ms` at seed 4096 and `137.7-158.8 ms` at 1024), so
+/// a hold that moves **one** flow's p90 has to exceed
+/// `(M4_LATENCY_SPREAD_BOUND - 1) x floor` = `25 ms` to raise the ratio past
+/// the bound on the floor; `30 ms` is the smallest whole value above that, and
+/// on the transient-free lane it lands the flagged flow's p90 at
+/// `~54-60 ms` against the others' `~24-26 ms`, a ratio of `~2.3`.
+const M4_FAIR_LATENCY_HOLD_MS: u64 = 30;
+
+/// The fair-latency arm's own fault namespace, and its only probe: hold the
+/// **last** flow's messages `M4_FAIR_LATENCY_HOLD_MS` between their send
+/// timestamp and their write ([`HoldWriter`]). That is the sender-side
+/// simulation of a lane that orders one flow's traffic last, which is the
+/// property [`M4_LATENCY_SPREAD_BOUND`] claims to catch, and it perturbs the
+/// arm's own *input* (where the flag sits in the write path), never the
+/// assertion. The namespace is its own (`M4_FAIR_LATENCY_*`) rather than M4's,
+/// so a probe of this bound cannot read as a probe of M4's.
+fn m4_fair_latency_hold() -> Option<(usize, Duration)> {
+    match fault("M4_FAIR_LATENCY")?.as_str() {
+        "M4_FAIR_LATENCY_hold" => {
+            Some((M4_FLOWS - 1, Duration::from_millis(M4_FAIR_LATENCY_HOLD_MS)))
+        }
+        _ => None,
+    }
+}
+
+/// The arm the fair-latency bound reads: M4's own `clean` arm -- the same
+/// `link(41/42, OWD, JITTER, LOSS_2, 0)` interactive link, the same `M4_FLOWS`
+/// tagged flows offering the same payload at the same `CADENCE` over the same
+/// window, and the same connected-but-unladen bulk lane -- taken from
+/// [`fairness_arms`] rather than restated, so the two cannot drift apart. Its
+/// only difference from [`m4_clean_level_arm`] is the fault namespace it reads.
+fn m4_fair_latency_arm() -> FairArmSpec {
+    let mut spec = fairness_arms("M4")
+        .into_iter()
+        .next()
+        .expect("the M4 arm set always carries its clean arm first");
+    spec.hold = m4_fair_latency_hold();
+    spec
+}
+
+/// Mandate 4's **fair-latency** arm: the bound that catches a flow being served
+/// preferentially, asserted on a statistic that is a property of the lane.
+///
+/// **Why this arm exists.** [`M4_LATENCY_SPREAD_BOUND`] was asserted on
+/// `max p99 / min p99` on the clean lane, and on the pre-4096 transport that
+/// ratio was held at `~1.01` by the *start-up transient*: every flow's p99 sat
+/// on the shared transient's body rather than on anything about that flow's
+/// service. Removing the transient (`rtp/GATE.md`, the pacer seed) puts each
+/// flow's p99 on the link floor plus that flow's own `p99`-th-largest
+/// uncovered-loss stall, so the ratio became a quotient of two small integer
+/// counts -- measured per-flow p99 at seed 4096 spanning `26.2-99.2 ms` inside
+/// one arm while all four p50s stayed at `21.2-23.4 ms` and every flow's
+/// delivery stayed `1.000`. A bound that fires on that draw is not coverage: it
+/// reports `2.25` on a lane with no scheduler asymmetry at all.
+///
+/// This arm asserts the same claim on the same bound at the same window,
+/// cadence and tier, but on the per-flow **p90** ([`fair_latency_spread`]) --
+/// the quantile the transient moves and a rare-event count does not. Measured
+/// over 13 reps at seeds 1024 and 4096 the p90 spread is `1.006-1.144`,
+/// `1.75x` inside the bound, while the read of the same lane's per-flow p90s is
+/// reported per flow so a breach names the flow. It is the bound's own red
+/// proof the file was missing: `M4_LATENCY_SPREAD_BOUND` had **no** vacuity
+/// probe on the clean lane (the two `M4_CLEAN_LEVEL_*` probes shift the whole
+/// link and leave all four flows equal), so it had never been shown to fail on
+/// a genuinely preferential lane.
+///
+/// The per-flow delivery floor is read *with* the bound, so a lane that meets
+/// its spread by starving a flow fails it.
+///
+/// Vacuity: `MANDATE_SMOKE_FAULT=M4_FAIR_LATENCY_hold` holds the last flow's
+/// messages `M4_FAIR_LATENCY_HOLD_MS` at the sender and fails this bound by
+/// name, with the other flows still at the floor and delivery still `1.000`.
+///
+/// **What it does not cover, stated rather than implied.** It bounds the
+/// *body* of the per-flow distribution. A starving scheduler that delayed only
+/// a flow's rare messages, leaving its p90 at the floor, would not move this
+/// statistic; on this lane that regime is indistinguishable from the iid loss
+/// draw that already moves p99/p999 by a factor of 2-3 between identical runs,
+/// and the cells that do bound it are the aggregate ceiling
+/// ([`M4_CLEAN_P99_CEILING_MS`]), the per-flow delivery floor
+/// ([`M4_DELIVERY_FLOOR`]) and the share imbalance ([`M4_IMBALANCE_BOUND`]),
+/// each asserted on this same run.
+#[tokio::test(flavor = "multi_thread")]
+async fn m4_clean_lane_fair_latency() {
+    let _serial = SERIAL.lock().await;
+    let run = with_timeout(
+        ARM_DEADLINE,
+        "m4/clean_fair_latency",
+        run_fairness_arm(m4_fair_latency_arm()),
+    )
+    .await;
+    let p90: Vec<f64> = run.flows.iter().map(|f| f.summary.p90).collect();
+    let p50_max = run.flows.iter().map(|f| f.summary.p50).fold(0.0, f64::max);
+    let delivery_min = run
+        .flows
+        .iter()
+        .map(|f| f.summary.delivery_pct)
+        .fold(f64::INFINITY, f64::min);
+    let samples: u64 = run.flows.iter().map(|f| f.summary.received).sum();
+    let spread = fair_latency_spread(&run);
+    let pass = samples > 0
+        && delivery_min >= M4_DELIVERY_FLOOR
+        && spread.is_finite()
+        && spread > 0.0
+        && spread <= M4_LATENCY_SPREAD_BOUND;
+    // Its own verdict line, not a `MANDATE` line and not an `[mandate-smoke …]`
+    // arm row, for the reason [`m4_clean_lane_p99_ceiling`] states.
+    println!(
+        "[m4-fair-latency] {} flows={} spread={:.3} spread_bound={:.1} p90={:?} p50_max={:.1} \
+         delivery_min={:.3} samples={} window_s={:.1} wall_s={:.1}",
+        if pass { "PASS" } else { "FAIL" },
+        M4_FLOWS,
+        spread,
+        M4_LATENCY_SPREAD_BOUND,
+        p90,
+        p50_max,
+        delivery_min,
+        samples,
+        run.window.as_secs_f64(),
+        run.wall.as_secs_f64(),
+    );
+    assert!(
+        samples > 0 && spread.is_finite() && spread > 0.0,
+        "[M4 fair-latency] the arm measured {samples} delivered message(s) and a spread of {spread}: a lane with no samples or no percentile is an instrument failure, not a spread that passes",
+    );
+    assert!(
+        delivery_min >= M4_DELIVERY_FLOOR,
+        "[M4 fair-latency] clean-arm flow delivery {delivery_min:.3} is under the {M4_DELIVERY_FLOOR} floor (sent={:?} received={:?}): a spread met by starving a flow is not met",
+        run.flows.iter().map(|f| f.sent).collect::<Vec<_>>(),
+        run.flows.iter().map(|f| f.received).collect::<Vec<_>>(),
+    );
+    assert!(
+        spread <= M4_LATENCY_SPREAD_BOUND,
+        "[M4 fair-latency] per-flow p90 spread {spread:.3} exceeds the {M4_LATENCY_SPREAD_BOUND} fair-latency bound (per-flow p90 {p90:?}, p50_max {p50_max:.1}): one flow's latency body is {spread:.2}x the best flow's, so that flow is being served preferentially on the shared interactive lane",
     );
 }
 
