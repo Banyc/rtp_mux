@@ -292,6 +292,8 @@ rtp_mux_jitter::jitter_nonloss_impairments = perf | 210 | baseline@non-loss-impa
 rtp_mux_jitter::jitter_cellular_timeline_arms = perf | 70 | composite(impairment,lane,report)@non-loss-impairment | non-loss-impairment@lane=dual+layer=rtp-frame+shape=cadence+flows=1+loss=none+rate=none+load=none+impairment=owd25-jitter100-and-200ms+report=liveness+metric=p99
 spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable = standard | 2 | baseline@spike-survival | spike-survival@spike=none+lanes=dual+impairment=owd95-floor+metric=delay-and-session-identity
 spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect = standard | 9 | orthogonal@spike-survival | spike-survival@spike=field-3205ms-round-trip+lanes=dual+impairment=owd95-floor+metric=delay-and-session-identity
+mandate_smoke::m1_hostile_tail_decomposition = full | 110 | baseline@hostile-tail | hostile-tail@arm-set=mechanism-decomposition+metric=p50-p99-max-and-wire
+mandate_smoke::m1_hostile_tail_lever = full | 132 | orthogonal@hostile-tail | hostile-tail@arm-set=lane-policy-sweep+metric=p50-p99-max-and-wire
 ```
 
 Declared sums are `default` 149 s, `standard` 41 s, `full` 1871 s and `perf`
@@ -617,7 +619,7 @@ it — it does, on an absent id).
 ```gate-budgets
 default = 300
 standard = 600
-full = 1900
+full = 2150
 perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.clean-band = mandate_smoke::probe_m4_clean_band_composition
@@ -637,6 +639,7 @@ baseline.hol-rtt100-clean = hol_probe::hol_rtt100_clean_solo
 baseline.hol-rtt100-ge5 = hol_probe::hol_rtt100_ge5_solo
 baseline.hol-rtt40-ge1 = hol_probe::hol_rtt40_ge1_solo
 baseline.hostile-probes = perf_probe::probe_hostile_goodput_30s
+baseline.hostile-tail = mandate_smoke::m1_hostile_tail_decomposition
 baseline.instrument-sanity = perf_probe::controller_fat_pipe_has_only_fixed_shaping
 baseline.interactive = rtp_mux_jitter::jitter_interactive_solo
 baseline.latency-sweep = rtp_mux_jitter::jitter_latency_dimension_arms
@@ -662,6 +665,7 @@ members.hol-rtt100-clean = hol-rtt100-clean*
 members.hol-rtt100-ge5 = hol-rtt100-ge5*
 members.hol-rtt40-ge1 = hol-rtt40-ge1*
 members.hostile-probes = hostile-probe*
+members.hostile-tail = hostile-tail*
 members.instrument-sanity = instrument-sanity*
 members.interactive = interactive-cadence*
 members.latency-sweep = latency-sweep*
@@ -1810,6 +1814,103 @@ per-connection seed on the connect/accept config
 `ReliableLayer::seed_send_rate` at construction) whose default — every caller
 that declares no offer — is `None`, i.e. the crate's unchanged stock constant.
 
+### The hostile tail's decomposition: what the post-seed residual is made of
+
+With the start-up transient gone the M1 hostile arm's p99 sits at
+`133.2–185.2 ms` (median `153.6`), and the question the seed change left is what
+that residual *is*. Two new `full`-tier probes answer it without retuning any
+existing arm: `mandate_smoke::m1_hostile_tail_decomposition` (110 s, seven arms)
+varies one impairment dimension at a time from the M1 hostile arm taken from
+`mandate_arms`; `mandate_smoke::m1_hostile_tail_lever` (132 s, eight arms) holds
+the M1 hostile arm fixed and varies the one thing `rtp_mux` owns — the
+interactive lane's transport policy — measuring the M1 lone-tail arm under the
+same policies so a lever cannot buy the hostile read with the lone one.
+
+**Decomposition, one dimension per arm.** Medians over six interleaved
+full-window reps on this crate's pinned `rtp v0.0.101`, lane seed `4096`,
+libtest `--test-threads=1`, `uptime` 1-minute load `2.8–12.1` across the set
+(the load travels with every rep in the run logs).
+
+| arm | dimension varied from the reference | p50 | p90 | p99 | p999 | max | over250 | c2s wire |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `hostile` (reference) | — | 2.0 | 87.3 | **153.6** | 200.5 | 222.2 | 0–1 | 6.66x |
+| `no_loss` | loss off | 0.1 | 21.7 | **92.2** | 111.7 | 122.0 | 0 | 6.80x |
+| `no_jitter` | jitter off | 25.5 | 85.5 | **149.7** | 174.9 | 192.5 | 0–10 | 2.99x |
+| `no_bulk` | bulk off | 3.0 | 89.5 | **173.4** | 222.5 | 234.2 | 0–37 | 6.53x |
+| `floor` (composite: loss+bulk off) | jitter alone | 0.1 | 22.6 | **92.9** | 112.6 | 121.6 | 0 | 6.80x |
+| `loss_only` (composite: jitter+bulk off) | loss alone | 25.5 | 86.0 | **160.8** | 260.0 | 277.8 | 0–8 | 2.97x |
+| `clean_floor` (composite: all three off) | the lane's own floor | 25.2 | 25.6 | **25.8** | 28.2 | 30.1 | 0 | 6.97x |
+
+Read against the reference: **the link's own jitter is `92.9 − 25.8 = 67.1 ms`
+of the p99, the transport's repair of the GE bursts is `153.6 − 92.2 = 61.4 ms`,
+and the competing bulk burst is `153.6 − 173.4 = −19.8 ms` — zero within this
+arm's own spread.** The wheel is not re-derived: the `clean_floor` p99 (`25.8`)
+reproduces the clean arm's recorded `~26 ms`, and the loss-free arms' maxima
+(`121.6–124.3 ms`) sit just under the analytic one-way ceiling
+`OWD + HOSTILE_JITTER = 125 ms`, which is what the armour's first-arriving-copy
+selection bounds.
+
+**Jitter arms neither longer nor spurious rungs — both directions measured.**
+*Longer*: the jittered and unjittered loss arms read the same repaired tail
+(`no_bulk` p99 `173.4` against `loss_only` `160.8`, a `12.6 ms` difference
+inside the settled 40 % impaired-percentile band), so the variance-inflated
+`corroborated_repair_rto` is not what sets the tail. *Spurious*: the loss-free
+arms report `over250 = 0` on every rep, so the lane fires no probe on a link
+that lost nothing even while its per-packet jitter is at its maximal `±100 ms`.
+The predecessor's residual "30–100 ms one-flow stall" is this table's
+`no_loss`/`floor` p99 (`92.2`/`92.9` of a `125 ms` link ceiling) — the injected
+impairment itself, not a mechanism downstream of the pacer seed.
+
+**The lever sweep is a quantified refusal.** The deployment's interactive-lane
+policy is `frame_reordering(true, prompt_tuning())` (FEC on, `instream_flush`,
+small-group parity 1). Every alternative `rtp_mux` owns was measured on the same
+arm (medians of six reps; `dedicated` two), with the M1 lone-tail arm under each
+tuning as the other read:
+
+| lane policy | hostile p99 | hostile wire | hostile over250 | lone-tail p99 |
+| --- | --- | --- | --- | --- |
+| `prompt1` (deployed) | **150.2** | 6.72x | 0 | 169.4 |
+| `stock` (`FecTuning::default()`) | 255.2 | 2.25x | 9–39 | 273.6 |
+| `parity3` (`small_group_parity_count: 3`) | 177.0 | 8.12x | 0–27 | 166.4 |
+| `strict` (`frame_strict_tuned(true, prompt1)`) | 167.5 | 6.70x | 0–4 | not swept |
+| `dedicated` (`CongestionLane::Dedicated`) | 214.2 | 4.89x | 0–20 | not swept |
+
+The deployed tuning is the minimum on the hostile p99; every alternative is
+worse (`stock` +70 %, `parity3` +18 %, `strict` +12 %, `dedicated` +43 %), and
+none is better on the lone tail (`parity3` reads `166.4` against `prompt1`'s
+`169.4` — equal within the band, so it is not a trade, just a worse hostile read
+at `+21 %` wire). This independently reproduces the `rtp/GATE.md` family's
+record that a parity increase aimed at one arm does not help the other: here it
+helps neither. **No `rtp_mux`-owned lever reduces the hostile tail**; the
+remaining components are the injected jitter (the impairment) and `rtp`'s
+repair ladder, whose cover `m` and rung deadlines this crate does not own.
+
+**The probe's own gate, and its vacuity.** The decomposition asserts its
+instrument (no arm measured zero samples, every arm delivered its offer, the
+reference arm's link actually applied the GE model) and one property with
+teeth: **on a loss-free arm no sample may exceed `M1_CEILING_MS`.** A loss-free
+path has nothing to repair, and a rung costs at least `TAIL_PROBED_MIN_RTO`
+(`300 ms`), so `over250 > 0` on `no_loss`/`floor` can only be a repair armed
+for a loss that did not happen. Vacuity: an extra `400 ms` one-way delay on the
+loss-free arms' links (the file's usual input perturbation) fails it red with
+`the loss-free no_loss arm reported 2400 sample(s) over 250 ms (max 525.5 ms,
+p99 524.0 ms) on a link that dropped nothing`, while the `dropped == 0` guard
+stayed green — so the failure names the repair property, not a side effect. The
+mutation was restored and the tree re-verified.
+
+**Cost, cells, and the tier raise.** Both probes are `full` tier and between
+them cost `110 + 132 = 242 s`, measured on libtest's own stamps. Coverage
+cells: `hostile-tail@arm-set=mechanism-decomposition+metric=p50-p99-max-and-wire`
+(the one-dimension arms above, a stated baseline being the M1 hostile arm) and
+`hostile-tail@arm-set=lane-policy-sweep+metric=p50-p99-max-and-wire` (the lane
+policy, one dimension from that baseline). Cells deliberately **not** covered,
+with the reason: the four-flow split (M4's own arm and the two level arms own
+it; this probe is one flow), and the armour cover `m` and the ladder's rung
+deadlines (both `rtp`'s, reached by `rtp/GATE.md`'s armour probes). The `full`
+ceiling is raised `1900 -> 2150` as a declared change: `1871 + 242 = 2113 s`, and
+`2150` is the smallest ceiling that admits the measured sum with room for the
+still-undeclared rows.
+
 ### The four-flow hostile level: `m4_hostile_lane_p99_ceiling`
 
 The four-flow **clean** level above closes the clean shape's ceiling gap, but
@@ -2113,6 +2214,8 @@ rtp_mux_jitter::jitter_interactive_with_loss = perf
 rtp_mux_jitter::jitter_latency_dimension_arms = perf
 rtp_mux_jitter::jitter_nonloss_impairments = perf
 rtp_mux_jitter::jitter_reorder_direction = perf
+mandate_smoke::m1_hostile_tail_decomposition = full
+mandate_smoke::m1_hostile_tail_lever = full
 rtp_mux_jitter::jitter_reorder_rate_curve = perf
 rtp_mux_jitter::jitter_request_response_arms = perf
 rtp_mux_jitter::jitter_shared_bottleneck_arms = perf
@@ -2238,6 +2341,8 @@ mandate_smoke::m1_interactive_tail_latency
 spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect
 spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable
 mandate_smoke::m1_lone_tail_rung_distribution
+mandate_smoke::m1_hostile_tail_decomposition
+mandate_smoke::m1_hostile_tail_lever
 mandate_smoke::m2_offered_load_latency
 mandate_smoke::m3_bulk_goodput_fraction
 mandate_smoke::m4_interactive_lane_fairness

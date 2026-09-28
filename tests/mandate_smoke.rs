@@ -946,6 +946,15 @@ async fn offer_cadence_on_deadline(
 /// interactive lane's own client->server wire, the offered payload, and the
 /// bulk sink/shaper counters.
 async fn run_arm(spec: ArmSpec) -> ArmRun {
+    run_arm_with(spec, LaneRtpConfig::frame_reordering(true, prompt_tuning())).await
+}
+
+/// [`run_arm`] with the interactive lane's transport configuration named by the
+/// caller. The default `run_arm` passes the deployment's own
+/// `frame_reordering(true, prompt_tuning())`, so every arm's behaviour is
+/// unchanged; this entry point exists so a *lever* probe can measure an
+/// alternative lane policy on the very same arm without retuning it.
+async fn run_arm_with(spec: ArmSpec, int_rtp: LaneRtpConfig) -> ArmRun {
     let ArmSpec {
         name,
         int_c2s,
@@ -956,7 +965,6 @@ async fn run_arm(spec: ArmSpec) -> ArmRun {
         msg_bytes,
     } = spec;
     let wall = Instant::now();
-    let int_rtp = LaneRtpConfig::frame_reordering(true, prompt_tuning());
     let bulk_rtp = LaneRtpConfig::production_bulk();
     let bulk_c2s = link(43, OWD, JITTER, LOSS_2, BULK_RATE_BPS);
     let bulk_s2c = link(44, OWD, JITTER, LOSS_2, BULK_RATE_BPS);
@@ -5049,4 +5057,290 @@ async fn m4_hostile_lane_p99_ceiling() {
         "[M4 hostile level] the four-flow hostile lane's p99 {p99_max:.1} ms exceeds its {M4_HOSTILE_P99_CEILING_MS:.1} ms ceiling (p50 {p50_max:.1}, per-flow p99 {:?}): the production shape runs {M4_FLOWS} flows on the one interactive lane, and its hostile tail is bounded only by M4's loose {M1_HOSTILE_P99_GUARD_MS:.0} ms per-flow guard -- a level regression past {M4_HOSTILE_P99_CEILING_MS:.1} ms (1.07x the recorded worst, {guard_tighter:.2}x tighter than that guard) is a product regression M1's one-flow clean arm cannot see",
         run.flows.iter().map(|f| f.summary.p99).collect::<Vec<_>>(),
     );
+}
+
+// ────────── the hostile tail's decomposition: one dimension per arm ──────────
+//
+// The hostile arm's p99 is a composite of mechanisms and its own one number
+// cannot say which of them it is: the link's own one-way jitter, the
+// transport's repair of what the GE model drops, and the lane's serialization
+// of a competing bulk burst. This probe measures **one arm per dimension** from
+// a stated baseline -- the M1 hostile arm itself, taken from [`mandate_arms`]
+// rather than restated -- so each reading attributes to the dimension it moves.
+// Two further arms are composites and are labelled as such: the link's own
+// floor (both loss and bulk removed) and the loss-only link (jitter and bulk
+// removed).
+//
+// What the decomposition is *for* is the question the hostile arm's guard
+// cannot answer: is the residual tail the link the product runs over, or is it
+// something the transport adds? The arms below separate the two, and the
+// jitter-only arm in particular is the no-spurious-repair control: with nothing
+// lost there is nothing to repair, so any sample past the link's own
+// `OWD + HOSTILE_JITTER` ceiling is a repair the transport armed for a loss
+// that did not happen.
+//
+// Report-only: the printed table is the deliverable. It asserts only its own
+// instrument sanity -- every arm measured samples, every arm delivered what it
+// offered, the reference arm's link actually applied the GE model (the counter
+// it names fired), and the loss-free arms' links dropped nothing -- because a
+// probe that returns no samples and exits green would have deleted the coverage
+// it exists to provide.
+
+/// The decomposition arms, each one dimension from the M1 hostile reference.
+fn hostile_decomposition_arms() -> Vec<ArmSpec> {
+    let window = cadence_window();
+    let reference = mandate_arms("M1")
+        .into_iter()
+        .nth(1)
+        .expect("the M1 arm set carries the hostile arm at index 1");
+    // Jitter + delay, no loss: the link's own one-way spread, nothing to repair.
+    let jitter_only = |seed: u64| link(seed, OWD, HOSTILE_JITTER, 0, 0);
+    // The GE model with the jitter removed: what the transport's repair alone
+    // costs on a quiet link.
+    let loss_no_jitter = |seed: u64| NetemConfig {
+        latency: OWD,
+        jitter: Duration::ZERO,
+        loss_model: gilbert_elliott_loss(5.0, 8.0),
+        seed,
+        ..NetemConfig::default()
+    };
+    // The lane's own floor: neither jitter nor loss, so this is the mux/rtp
+    // serialization the impaired arms sit on top of.
+    let clean_floor = |seed: u64| link(seed, OWD, Duration::ZERO, 0, 0);
+    let load = Load::Cadence { cadence_divisor: 1 };
+    let arm =
+        |name: &'static str, int_c2s: NetemConfig, int_s2c: NetemConfig, bulk: bool| ArmSpec {
+            name,
+            int_c2s,
+            int_s2c,
+            bulk,
+            load,
+            window,
+            msg_bytes: MSG_BYTES,
+        };
+    vec![
+        // baseline: the M1 hostile arm, unchanged.
+        reference,
+        // orthogonal(loss): the hostile link with nothing to repair.
+        arm("no_loss", jitter_only(41), jitter_only(42), true),
+        // orthogonal(jitter): the hostile loss on a quiet link.
+        arm("no_jitter", loss_no_jitter(41), loss_no_jitter(42), true),
+        // orthogonal(bulk): the hostile link with no competing burst.
+        arm("no_bulk", hostile_link(41), hostile_link(42), false),
+        // composite(loss,bulk): the link's own jitter alone.
+        arm("floor", jitter_only(41), jitter_only(42), false),
+        // composite(jitter,bulk): the transport's repair alone on a quiet link.
+        arm("loss_only", loss_no_jitter(41), loss_no_jitter(42), false),
+        // composite(loss,jitter,bulk): the floor the impaired arms sit on.
+        arm("clean_floor", clean_floor(41), clean_floor(42), false),
+    ]
+}
+
+/// The M1 hostile tail's decomposition. Ignored: it measures the same arms' own
+/// mechanisms, not a mandate, and its cost is seven full-window runs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "hostile-tail decomposition; seven ~25 s arms; run with --ignored --nocapture --test-threads=1"]
+async fn m1_hostile_tail_decomposition() {
+    let _serial = SERIAL.lock().await;
+    let mut runs = Vec::new();
+    for spec in hostile_decomposition_arms() {
+        let label = format!("hostile-decomp/{}", spec.name);
+        let run = with_timeout(ARM_DEADLINE, &label, run_arm(spec)).await;
+        runs.push(run);
+    }
+    let reference = runs
+        .iter()
+        .find(|run| run.name == "hostile")
+        .expect("the decomposition always carries the M1 hostile arm as its reference");
+    for run in &runs {
+        let s = &run.summary;
+        let dropped = run.int_c2s_counters.dropped;
+        let received = run.int_c2s_counters.received.max(1);
+        let wire_multiple = if run.offered_bytes == 0 {
+            0.0
+        } else {
+            run.int_c2s_wire_bytes as f64 / run.offered_bytes as f64
+        };
+        let dp99 = s.p99 - reference.summary.p99;
+        let row = format!(
+            "[hostile-decomp {name:<9}] p50={p50:7.1} p90={p90:7.1} p99={p99:7.1} \
+             p999={p999:7.1} max={max:8.1} over250={o25:>4} del={del:.3} recv={recv:>5} \
+             applied_loss={loss:>5}/{received:>5} wire={wire:>8}B offered={offered:>8}B \
+             wire_x={wx:5.2} dp99_vs_hostile={dp99:+8.1} wall={wall:.1}s\n",
+            name = run.name,
+            p50 = s.p50,
+            p90 = s.p90,
+            p99 = s.p99,
+            p999 = s.p999,
+            max = s.max,
+            o25 = over250_count(&run.samples),
+            del = s.delivery_pct,
+            recv = s.received,
+            loss = dropped,
+            received = received,
+            wire = run.int_c2s_wire_bytes,
+            offered = run.offered_bytes,
+            wx = wire_multiple,
+            dp99 = dp99,
+            wall = run.wall.as_secs_f64(),
+        );
+        let mut stderr = std::io::stderr().lock();
+        let _ = std::io::Write::write_all(&mut stderr, row.as_bytes());
+    }
+    for run in &runs {
+        assert!(
+            !run.samples.is_empty(),
+            "[hostile-decomp] the {} arm measured no delivered sample: a probe that returns nothing is an instrument failure, not a decomposition",
+            run.name,
+        );
+        assert!(
+            run.summary.delivery_pct >= M2_HOSTILE_DELIVERY_FLOOR,
+            "[hostile-decomp] the {} arm delivered {:.3} of its offer, under the {M2_HOSTILE_DELIVERY_FLOOR} floor: the arm measured a starved lane, not the mechanism it varies",
+            run.name,
+            run.summary.delivery_pct,
+        );
+    }
+    // The counter the reference arm's mechanism names must have fired, and the
+    // control arms' must not have: a "no loss" arm whose link dropped datagrams
+    // is not a no-spurious-repair control.
+    assert!(
+        reference.int_c2s_counters.dropped > 0,
+        "[hostile-decomp] the reference arm's link applied {} drops over {} datagrams: the GE model did not fire, so the arm measured a loss-free link while claiming the hostile one",
+        reference.int_c2s_counters.dropped,
+        reference.int_c2s_counters.received,
+    );
+    // The loss-free arms' links must have applied no loss, and their lanes must
+    // have fired no rung: with nothing lost there is nothing to repair, so a
+    // sample past the M1 ceiling can only be a repair the transport armed for a
+    // loss that did not happen (a rung costs at least `TAIL_PROBED_MIN_RTO`,
+    // 300 ms > the ceiling). This is the probe's real property, and the reason
+    // the jitter-only arm is a control rather than just another reading.
+    for name in ["no_loss", "floor"] {
+        let run = runs.iter().find(|run| run.name == name).unwrap();
+        assert_eq!(
+            run.int_c2s_counters.dropped, 0,
+            "[hostile-decomp] the {name} arm's link dropped {} datagram(s), so it is not the loss-free control its name claims",
+            run.int_c2s_counters.dropped,
+        );
+        let over = over250_count(&run.samples);
+        assert_eq!(
+            over, 0,
+            "[hostile-decomp] the loss-free {name} arm reported {over} sample(s) over {M1_CEILING_MS} ms (max {:.1} ms, p99 {:.1} ms) on a link that dropped nothing: a loss-free path has nothing to repair, so no sample may reach a repair rung -- the lane armed a repair for a loss that did not happen",
+            run.summary.max, run.summary.p99,
+        );
+    }
+}
+
+// ────── the rtp_mux-owned levers on the hostile lane: FEC tuning, frame mode ──
+//
+// The decomposition above says the hostile p99 is the link's own jitter plus the
+// transport's repair. The repair is `rtp`'s ladder, but the *lane policy* that
+// decides what the repair has to work with is `rtp_mux`'s: the FEC tuning
+// (`FecTuning::small_group_parity_count`, `instream_flush`) and the receiver's
+// frame mode (fast-forward or strict). This probe sweeps those on the M1
+// hostile arm **and** the M1 lone-tail arm at the same time, because the record
+// is that a parity increase aimed at one arm read worse on the other: a lever is
+// only a lever if it does not buy the hostile tail with the lone one.
+//
+// Report-only *for the lever decision*, but it asserts its own instrument sanity
+// (every arm measured samples and delivered its offer), so a zero-sample sweep
+// cannot read as a refusal.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "interactive-lane lever sweep; seven ~25 s arms; run with --ignored --nocapture --test-threads=1"]
+async fn m1_hostile_tail_lever() {
+    let _serial = SERIAL.lock().await;
+    let hostile = mandate_arms("M1")
+        .into_iter()
+        .nth(1)
+        .expect("the M1 arm set carries the hostile arm at index 1");
+    let lone = mandate_arms("M1")
+        .into_iter()
+        .nth(2)
+        .expect("the M1 arm set carries the lone_tail arm at index 2");
+    let tunings: [(&str, rtp::FecTuning); 3] = [
+        ("stock", rtp::FecTuning::default()),
+        ("prompt1", prompt_tuning()),
+        (
+            "parity3",
+            rtp::FecTuning {
+                instream_flush: true,
+                small_group_parity_count: 3,
+            },
+        ),
+    ];
+    let mut rows: Vec<(String, ArmRun)> = Vec::new();
+    for (label, tuning) in tunings {
+        for (arm, spec) in [("hostile", hostile.clone()), ("lone", lone.clone())] {
+            let lane = LaneRtpConfig::frame_reordering(true, tuning);
+            let name = format!("{arm}/{label}");
+            let run = with_timeout(ARM_DEADLINE, &name, run_arm_with(spec, lane)).await;
+            rows.push((name, run));
+        }
+    }
+    // The frame-mode lever alone, at the deployment's own tuning.
+    let strict = with_timeout(
+        ARM_DEADLINE,
+        "hostile/strict",
+        run_arm_with(
+            hostile.clone(),
+            LaneRtpConfig::frame_strict_tuned(true, prompt_tuning()),
+        ),
+    )
+    .await;
+    rows.push(("hostile/strict".to_owned(), strict));
+    // The congestion-intent lever: the deployment declares the interactive lane
+    // `Shared` (it shares the host's bottleneck with whatever else is on the
+    // wire). The harness's hostile arm has no competing flow on the lane's own
+    // link, so `Dedicated` is the one alternative intent the crate could name;
+    // it is measured because it is a lane policy this crate owns, not because
+    // the deployment would take it.
+    let dedicated = with_timeout(
+        ARM_DEADLINE,
+        "hostile/dedicated",
+        run_arm_with(
+            hostile.clone(),
+            LaneRtpConfig::frame_reordering(true, prompt_tuning())
+                .with_congestion_lane(rtp::CongestionLane::Dedicated),
+        ),
+    )
+    .await;
+    rows.push(("hostile/dedicated".to_owned(), dedicated));
+
+    for (name, run) in &rows {
+        let s = &run.summary;
+        let row = format!(
+            "[hostile-lever {name:<16}] p50={p50:7.1} p90={p90:7.1} p99={p99:7.1} \
+             p999={p999:7.1} max={max:8.1} over250={o25:>4} del={del:.3} recv={recv:>5} \
+             wire_x={wx:5.2} wall={wall:.1}s\n",
+            name = name,
+            p50 = s.p50,
+            p90 = s.p90,
+            p99 = s.p99,
+            p999 = s.p999,
+            max = s.max,
+            o25 = over250_count(&run.samples),
+            del = s.delivery_pct,
+            recv = s.received,
+            wx = if run.offered_bytes == 0 {
+                0.0
+            } else {
+                run.int_c2s_wire_bytes as f64 / run.offered_bytes as f64
+            },
+            wall = run.wall.as_secs_f64(),
+        );
+        let mut stderr = std::io::stderr().lock();
+        let _ = std::io::Write::write_all(&mut stderr, row.as_bytes());
+    }
+    for (name, run) in &rows {
+        assert!(
+            !run.samples.is_empty(),
+            "[hostile-lever] the {name} arm measured no delivered sample: a sweep that measures nothing cannot refuse a lever",
+        );
+        assert!(
+            run.summary.delivery_pct >= M2_HOSTILE_DELIVERY_FLOOR,
+            "[hostile-lever] the {name} arm delivered {:.3} of its offer, under the {M2_HOSTILE_DELIVERY_FLOOR} floor",
+            run.summary.delivery_pct,
+        );
+    }
 }
