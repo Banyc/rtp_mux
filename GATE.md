@@ -2452,6 +2452,7 @@ non-`support` tests reported by `cargo test -p rtp_mux --test <target> --
 birth_liveness::a_birth_is_not_killed_by_a_spike_scale_gap_but_still_times_out_beyond_its_budget = full
 cold_connection::cold_connection_decomposition = standard
 cold_connection::mux_lane_birth_is_one_round_trip = standard
+cc_link_ab::cc_link_reaches_the_bulk_controller_and_bounds_the_shared_queue = full
 contested_latency::contested_capped_clean = full
 contested_latency::contested_capped_jitter_loss = perf
 contested_latency::contested_hostile = perf
@@ -2585,6 +2586,7 @@ own body: a `perf` scenario containing `assert!`/`assert_eq!`/`assert_ne!`/
 ```gate-asserting
 cold_connection::cold_connection_decomposition
 cold_connection::mux_lane_birth_is_one_round_trip
+cc_link_ab::cc_link_reaches_the_bulk_controller_and_bounds_the_shared_queue
 contested_latency::contested_capped_clean
 dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction
 dynamic_contested::dyn_dual_auto_big_first
@@ -3022,6 +3024,63 @@ hostile-message-latency-probe = NETEM_PERF_WINDOW_SECONDS,NETEM_PERF_WARMUP_SECO
 minecraft-contested-arms = MC_CONTESTED_FAULT,MC_RUNS,MC_WINDOW_SECS | - | the Minecraft-shaped composite's fault selector, run count and window: `MC_CONTESTED_FAULT` selects one of four input perturbations that each remove the property one assertion guards (`slow`, +250 ms one-way, drives the round-trip p99 tripwire past its bound; `no_bulk` opens the bulk stream but asks for a zero-length push, so the saturation chain fails; `offer_cut` offers a tenth of the tick, so the offer floor fails; `bulk_interactive` opens the bulk stream on the interactive lane, so the lane assertion fails), `MC_RUNS` is the number of independent runs the asserting arm repeats (default 3, each ~25 s of ramp + window + grace with a fresh session, seed and link pair), and `MC_WINDOW_SECS` sizes the measured window (default 20 s, four burst periods and ~1000 small frames); the fault selector sizes nothing and the window is a duration, so the load arithmetic derives from `MC_RUNS` with the window at its declared default, and a longer window scales the wall proportionally | minecraft-shaped-p99@shape=composite+metric=interactive-rtt-p99, minecraft-shaped-saturation@bulk=saturating-s2c+metric=backlog-and-passed-fraction, minecraft-shaped-direction@bulk=sweep+metric=interactive-rtt-p99, minecraft-shaped-lane@metric=observed-source-lane, minecraft-shaped-vacuity@fault=MC_CONTESTED_FAULT+targets=rtt-tripwire-and-offer-and-saturation-and-lane | MC_RUNS=3,total=MC_RUNS,wall=76.85s,bound=1.2e-1/run
 vacuity-fault-selectors = MANDATE_SMOKE_FAULT,HOL_PROBE_FAULT,SPIKE_SURVIVAL_FAULT,RTP_MUX_COLD_CONNECTION_FAULT | - | the red-proof input perturbations, not measurements: MANDATE_SMOKE_FAULT selects one smoke arm's perturbed input (a slowed or re-shaped link, a starved or dropped flow, or an offer cut to a tenth of the cadence), HOL_PROBE_FAULT the concurrent arms' offering serialization or throttle, SPIKE_SURVIVAL_FAULT the skipped spike, the mid-spike session churn or the late churn, and RTP_MUX_COLD_CONNECTION_FAULT the pre-fix sequential birth surrogate; each exists so the arm it perturbs can be shown to fail from the measurement path, each is unset in every real run, and none sizes anything, so this row's load is refused rather than invented | smoke-vacuity@fault=MANDATE_SMOKE_FAULT+targets=M1-M2-M3-M4, offer-vacuity@fault=HOL_PROBE_FAULT+targets=concurrent-offer-floor, spike-vacuity@fault=SPIKE_SURVIVAL_FAULT+targets=session-identity, birth-vacuity@fault=RTP_MUX_COLD_CONNECTION_FAULT+targets=dual-lane-birth
 ```
+
+## The cross-lane CC signal: is it wired, and does it buy the shared tail?
+
+`tests/cc_link_ab.rs` is a `full`-tier arm (opt-in, measured **85 s** at load
+4.5-10.9 on ten cores; `2 arms x 4 interleaved reps` of an 8 s window on one
+shared 1 MiB/s / 128 KiB bottleneck shaper) that measures `rtp::cc`'s
+cross-connection signal at the bulk connection's own congestion controller,
+rather than inferring it from a latency a dozen other things move. The two arms
+differ in one dimension - whether one `rtp::cc::CcSignalHub` is passed to the
+dual-lane client - and both lanes' client-to-server traffic crosses one shared
+shaper, so a saturating bulk genuinely stands in front of the interactive lane.
+
+Coverage cells: `cc-signal@lane=dual+load=saturating-s2c+impairment=owd25-jitter5+shaper=shared-uplink+mechanism=cc-link+metric=interactive-latency-percentiles-and-bulk-goodput`,
+honest beside
+`cc-signal@mechanism=absent+metric=interactive-latency-percentiles-and-bulk-goodput`
+(the control), with the controller-side cells
+`cc-signal@mechanism=cc-link+probe=loss-gate-engagement` and
+`cc-signal@mechanism=cc-link+probe=drain-vs-loss-backoff-branch-share` read off
+the public metrics surface (`congestion_loss_ratio`, `congestion_delay_drains`,
+`congestion_loss_backoffs`). The positive control is
+`cc-signal@wiring=hub-aggregate-observed-shared`.
+
+**What it measured.** The wiring is live end to end: in the active arm the
+hub's own aggregate read shared on 6 325 of ~7 600 samples, and the bulk
+controller's branch histogram moved exactly as `reliable_layer.rs`'s
+`loss_blocks_delay_control && !shared_path` prescribes - cumulative
+`drain/loss-backoff` decisions were `2578/12` (absent) against `2603/0`
+(active), i.e. every loss-gated decision the arms saw was suppressed. But the
+gate that makes the suppression matter, `loss_event_rate >= CC_DATA_LOSS_RATE`
+(`0.2`), was open on only `13` of 7 506 (absent) and `64` of 7 529 (active)
+RTT-sample observations - 0.17-0.85 % - because the shared shaper's loss event
+rate sits around `0.1-0.24`. Below that gate the controller already drains
+(`shared_path` is a no-op), so the mechanism changes the decision in well under
+1 % of decisions and the shared queue is not bounded: the shaper's backlog p99
+is `122-128 KiB` (its 128 KiB queue full) in **both** arms, and the interactive
+median p99 is `145.0` (absent) against `149.2` ms (active), with bulk goodput
+`0.932x` against `0.935x` of the nominal. The mechanism is therefore **live but
+almost never gated** in this shape; the earlier `ibfq_nic_mandate` and
+`mc_nic_cross_lane_signal` arms reach the same conclusion by their own routes.
+
+**The lever, measured and refused.** `CC_DATA_LOSS_RATE` is the nudgeable
+transport parameter that decides how often `loss_blocks_delay_control` is set.
+Lowering it `0.2 -> 0.05` in an unlanded `rtp` probe opened the gate on `391`
+(absent) / `177` (active) observations and suppressed `360` loss-backoff
+decisions (cumulative `drain/loss` `2352/360` absent against `2724/0` active) -
+a 30x increase in the mechanism's exercising. The interactive median p99 did
+not move (`141.3` absent against `141.6` active ms), the backlog p99 stayed at
+the full `120-129 KiB` queue, and bulk goodput was `0.939x` against `0.936x`:
+engaging the suppression far more often buys nothing measurable, so the gate is
+not the lever and the refusal is quantified rather than asserted.
+
+**Vacuity.** Mutating `reliable_layer.rs`'s `shared_path` expression to `false`
+(one occurrence of `is_shared()` removed, printed and counted before the
+verdict) turned the controller-branch assertion red with the observed values
+`active 0.928` against `absent 0.941`, while the `shared_probe` positive control
+still read 6 380 - so the arm fails on the suppression and not on the wiring.
+The restored `rtp` tree was verified byte-clean (`jj diff --stat` = 0 files).
 
 ## Opt-in targets outside this manifest
 
