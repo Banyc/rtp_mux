@@ -2023,7 +2023,7 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
 /// congestion intention. Both peers of a lane must agree on the first three
 /// (there is no in-band negotiation); the congestion intention is local to the
 /// connection that declares it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LaneRtpConfig {
     pub fec: bool,
     pub frame_mode: rtp::FrameMode,
@@ -2036,6 +2036,13 @@ pub struct LaneRtpConfig {
     /// [`Self::production_bulk`] so the declaration comes from the same
     /// mapping the deployment uses.
     pub congestion_lane: CongestionLane,
+    /// The lane's **pacer seed**, or `None` for a lane that declares no offer.
+    /// This is the deployment's per-lane policy, read from
+    /// [`crate::lane_transport::initial_send_rate`] rather than restated here,
+    /// so a scenario's arm seeds exactly the lane the deployment seeds.  The
+    /// interactive-lane constructors take it; every other lane leaves it `None`
+    /// and keeps rtp's own stock seed.
+    pub initial_send_rate: Option<f64>,
 }
 
 impl LaneRtpConfig {
@@ -2047,6 +2054,7 @@ impl LaneRtpConfig {
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
+            initial_send_rate: None,
         }
     }
 
@@ -2078,6 +2086,7 @@ impl LaneRtpConfig {
             frame_mode: FrameMode::enabled(),
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
+            initial_send_rate: None,
         }
     }
 
@@ -2089,6 +2098,9 @@ impl LaneRtpConfig {
             frame_mode: FrameMode::enabled_reordering(),
             fec_tuning,
             congestion_lane: CongestionLane::Shared,
+            initial_send_rate: crate::lane_transport::initial_send_rate(
+                mux::LaneClass::Interactive,
+            ),
         }
     }
 
@@ -2100,6 +2112,9 @@ impl LaneRtpConfig {
             frame_mode: FrameMode::enabled(),
             fec_tuning,
             congestion_lane: CongestionLane::Shared,
+            initial_send_rate: crate::lane_transport::initial_send_rate(
+                mux::LaneClass::Interactive,
+            ),
         }
     }
 }
@@ -2128,6 +2143,7 @@ fn lane_connect_config(
         frame_delivery: lane.frame_mode,
         metrics_observer: observer,
         congestion_lane: lane.congestion_lane,
+        initial_send_rate: lane.initial_send_rate,
         ..rtp::udp::ConnectConfig::default()
     }
 }
@@ -2167,6 +2183,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
+            initial_send_rate: None,
         }
     };
     let bulk_rtp = if bulk_frame {
@@ -2177,6 +2194,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
+            initial_send_rate: None,
         }
     };
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
@@ -2216,6 +2234,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
+            initial_send_rate: None,
         }
     };
     let bulk_rtp = if bulk_frame {
@@ -2226,6 +2245,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
             frame_mode: FrameMode::default(),
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
+            initial_send_rate: None,
         }
     };
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
@@ -2313,6 +2333,7 @@ async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
                         fec_tuning: lane_rtp.fec_tuning,
                         frame_delivery: lane_rtp.frame_mode,
                         congestion_lane: lane_rtp.congestion_lane,
+                        initial_send_rate: lane_rtp.initial_send_rate,
                         ..rtp::udp::AcceptConfig::default()
                     })
                     .await

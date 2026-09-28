@@ -83,6 +83,37 @@ pub(crate) fn congestion_lane(lane: LaneClass) -> CongestionLane {
     }
 }
 
+/// The interactive lane's **pacer seed**, in packets per second: the rate the
+/// lane is known to be offered, so its reliable sender is not served from a
+/// standing sender-side backlog while its congestion ramp climbs to that offer.
+///
+/// The number is a measurement, not a round figure.  The production four-flow
+/// shape offers `MSG_BYTES`/`CADENCE` on each of four flows (`256 B` every
+/// `5 ms` = `800` messages/second) and every message's fresh-tail armour takes
+/// its own pacer token (`1 + copies` = 5-6 here), so the lane's offer is
+/// ~`4.5k` packets/second: measured on the harness's four-flow production arms,
+/// the stock `1024` seed leaves the lane in a start-up transient whose tail is
+/// `274-423 ms` on the hostile link and `157-180 ms` on the clean one, and a
+/// seed of `4096` removes it (hostile four-flow p99 `320.9 -> 192.7 ms` over
+/// five interleaved reps each; clean p99 `178 -> 29 ms`).  It is applied to the
+/// interactive lane only: a lane that declares no offer — the bulk lane, a
+/// bare `rtp` connection, a tiny-MSS transfer — keeps rtp's own stock seed, and
+/// measured at the stock seed the tiny-MSS lossy transfer is `0/30` failures
+/// while a *global* seed of `4096` makes it `3/30`, which is why this is a lane
+/// policy and not a crate constant.
+pub(crate) const INTERACTIVE_INITIAL_SEND_RATE: f64 = 4096.0;
+
+/// The lane's pacer seed, or `None` for a lane that declares no offer (see
+/// [`INTERACTIVE_INITIAL_SEND_RATE`]).  This is the one authority for the
+/// mapping: the layer-testing kit reads it, so a scenario's arm seeds exactly
+/// the lane the deployment seeds.
+pub(crate) fn initial_send_rate(lane: LaneClass) -> Option<f64> {
+    match lane {
+        LaneClass::Interactive => Some(INTERACTIVE_INITIAL_SEND_RATE),
+        LaneClass::Bulk => None,
+    }
+}
+
 pub(crate) fn connect_config(
     lane: LaneClass,
     settings: ConnectSettings,
@@ -104,6 +135,7 @@ pub(crate) fn connect_config(
             .map(crate::ObfuscationKey::into_bytes),
         frame_delivery: frame_delivery(lane),
         congestion_lane: congestion_lane(lane),
+        initial_send_rate: initial_send_rate(lane),
         ..defaults
     }
 }
@@ -122,6 +154,7 @@ pub(crate) fn accept_config(lane: LaneClass, settings: AcceptSettings) -> rtp::u
         metrics_observer: settings.metrics_observer,
         frame_delivery: frame_delivery(lane),
         congestion_lane: congestion_lane(lane),
+        initial_send_rate: initial_send_rate(lane),
         ..defaults
     }
 }
