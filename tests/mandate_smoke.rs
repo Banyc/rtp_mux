@@ -192,6 +192,60 @@ const M3_CAPACITY_FRACTION: f64 = 0.35;
 const M1_HOSTILE_P99_GUARD_MS: f64 = 900.0;
 /// M1 hostile cadence-arm `> 250 ms` sample-count guard (measured 0-2.75 %).
 const M1_HOSTILE_OVER250_GUARD_PCT: f64 = 8.0;
+
+/// The number of interleaved hostile reps [`m1_hostile_p99_replicated`] takes.
+/// Derived, not picked. The hostile p99's between-rep standard deviation is
+/// `M1_HOSTILE_P99_REP_SD_MS`, so the difference of two revisions' medians has
+/// `se = sqrt(2) * 1.2533 * sd / sqrt(R)` and clears a move of `D` at 95 %
+/// confidence and 80 % power when `R >= (2.802 * sqrt(2) * 1.2533 * sd / D)^2`.
+/// For `D = 60 ms` and the recorded `sd = 38.4 ms` that is `10.12`, so `R = 11`.
+const M1_HOSTILE_P99_REP_REPS: usize = 11;
+
+/// The between-rep standard deviation of a **single** hostile p99 over the 43
+/// healthy observations on record: the 20 load-logged interleaved reps of the
+/// campaign recorded in `rtp_mux/GATE.md` (range 117.5-220.3 ms, sd 27.1 ms) and
+/// the 23 archived battery runs of the same arm under
+/// `netem_test/.net-perf-history/` (113.3-281.9 ms, sd 46.1 ms; the two
+/// consecutive same-revision observations `162.5` and `281.9 ms` that
+/// `crates/AUDIT_COVERAGE.md` records are two of them). The archive is included
+/// deliberately and is the reason the count is eleven and not six: a
+/// before/after comparison is exposed to the cross-revision movement the archive
+/// holds and the one-revision campaign cannot see, so `sd = 38.4` is the honest
+/// input rather than the campaign's own 27.1.
+const M1_HOSTILE_P99_REP_SD_MS: f64 = 38.4;
+
+/// The bound on the **median** hostile p99 across
+/// [`M1_HOSTILE_P99_REP_REPS`] interleaved reps, asserted by
+/// [`m1_hostile_p99_replicated`].
+///
+/// Derived, not picked: `mean + 4 sd` of the *median's* own sampling
+/// distribution, over the same 43 healthy observations. Their mean is `161.5 ms`
+/// and the median-of-eleven sd, bootstrapped from them (400 000 resamples), is
+/// `14.93 ms`, so the bound is `161.5 + 4 * 14.93 = 221.2 ms`, rounded up to the
+/// next whole 5 ms. Thirty-seven in a million healthy draws of that median
+/// exceed it. The arm's own vacuity fault (`MANDATE_SMOKE_FAULT=M1_IMPAIRED_slow`,
+/// `+300 ms` one-way on the hostile link, which pushes the arm past the 1 s
+/// repair floor) measured a median of `2021.2 ms` on this arm's ten-rep form, so
+/// a healthy draw and a bad lane stay an order of magnitude apart. The bound is
+/// `1.32x` tighter than the single-rep limit the deployed baseline carries
+/// (`298 ms`) and is asserted on a statistic whose noise is known, so a change
+/// that moves the hostile tail by `60 ms` fails here rather than hiding inside a
+/// single rep's draw.
+const M1_HOSTILE_P99_MEDIAN_BOUND_MS: f64 = 225.0;
+
+/// The bound on the **median** hostile p90 across [`M1_HOSTILE_P99_REP_REPS`]
+/// interleaved reps, asserted by [`m1_hostile_p99_replicated`].
+///
+/// The p90 is the quantile the same campaign measured as a *lane property*:
+/// over the 20 controlled reps it spans `78.7-93.2 ms` (1.18x, sd `3.8 ms`,
+/// cv `0.04`) where the same runs' p99 spans `1.87x` -- the body does not move
+/// and the tail's count does. So this is the arm's level claim that does not
+/// depend on a rare-event draw at all, and it is asserted beside the tail so a
+/// regression that shifts the whole distribution (the fault, `+300 ms`) is named
+/// whichever statistic is read. Derived the same way: `mean + 4 sd` over the 20
+/// controlled reps is `87.2 + 4 * 3.8 = 102.4 ms`, rounded up to the next whole
+/// 5 ms.
+const M1_HOSTILE_P90_MEDIAN_BOUND_MS: f64 = 105.0;
 /// M1 lone-tail p99 guard. The field's 60 s GE lone-tail arms measured p99
 /// 1053-1542 ms (the 1 s `MIN_RTO` repair floor plus backoff); the guard is
 /// ~2x the top of that band, so a change that at least doubles the known
@@ -2034,6 +2088,210 @@ async fn m1_interactive_tail_latency() {
         over250_pct(&lone.samples) <= M1_LONE_OVER250_GUARD_PCT,
         "[M1] lone-tail arm has {:.3}% of samples > {M1_CEILING_MS} ms, over its {M1_LONE_OVER250_GUARD_PCT}% regression guard",
         over250_pct(&lone.samples),
+    );
+}
+
+/// One reading of [`m1_hostile_p99_replicated`], printed so the arm's per-rep
+/// distribution is evidence in the run's own log rather than only a summary:
+/// which rep, its own percentiles, and its own `> 250 ms` sample count. The
+/// prefix is deliberately not `[mandate-smoke …]`: `tools/mandate-check` reads
+/// those as arm lines and attributes them to the mandate whose `MANDATE` line
+/// follows them, and these rows are an instrument reading rather than an arm the
+/// declaration carries (see [`mandate_runs_quiet`]).
+fn print_hostile_replicated_row(role: &str, rep: &str, run: &ArmRun) {
+    let s = &run.summary;
+    let row = format!(
+        "[m1-hostile-replicated] role={role:<7} rep={rep:<10} p50={p50:7.1} p90={p90:7.1} \
+         p99={p99:7.1} p999={p999:8.1} max={max:8.1} over250={o25:>4} \
+         recv={recv:>5} sent={sent:>5}\n",
+        p50 = s.p50,
+        p90 = s.p90,
+        p99 = s.p99,
+        p999 = s.p999,
+        max = s.max,
+        o25 = over250_count(&run.samples),
+        recv = s.received,
+        sent = s.sent,
+    );
+    print_censoring_row(&row);
+}
+
+/// The median of a slice, by value. `NaN` for an empty slice, so a caller that
+/// somehow measured no rep fails its bound rather than passing a zero.
+fn median_of(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    match n {
+        0 => f64::NAN,
+        _ if n % 2 == 1 => sorted[n / 2],
+        _ => 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]),
+    }
+}
+
+/// Mandate 1's hostile arm read as a **median of interleaved reps** rather than
+/// as one draw.
+///
+/// A **new arm alongside, with no existing arm retuned**: the `clean`, `hostile`
+/// and `lone_tail` arms keep their impairment, seeds, windows, cadence, tier and
+/// guards exactly, and this test measures the very same `hostile` spec
+/// [`mandate_arms`] builds -- `MANDATE_SMOKE_FAULT` reaches it unchanged, so the
+/// arm's vacuity is the same input perturbation M1's own impaired-baseline gate
+/// reads, and a probe of one arm's assertion cannot read as a probe of the
+/// other's because each failure names its own bound.
+///
+/// It exists because **one hostile rep is not a measurement of the hostile
+/// lane**. Measured on this revision (20 interleaved `m1_interactive_tail_latency`
+/// invocations, `uptime` logged per rep): the hostile p99 spans
+/// **117.5-220.3 ms (1.87x)** with a between-rep sd of `27.1 ms` and cv `0.17`,
+/// while the same runs' p75/p90/p95 span only 1.34x/1.18x/1.20x. The spread is a
+/// **rare-event count, not a host drift and not a body shift**: the p99 is
+/// `+0.95` correlated with the count of samples over `150 ms` and `-0.33`
+/// correlated with the paired clean arm's own p99, and the seven reps at load
+/// `6.9-18.2` (where the clean arm's p99 reached `84.6 ms`) read the *lowest*
+/// hostile p99 in the set. The samples inside a run are not scattered either: a
+/// severe head-of-line repair episode releases its whole queued cascade at one
+/// instant, so its members read a gradient (`247.2` down to `153.1 ms` at a
+/// single `t = 2.746 s` in one rep) and the p99 is fixed by how far up that
+/// cascade the 99th percentile reaches. So the statistic this arm asserts is the
+/// **median of `M1_HOSTILE_P99_REP_REPS` interleaved reps**, whose sampling sd is
+/// `14.93 ms` rather than the `38.4 ms` of a single draw.
+///
+/// The rep count and both bounds are derived on their constants. The control
+/// **brackets** the rep set rather than repeating per rep: the 20 paired reps
+/// above show the clean arm has no explanatory power for the hostile p99, so a
+/// per-rep control would double this arm's cost for coverage the measurement
+/// says is not there. Its readings say whether the host was contended while the
+/// reps ran, which is what attributes a breached bound.
+///
+/// The arm's vacuity is `MANDATE_SMOKE_FAULT=M1_IMPAIRED_slow`, which shifts the
+/// hostile link by `+300 ms` one-way on both directions and leaves the control
+/// untouched: the hostile median moves from `161.5` to `2021.2 ms` and both
+/// bounds fail -- the p90 and the p99 are collected and named together, so one
+/// fault shows each assertion biting -- from the measurement path rather than
+/// from a moved assertion.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; eleven ~16 s hostile reps plus two clean control readings; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn m1_hostile_p99_replicated() {
+    let _serial = SERIAL.lock().await;
+    // The very specs M1 builds, so the fault selector reaches the hostile arm
+    // exactly as it does for the mandate gate; the clean arm is the control and
+    // the fault leaves it untouched.
+    let specs = mandate_arms("M1");
+    let clean = specs[0].clone();
+    let hostile = specs[1].clone();
+
+    let open = with_timeout(
+        ARM_DEADLINE,
+        "m1_hostile_replicated/control-open",
+        run_arm(clean.clone()),
+    )
+    .await;
+    print_hostile_replicated_row("control", "open", &open);
+
+    let mut hostile_p99 = Vec::with_capacity(M1_HOSTILE_P99_REP_REPS);
+    let mut hostile_p90 = Vec::with_capacity(M1_HOSTILE_P99_REP_REPS);
+    for rep in 0..M1_HOSTILE_P99_REP_REPS {
+        let run = with_timeout(
+            ARM_DEADLINE,
+            &format!("m1_hostile_replicated/rep{}", rep + 1),
+            run_arm(hostile.clone()),
+        )
+        .await;
+        // The arm's own sanity: something was measured, and the percentile is
+        // not degenerate. An arm that took its measurement path and returned no
+        // samples has deleted the coverage it exists to provide.
+        assert!(
+            run.summary.received > 0 && run.summary.p99.is_finite() && run.summary.p99 > 0.0,
+            "[M1-hostile-replicated] rep {} measured {} samples with a non-finite p99 {:.1}: the arm must measure the hostile lane, not skip it",
+            rep + 1,
+            run.summary.received,
+            run.summary.p99,
+        );
+        print_hostile_replicated_row("hostile", &format!("rep{}", rep + 1), &run);
+        hostile_p99.push(run.summary.p99);
+        hostile_p90.push(run.summary.p90);
+    }
+
+    let close = with_timeout(
+        ARM_DEADLINE,
+        "m1_hostile_replicated/control-close",
+        run_arm(clean.clone()),
+    )
+    .await;
+    print_hostile_replicated_row("control", "close", &close);
+    let control_p99 = [open.summary.p99, close.summary.p99];
+
+    let p99_median = median_of(&hostile_p99);
+    let p90_median = median_of(&hostile_p90);
+    let p99_min = hostile_p99.iter().cloned().fold(f64::INFINITY, f64::min);
+    let p99_max = hostile_p99
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let sd = {
+        let mean = hostile_p99.iter().sum::<f64>() / hostile_p99.len() as f64;
+        let var = hostile_p99
+            .iter()
+            .map(|v| (v - mean) * (v - mean))
+            .sum::<f64>()
+            / (hostile_p99.len() - 1) as f64;
+        var.sqrt()
+    };
+    // The half-width the arm's own reps give the median, and the two-revision
+    // resolution they imply: printed so a reader comparing this run with another
+    // reads the number the rep count was derived from rather than re-deriving it.
+    let ci95 = 1.96 * 1.2533 * sd / (hostile_p99.len() as f64).sqrt();
+    let basis_points = 2.802 * (2.0f64).sqrt() * 1.2533 * sd / (hostile_p99.len() as f64).sqrt();
+    print_censoring_row(&format!(
+        "[m1-hostile-replicated] summary reps={reps} p99_median={p99m:7.1} p99_min={p99lo:7.1} \
+         p99_max={p99hi:7.1} p99_sd={sd:6.2} recorded_sd={rsd:5.1} ci95_halfwidth={ci95:6.2} \
+         two_arm_move_at_80pct_power={basis:6.2} p90_median={p90m:7.1} \
+         control_p99={c0:7.1}/{c1:7.1} p99_bound={b99:.1} p90_bound={b90:.1}\n",
+        reps = hostile_p99.len(),
+        p99m = p99_median,
+        p99lo = p99_min,
+        p99hi = p99_max,
+        sd = sd,
+        rsd = M1_HOSTILE_P99_REP_SD_MS,
+        ci95 = ci95,
+        basis = basis_points,
+        p90m = p90_median,
+        c0 = control_p99[0],
+        c1 = control_p99[1],
+        b99 = M1_HOSTILE_P99_MEDIAN_BOUND_MS,
+        b90 = M1_HOSTILE_P90_MEDIAN_BOUND_MS,
+    ));
+
+    // The control first: a contended host is named before the hostile bounds are
+    // read, so a breach is attributed rather than assumed.
+    for (slot, value) in [("open", control_p99[0]), ("close", control_p99[1])] {
+        assert!(
+            value <= M1_CEILING_MS,
+            "[M1-hostile-replicated] the control (clean) arm read p99 {value:.1} ms at the {slot} of the rep set, over M1's {M1_CEILING_MS} ms ceiling: the host was contended while the hostile reps ran, so this run's hostile p99 (median {p99_median:.1} ms) is inconclusive rather than a lane reading",
+        );
+    }
+    // Both breached bounds are collected and named together: the two say
+    // different things (the body moved / the tail moved), and a run that
+    // breaches both must report both rather than let the first assertion fire
+    // and hide the second.
+    let mut breaches = Vec::new();
+    if p90_median > M1_HOSTILE_P90_MEDIAN_BOUND_MS {
+        breaches.push(format!(
+            "[M1-hostile-replicated] the median hostile p90 over {reps} interleaved reps is {p90_median:.1} ms, over its {M1_HOSTILE_P90_MEDIAN_BOUND_MS} ms bound (per-rep p90: {hostile_p90:?}): the hostile lane's body moved, which no rare-event draw of its tail can explain",
+            reps = hostile_p99.len(),
+        ));
+    }
+    if p99_median > M1_HOSTILE_P99_MEDIAN_BOUND_MS {
+        breaches.push(format!(
+            "[M1-hostile-replicated] the median hostile p99 over {reps} interleaved reps is {p99_median:.1} ms, over its {M1_HOSTILE_P99_MEDIAN_BOUND_MS} ms bound (per-rep p99: {hostile_p99:?}; control p99: {control_p99:?}): the hostile lane's repair tail regressed past the level a replicated median can establish, at a noise of {sd:.2} ms between reps",
+            reps = hostile_p99.len(),
+        ));
+    }
+    assert!(
+        breaches.is_empty(),
+        "[M1-hostile-replicated] the replicated hostile level regressed past its derived bounds:\n{}",
+        breaches.join("\n"),
     );
 }
 

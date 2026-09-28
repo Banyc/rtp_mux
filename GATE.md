@@ -297,6 +297,7 @@ spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect 
 mandate_smoke::m1_hostile_tail_decomposition = full | 110 | baseline@hostile-tail | hostile-tail@arm-set=mechanism-decomposition+metric=p50-p99-max-and-wire
 mandate_smoke::m1_hostile_tail_lever = full | 132 | orthogonal@hostile-tail | hostile-tail@arm-set=lane-policy-sweep+metric=p50-p99-max-and-wire
 mandate_smoke::m1_lone_tail_cover_wire = full | 60 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-ge5pct-jitter100ms+metric=cover-decomposition-and-rungs
+mandate_smoke::m1_hostile_p99_replicated = full | 204 | orthogonal@hostile-tail | hostile-tail@arm-set=replicated+metric=p50-p99-max-and-wire
 ```
 
 Declared sums are `default` 149 s, `standard` 41 s, `full` 1871 s and `perf`
@@ -880,6 +881,8 @@ bounds above (measured X, bound Y, so a change that at least doubles it fails):
 | --- | --- | --- |
 | M1 hostile (GE cadence) p99 | 212–280 ms (12 s arm) | `900 ms` (~3×) |
 | M1 hostile `> 250 ms` share | 0–2.75 % | `8 %` (~3×) |
+| M1 hostile **replicated** p99 (median of 11 rep p99s) | 133.1–163.4 ms over three 11-rep sets; per-rep 115.5–223.2 ms | `225 ms` (derived; `m1_hostile_p99_replicated`) |
+| M1 hostile **replicated** p90 (median of 11 rep p90s) | 83.5–88.5 ms; per-rep 78.7–93.6 ms | `105 ms` (derived; `m1_hostile_p99_replicated`) |
 | M1 lone-tail p99 | field 1053–1542 ms (60 s) | `3200 ms` (~2×) |
 | M1 lone-tail p99.9 | 797–1636 ms (15 s arm); field ladder 5315 ms | `8000 ms` (~1.5× the field ladder) |
 | M1 lone-tail `> 250 ms` share | field 2.7 %, smoke 0–0.7 % | `8 %` |
@@ -2030,7 +2033,122 @@ re-formatted before the gates below were run.
 **Cost.** `56.0-56.4 s` of libtest's own time for the three `~18.6 s` arms, over
 four reps; declared 60 s. The `full` ceiling is raised `2150 -> 2210` as a
 declared change: `2113 + 60 = 2173 s`, and `2210` is the smallest ceiling that
-admits the sum with room for the tier's still-undeclared rows.
+admits the sum with room for the tier's still-undeclared rows. The
+replicated-hostile arm adds 204 s (`2113 + 60 + 204 = 2377 s`), which that 37 s
+of room does not admit, so `full` is raised again as a declared change
+(`2210 -> 2400`) for a row whose cost is *measured* rather than read: 203.76 s
+and 204.72 s of libtest's own time on two runs of `--ignored --exact
+m1_hostile_p99_replicated --nocapture`, declared 204 s, and the 2400 s ceiling
+admits the sum with 23 s of room.
+
+### The hostile tail read as a replicated median: `m1_hostile_p99_replicated`
+
+One hostile rep is not a measurement of the hostile lane, and the record says so:
+M1 `hostile`'s p99 read **162.5 then 281.9 ms between two consecutive runs of one
+revision** (`crates/AUDIT_COVERAGE.md`; both are archived battery runs,
+`20260928T104624Z-5644b00651e7` and `20260928T105457Z-5644b00651e7` under
+`netem_test/.net-perf-history/`). Twenty further interleaved reps of that same
+arm were then taken on one unchanged revision (`rtp_mux` `d30cb60e`, the pinned
+`rtp v0.0.101`, `MANDATE_SMOKE_FAULT` unset, each rep one `--exact
+m1_interactive_tail_latency` invocation with `uptime` logged per rep), and the
+23 archived battery runs of the same arm were read beside them. The 20 controlled
+reps put this distribution on the swing:
+
+| quantity (ms) | min | max | range | mean | sd | cv |
+| --- | --- | --- | --- | --- | --- | --- |
+| hostile p90 | 78.7 | 93.2 | 1.18x | 87.2 | 3.8 | 0.04 |
+| hostile p99 | 117.5 | 220.3 | 1.87x | 155.4 | 27.1 | 0.17 |
+| hostile p999 | 139.5 | 299.4 | 2.15x | 209.9 | 41.0 | 0.20 |
+| hostile max | 147.0 | 315.1 | 2.14x | 223.1 | 43.0 | 0.19 |
+| control (clean) p99 | 25.5 | 84.6 | 3.32x | 33.0 | 15.6 | 0.47 |
+
+The 20-rep set and its 13 `load < 5` reps alone (117.5–220.3 ms, sd 30.7,
+cv 0.19) are the same shape: the seven further reps at load 6.9–18.2 read
+*lower and tighter* (123.5–173.0 ms, sd 17.6), and in those the control's own
+p99 reached 84.6 ms. So the swing is not host drift — and it is not a body
+shift either.
+
+**What the number is a draw of.** Quantile by quantile over the same 20 reps the
+body is stable and the variance grows monotonically only above p97:
+
+| quantile | p75 | p90 | p95 | p97 | p98 | p99 | p99.5 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| between-rep range | 1.34x | 1.19x | 1.20x | 1.29x | 1.47x | 1.88x | 2.05x |
+| cv | 0.08 | 0.04 | 0.05 | 0.07 | 0.11 | 0.17 | 0.18 |
+
+The samples are not scattered inside a run either: a severe head-of-line repair
+episode releases its whole queued cascade at one instant, so the members read a
+gradient of that one episode (`247.2` down to `153.1 ms` at a single
+`t = 2.746 s` in one rep), and the p99 is fixed by how far up the longest cascade
+the 99th percentile reaches. Accordingly the p99 is `+0.95` correlated with the
+count of samples over 150 ms and `-0.33` with the paired control's own p99.
+**The hostile p99 is a count of rare events — how many severe repair episodes a
+window happened to contain — not a lane property, which is the same finding that
+moved `m4_clean_lane_p99_ceiling`'s spread bound from p99 to per-flow p90, one
+level up.** The p90 is the quantile that *is* a lane property here (cv 0.04,
+range 1.18x over 20 reps).
+
+**How many reps a comparison needs.** Two populations are on record for the
+single-rep p99. The **20 controlled reps** above are one revision with the load
+logged (`117.5–220.3 ms`, sd `27.1 ms`). The **23 archived battery runs** of the
+same arm under `netem_test/.net-perf-history/` are `113.3–281.9 ms`, sd
+`46.1 ms` — the two consecutive same-revision observations `162.5` and `281.9 ms`
+this section opened with are two of them (`20260928T104624Z-5644b00651e7` and
+`20260928T105457Z-5644b00651e7`; the archive records each run's source revision,
+and those 23 span twelve of them). The archive is the population the rep count
+is derived from, deliberately: a before/after comparison is exposed to the
+cross-revision movement the archive holds and a single-revision campaign cannot
+see, and it is the archive whose spread the `perf-history` tool's own
+`measured_spread` already draws. Over the **43 observations combined**
+(`mean 161.5 ms`, `sd 38.4 ms`, range `2.49x`), the difference of two revisions'
+**median-of-R** p99s has `se = sqrt(2) * 1.2533 * sd / sqrt(R)` and clears a move
+of `D` at 95 % confidence and 80 % power when
+`R >= (2.802 * sqrt(2) * 1.2533 * sd / D)^2`. For the `60 ms` move this workspace
+cares about that is `(2.802 * 1.7725 * 38.4 / 60)^2 = 10.12`, so **eleven
+interleaved reps per revision**; on the campaign's own tighter `sd = 27.1 ms` it
+would be `5.03`. Eleven, not three, is what a future hostile-p99 comparison has
+to pay, and the arm below is what pays it.
+
+**The arm.** `mandate_smoke::m1_hostile_p99_replicated` (`full` tier,
+`#[ignore]`d, 204 s declared / 203.8–204.7 s measured) is a **new arm alongside,
+with no existing arm retuned**: `clean`, `hostile` and `lone_tail` keep their
+impairment, seeds, windows, cadence, tier, `#[ignore]` reasons and guards
+exactly, and this test measures the very same `hostile` spec `mandate_arms`
+builds. It takes `M1_HOSTILE_P99_REP_REPS = 11` reps and asserts:
+
+* the **median** hostile p99 `<= M1_HOSTILE_P99_MEDIAN_BOUND_MS = 225 ms`,
+derived `mean + 4 sd` of the *median's* own sampling distribution
+(`161.5 + 4 * 14.93 = 221.2`, rounded up to the next 5 ms; thirty-seven in a
+million healthy draws of that median exceed it, bootstrapped from the 43
+observations over 400 000 resamples);
+* the **median** hostile p90 `<= M1_HOSTILE_P90_MEDIAN_BOUND_MS = 105 ms`,
+derived `mean + 4 sd` over the 20 controlled reps' p90s (`87.2 + 4 * 3.8 =
+102.4`, rounded up) — the level claim that rests on no rare-event draw at all;
+* both control (clean) readings `<= M1`'s 250 ms ceiling, so a contended host is
+named before a breached hostile bound is attributed — the run is called
+inconclusive rather than a lane reading;
+* every rep measured a non-empty, non-degenerate sample set, so a rep that takes
+the measurement path and returns nothing fails rather than passing.
+
+The per-rep rows and a summary (`p99_median`, `p99_min`, `p99_max`, `p99_sd`,
+the median's own `ci95_halfwidth` and the `two_arm_move_at_80pct_power` this
+run's reps give) are printed, so a reader comparing two revisions reads the
+resolution of its own inputs off the run instead of re-deriving it. The control
+**brackets** the rep set rather than repeating per rep: the 20 paired reps above
+show the clean arm has no explanatory power for the hostile p99, so a per-rep
+control would double the arm's cost for coverage the measurement says is not
+there. Healthy sets on this revision read p99 median 143.4, 163.4 and 133.1 ms
+(per-rep 115.5–223.2, 121.6–209.9 and 120.7–216.1), p90 median 83.5, 88.5 and
+85.5 ms, and control p99 25.7–29.5 ms — all inside both bounds, with the
+*single-rep* 298 ms limit the deployed baseline carries only 75 ms above one
+set's worst draw.
+
+**The red.** `MANDATE_SMOKE_FAULT=M1_IMPAIRED_slow` — the arm's own input
+perturbation, `+300 ms` one-way on the hostile link, which pushes the arm past
+the 1 s repair floor; the control is untouched — reads p99 median **1886.2 ms**
+against the 225 ms bound and p90 median **1531.1 ms** against the 105 ms bound,
+both named in one failure and taken from the measurement path rather than from a
+moved assertion (`exit 101`; per-rep p99 1469.7–2549.0 ms, control 25.5/26.0 ms).
 
 ### The four-flow hostile level: `m4_hostile_lane_p99_ceiling`
 
@@ -2407,6 +2525,7 @@ mux_ceiling_probe::probe_mux_sink_4mib_mss8k = standard
 mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = full
 mux_stream_fairness::mux_stream_fairness_longrun = full
 mux_stream_fairness::mux_stream_fairness_sweep = full
+mandate_smoke::m1_hostile_p99_replicated = full
 mandate_smoke::m1_lone_tail_field_rtt = full
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep = full
 mandate_smoke::m1_lone_tail_loss_model = full
@@ -2542,6 +2661,7 @@ mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
 mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf
 mux_stream_fairness::mux_stream_fairness_longrun
 mux_stream_fairness::mux_stream_fairness_sweep
+mandate_smoke::m1_hostile_p99_replicated
 mandate_smoke::m1_lone_tail_field_rtt
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep
 mandate_smoke::m1_lone_tail_loss_model
