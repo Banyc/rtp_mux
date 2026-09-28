@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # Command-line parsing for the `netem-tools` and `perf-history` binaries, the
-# tooling's only public face. Optional behind `cli` because this crate is
+# tooling's only public face. Optional behind `perf` because this crate is
 # pinned by published tags and consumed as a dependency by `proxy`: a plain
 # `[dependencies]` entry would make every consumer fetch and build a parser the
 # library never calls.

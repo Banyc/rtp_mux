@@ -12,7 +12,7 @@
 //!
 //! Run `netem-tools <subcommand> --help` for the flags. The command line is
 //! parsed with clap's `derive` API: a subcommand dispatcher, and each
-//! subcommand's flags a struct. The crate's `cli` feature carries clap, and both
+//! subcommand's flags a struct. The crate's `perf` feature carries clap, and both
 //! binaries require that feature, so a plain library build — and every sibling
 //! crate that consumes this one as a dev-dependency — never fetches or builds a
 //! parser the library does not call.
