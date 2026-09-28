@@ -1,5 +1,8 @@
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
 
+#[cfg(feature = "perf")]
+pub mod tools;
+
 mod accept_error;
 mod admission;
 mod bidirectional;

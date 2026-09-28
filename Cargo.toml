@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Command-line parsing for the `netem-tools` and `perf-history` binaries, the
+# tooling's only public face. Optional behind `cli` because this crate is
+# pinned by published tags and consumed as a dependency by `proxy`: a plain
+# `[dependencies]` entry would make every consumer fetch and build a parser the
+# library never calls.
+clap = { version = "4.6.7", features = ["derive"], optional = true }
 futures = "0.3"
 metrics = "0.24"
 mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.34" }
@@ -16,8 +22,8 @@ mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.34" }
 netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.2", features = ["test-kit"], optional = true }
 # netem-test = { path = "../netem_test/netem-test", features = ["test-kit"], optional = true }
 rand = "0.10"
-rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.103" }
-# rtp = { path = "../rtp" }
+rtp = { path = "../rtp" }
+# rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.103" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -39,13 +45,31 @@ mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.34", features = ["
 # mux = { path = "../mux", features = ["testing"] }
 netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.2", features = ["test-kit"] }
 # netem-test = { path = "../netem_test/netem-test", features = ["test-kit"] }
-rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.103", features = ["testing"] }
-# rtp = { path = "../rtp", features = ["testing"] }
+rtp = { path = "../rtp", features = ["testing"] }
+# rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.103", features = ["testing"] }
 rtp_mux = { path = ".", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
 testing = ["dep:netem-test", "rtp/testing", "mux/testing"]
+# The mandate tooling: the runner, the plotters and the gate checkers — the
+# crate's own performance face. Both binaries require this feature
+# (`required-features` below), so a plain library build — and every consumer —
+# compiles without clap.
+perf = ["dep:clap"]
+
+# Both binaries parse their command line with clap, which is what the `perf`
+# feature pulls in. Declared explicitly rather than auto-discovered, because a
+# `[[bin]]` section is the only place `required-features` can be stated.
+[[bin]]
+name = "netem-tools"
+path = "src/bin/netem-tools.rs"
+required-features = ["perf"]
+
+[[bin]]
+name = "perf-history"
+path = "src/bin/perf-history.rs"
+required-features = ["perf"]
 
 [lints.clippy]
 disallowed_methods = "deny"

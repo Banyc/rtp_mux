@@ -1,0 +1,33 @@
+#!/bin/sh
+# `mandate-check` — run the mandate battery, then archive and compare the run.
+#
+# The runner is `netem-tools mandate-check`. This wrapper exists because it is
+# the documented entry point (`tools/MANDATE_SMOKE.md`, `tools/PERF_LOOP.md`,
+# `tools/PERF_INFRA.md` and `AGENTS.md` all name it), and it is a shim rather
+# than a second implementation: it resolves the binary, builds it when it is
+# missing, and hands it every argument unchanged. The battery, the history step
+# (the archive and the comparison), the artifacts and the exit codes are all the
+# binary's, so no behaviour has two implementations.
+set -e
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root=$(dirname -- "$here")
+release="$root/target/release/netem-tools"
+debug="$root/target/debug/netem-tools"
+
+if [ -x "$release" ]; then
+    exec "$release" mandate-check "$@"
+fi
+if [ -x "$debug" ]; then
+    exec "$debug" mandate-check "$@"
+fi
+
+# An operator who runs the documented entry point should not have to know a
+# second build command, which is what the Python wrapper provided. A build that
+# fails is reported and the invocation fails with it.
+echo "mandate-check: the runner is not built; building it with" \
+     "cargo build --release -p rtp_mux --features perf --bin netem-tools" >&2
+if ! (cd "$root" && cargo build --release -p rtp_mux --features perf --bin netem-tools); then
+    echo "mandate-check: the runner could not be built" >&2
+    exit 2
+fi
+exec "$release" mandate-check "$@"

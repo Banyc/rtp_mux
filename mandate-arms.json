@@ -1,0 +1,55 @@
+{
+  "schema": "mandate-arms/1",
+  "mandates": [
+    "M1",
+    "M2",
+    "M3",
+    "M4"
+  ],
+  "censoring": {
+    "mandate": "M1",
+    "instrument": "m1-censoring"
+  },
+  "source": "tools/PERF_INFRA.md, 'The smoke set' (the arm table: each arm's impairment, load shape and lanes), and the M3/M4 arm descriptions in rtp_mux/tests/mandate_smoke.rs; the cells restate what those documents already state and are not a second authority for any bound. The `probe/` keys name this crate's own perf-tier probes, whose cells are the `probe-*` rows of tests/GATE.md (family `probe`, reference lib::tests::clean_forwarding_perf_probe). The `mandate-compare` subcommand also reads each arm's cells to decide whether a counter it recorded is load-bearing for that arm \u2014 the rule, and what the declared cells can and cannot express, is in that tool's docstring.",
+  "cells": {
+    "M1/clean": [
+      "M1@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+scale=256B+metric=p99"
+    ],
+    "M1/hostile": [
+      "M1@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+shape=cadence+flows=1+scale=256B+metric=p99"
+    ],
+    "M1/lone_tail": [
+      "M1@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+shape=request-response+depth=1+flows=1+scale=256B+metric=p99"
+    ],
+    "M2/clean": [
+      "M2@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+metric=offer-and-latency"
+    ],
+    "M2/hostile": [
+      "M2@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+shape=cadence+flows=1+metric=offer-and-latency"
+    ],
+    "M2/lone_tail": [
+      "M2@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+shape=request-response+depth=1+flows=1+metric=offer-and-latency"
+    ],
+    "M3/m3": [
+      "M3@lane=bulk+rate=8MiBps+burst=2MiB+period=3s+reps=3+metric=capacity-fraction"
+    ],
+    "M4/m4/clean": [
+      "M4@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+    ],
+    "M4/m4/hostile": [
+      "M4@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+    ],
+    "probe/forwarding": [
+      "probe-forwarding@metric=throughput+layer=netem-runner"
+    ],
+    "probe/dest-cache": [
+      "probe-dest-cache@metric=throughput+layer=netem-runner"
+    ],
+    "probe/deadline": [
+      "probe-deadline@metric=latency+layer=netem-runner"
+    ],
+    "probe/std-udp": [
+      "probe-std-udp@metric=throughput+layer=netem-runner+transport=std-udp"
+    ]
+  }
+}

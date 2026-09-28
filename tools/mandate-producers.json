@@ -1,0 +1,63 @@
+{
+  "schema": "mandate-producers/1",
+  "source": "The producer contract in tools/MANDATE_SMOKE.md ('The producer contract'): each entry names a test target that prints per-arm `[mandate-smoke <arm>] ...` lines, the sections those arms are attributed to, and which of those sections print a `MANDATE` line and write plots (a producer with a verdict section owes its evidence, so that is derived from `verdicts` rather than declared). The arms' coverage cells are declared separately, in tools/mandate-arms.json.",
+  "producers": [
+    {
+      "id": "rtp_mux",
+      "package": "rtp_mux",
+      "target": "mandate_smoke",
+      "source": "tests/mandate_smoke.rs",
+      "default_path": ".",
+      "cargo_args": [
+        "test",
+        "--release",
+        "-p",
+        "rtp_mux",
+        "--test",
+        "mandate_smoke"
+      ],
+      "test_args": [
+        "--nocapture"
+      ],
+      "sections": [
+        "M1",
+        "M2",
+        "M3",
+        "M4"
+      ],
+      "verdicts": [
+        "M1",
+        "M2",
+        "M3",
+        "M4"
+      ],
+      "log": "mandate-smoke.log",
+      "declaration": "mandate-arms.json",
+      "baseline": "mandate-baseline.json"
+    },
+    {
+      "id": "netem_test",
+      "package": "netem_test",
+      "target": "lib",
+      "source": "src/lib.rs",
+      "default_path": "../netem_test/netem-test",
+      "cargo_args": [
+        "test",
+        "--release",
+        "-p",
+        "netem-test",
+        "--lib"
+      ],
+      "test_args": [
+        "--ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "sections": [
+        "probe"
+      ],
+      "verdicts": [],
+      "log": "mandate-netem_test.log"
+    }
+  ]
+}
