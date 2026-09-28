@@ -37,6 +37,10 @@ pub(crate) struct DualLaneSettings {
     pub bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     pub handshake: bool,
     pub obfuscation_key: Option<crate::ObfuscationKey>,
+    /// Optional per-NIC scheduler both lanes egress through (the same instance
+    /// the caller shares across connections on that NIC). `None` keeps the
+    /// stock per-socket behaviour.
+    pub nic: Option<rtp::nic::NicScheduler>,
 }
 
 pub(crate) struct ConnectedDualLaneBirth {
@@ -159,6 +163,7 @@ async fn connect_dual_lane_once(
         bulk_metrics_observer,
         handshake,
         obfuscation_key,
+        nic,
     } = settings;
     let bind_addr = bind(addr);
     let bulk_addr = bulk_addr(addr)?;
@@ -172,20 +177,30 @@ async fn connect_dual_lane_once(
         metrics_observer: None,
         obfuscation_key,
     };
-    let interactive_config = crate::lane_transport::connect_config(
+    let mut interactive_config = crate::lane_transport::connect_config(
         LaneClass::Interactive,
         crate::lane_transport::ConnectSettings {
             metrics_observer: interactive_metrics_observer,
             ..base.clone()
         },
     );
-    let bulk_config = crate::lane_transport::connect_config(
+    let mut bulk_config = crate::lane_transport::connect_config(
         LaneClass::Bulk,
         crate::lane_transport::ConnectSettings {
             metrics_observer: bulk_metrics_observer,
             ..base
         },
     );
+    if let Some(scheduler) = &nic {
+        interactive_config.nic = Some(rtp::nic::NicLink {
+            scheduler: scheduler.clone(),
+            class: rtp::nic::Class::Interactive,
+        });
+        bulk_config.nic = Some(rtp::nic::NicLink {
+            scheduler: scheduler.clone(),
+            class: rtp::nic::Class::Bulk,
+        });
+    }
     // The two lanes are independent connections to independent addresses;
     // dial them together.  Dialing them one after the other adds the second
     // lane's opening handshake (two round trips plus the transport's random
@@ -193,15 +208,13 @@ async fn connect_dual_lane_once(
     // which is most of a cold connection's cost on a long-RTT path.
     let interactive = async {
         match socket {
-            Some(socket) => {
-                rtp::udp::FrameDeliveryIo::connect_with_socket(
-                    socket,
-                    addr,
-                    interactive_config.clone(),
-                )
-                .await
+            // A pre-bound socket cannot carry the NIC's `NicLink` (the
+            // scheduler owns the socket), so the NIC path dials by address.
+            Some(socket) if interactive_config.nic.is_none() => {
+                rtp::udp::FrameDeliveryIo::connect_with_socket(socket, addr, interactive_config)
+                    .await
             }
-            None => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, interactive_config).await,
+            _ => rtp::udp::FrameDeliveryIo::connect(bind_addr, addr, interactive_config).await,
         }
     };
     let bulk = rtp::udp::FrameDeliveryIo::connect(

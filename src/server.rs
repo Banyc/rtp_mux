@@ -60,6 +60,8 @@ pub struct RtpMuxServer {
     interactive_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     bulk_metrics_observer: Option<rtp::metrics::MetricsObserver>,
     handshake: bool,
+    /// Optional per-NIC scheduler both lanes' egress is admitted through.
+    nic: Option<rtp::nic::NicScheduler>,
 }
 
 enum BirthHeartbeatFailure {
@@ -82,8 +84,9 @@ pub enum ServeError {
     ExpiryWorkerStopped { addr: SocketAddr },
 }
 
-/// Settings for [`RtpMuxServer::bind`]: the datagram-obfuscation key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Settings for [`RtpMuxServer::bind`]: the datagram-obfuscation key and an
+/// optional per-NIC egress scheduler.
+#[derive(Debug, Clone, Default)]
 pub struct RtpMuxServerConfig {
     /// When set, every RTP datagram is prefixed with a 24-byte random nonce
     /// and chacha20-encrypted with this key on both lanes. The peer
@@ -93,6 +96,11 @@ pub struct RtpMuxServerConfig {
     /// probes with the same key, so a passive observer cannot tell probes
     /// from data.
     pub obfuscation_key: Option<crate::ObfuscationKey>,
+    /// Optional per-NIC egress scheduler both lanes send through. The caller
+    /// constructs one per NIC and passes the **same** instance to every
+    /// server (and connector) on that NIC. `None` keeps the stock per-socket
+    /// behaviour.
+    pub nic: Option<rtp::nic::NicScheduler>,
 }
 
 /// Interactive ports the acquisition may draw while the port adjacent to each
@@ -118,6 +126,7 @@ impl RtpMuxServer {
     ) -> io::Result<Self> {
         let RtpMuxServerConfig {
             obfuscation_key: key,
+            nic,
         } = config;
         let key_bytes = key.map(crate::ObfuscationKey::into_bytes);
         let requested = resolve_bind_addrs(addr).await?;
@@ -128,7 +137,7 @@ impl RtpMuxServer {
                 .await
             {
                 Ok((interactive_listener, bulk_listener)) => {
-                    return Ok(Self::new(interactive_listener, bulk_listener));
+                    return Ok(Self::new(interactive_listener, bulk_listener).with_nic(nic.clone()));
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -148,7 +157,46 @@ impl RtpMuxServer {
             interactive_metrics_observer: None,
             bulk_metrics_observer: None,
             handshake: true,
+            nic: None,
         }
+    }
+
+    /// Attach the per-NIC egress scheduler both lanes are admitted through.
+    /// The caller shares one instance per NIC with the connector so all of
+    /// that NIC's connections are arbitrated together.
+    pub fn with_nic(mut self, nic: Option<rtp::nic::NicScheduler>) -> Self {
+        self.nic = nic;
+        self
+    }
+
+    /// Build one lane's accept config, injecting the per-NIC scheduler when
+    /// one is configured. Takes the fields rather than `&self` so the
+    /// `select!` loop can hold `&mut self.mux` at the same time.
+    fn lane_accept_config(
+        interactive_fec_tuning: rtp::FecTuning,
+        interactive_instream_group_fec: bool,
+        nic: Option<&rtp::nic::NicScheduler>,
+        lane: LaneClass,
+        metrics_observer: Option<rtp::metrics::MetricsObserver>,
+    ) -> rtp::udp::AcceptConfig {
+        let mut config = lane_transport::accept_config(
+            lane,
+            lane_transport::AcceptSettings {
+                interactive_fec_tuning,
+                interactive_instream_group_fec,
+                metrics_observer,
+            },
+        );
+        if let Some(scheduler) = nic {
+            config.nic = Some(rtp::nic::NicLink {
+                scheduler: scheduler.clone(),
+                class: match lane {
+                    LaneClass::Interactive => rtp::nic::Class::Interactive,
+                    LaneClass::Bulk => rtp::nic::Class::Bulk,
+                },
+            });
+        }
+        config
     }
 
     /// Toggle the RTP opening handshake for this server instance (enabled by
@@ -359,13 +407,12 @@ impl RtpMuxServer {
                 }
                 result = accept_rtp_frame_delivery(
                     &self.interactive_listener,
-                    lane_transport::accept_config(
+                    Self::lane_accept_config(
+                        self.interactive_fec_tuning,
+                        self.interactive_instream_group_fec,
+                        self.nic.as_ref(),
                         LaneClass::Interactive,
-                        lane_transport::AcceptSettings {
-                            interactive_fec_tuning: self.interactive_fec_tuning,
-                            interactive_instream_group_fec: self.interactive_instream_group_fec,
-                            metrics_observer: self.interactive_metrics_observer.clone(),
-                        },
+                        self.interactive_metrics_observer.clone(),
                     ),
                     self.handshake,
                 ) => {
@@ -373,13 +420,12 @@ impl RtpMuxServer {
                 }
                 result = accept_rtp_frame_delivery(
                     &self.bulk_listener,
-                    lane_transport::accept_config(
+                    Self::lane_accept_config(
+                        self.interactive_fec_tuning,
+                        self.interactive_instream_group_fec,
+                        self.nic.as_ref(),
                         LaneClass::Bulk,
-                        lane_transport::AcceptSettings {
-                            interactive_fec_tuning: self.interactive_fec_tuning,
-                            interactive_instream_group_fec: self.interactive_instream_group_fec,
-                            metrics_observer: self.bulk_metrics_observer.clone(),
-                        },
+                        self.bulk_metrics_observer.clone(),
                     ),
                     self.handshake,
                 ) => {

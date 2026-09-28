@@ -137,6 +137,7 @@ async fn matching_obfuscation_keys_open_session() {
         "127.0.0.1:0",
         RtpMuxServerConfig {
             obfuscation_key: Some(key),
+            ..Default::default()
         },
     )
     .await
@@ -160,6 +161,7 @@ async fn mismatched_obfuscation_keys_do_not_open_session() {
         "127.0.0.1:0",
         RtpMuxServerConfig {
             obfuscation_key: Some(rtp_mux::ObfuscationKey::from_bytes([7; 32])),
+            ..Default::default()
         },
     )
     .await

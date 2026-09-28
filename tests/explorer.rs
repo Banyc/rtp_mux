@@ -24,6 +24,7 @@ async fn spawn_echo_server_with_key(
         "127.0.0.1:0",
         RtpMuxServerConfig {
             obfuscation_key: key,
+            ..Default::default()
         },
     )
     .await
