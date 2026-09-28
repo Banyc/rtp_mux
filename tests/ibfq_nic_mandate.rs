@@ -370,7 +370,8 @@ async fn run_arm(arm: Arm) -> Run {
             }
             let bulk_before = bulk_sink.load(Ordering::Relaxed);
             let bulk_started = Instant::now();
-            let bulk_task = tokio::spawn(async move {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+            let _ = bulk_tasks.spawn(async move {
                 if bulk_write.write_all(b"B").await.is_err() {
                     return;
                 }
@@ -392,7 +393,7 @@ async fn run_arm(arm: Arm) -> Run {
             } else {
                 0
             };
-            let _ = bulk_task.await;
+            let _ = bulk_tasks.join_next().await;
             let bulk_secs = bulk_started.elapsed().as_secs_f64();
             tokio::time::sleep(GRACE).await;
             let bulk_bytes = bulk_sink.load(Ordering::Relaxed) - bulk_before;

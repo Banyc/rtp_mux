@@ -1580,6 +1580,7 @@ pub async fn dual_mux_client_connect_with_lane_modes_via(
 /// congestion-signalling hub. The transport derives each lane's `(src, dst)`
 /// path group from its own socket, so the caller passes the hub and the role,
 /// not a resolved group.
+#[allow(clippy::too_many_arguments)] // the two lane policies, the two observers and the hub are independent caller inputs
 pub async fn dual_mux_client_connect_lane_rtp_via_cc_link(
     tx: &TestTaskSubmitter,
     int_proxy_addr: std::net::SocketAddr,
