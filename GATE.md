@@ -210,6 +210,8 @@ sum the checker reports is the declared subset.
 ```gate-perf-design
 cold_connection::cold_connection_decomposition = standard | 28 | baseline@establishment | cold-connection@lanes=dual+handshake=on+impairment=clean+scale=owd20-and-owd96+metric=min-round-trips-to-stream
 cold_connection::mux_lane_birth_is_one_round_trip = standard | 13 | orthogonal@establishment | cold-connection@lanes=dual+handshake=on+impairment=clean+scale=owd20-and-owd96+metric=mux-pairing-round-trips
+minecraft_contested::mc_downstream_saturating_bulk = full | 77 | baseline@minecraft-shaped | minecraft-shaped@session=long-lived+bulk=saturating-s2c+shape=minecraft-composite+lanes=dual+impairment=owd50-iid2pct-jitter10+metric=interactive-rtt-percentiles
+minecraft_contested::mc_bulk_direction_decomposition = full | 77 | orthogonal@minecraft-shaped | minecraft-shaped@session=long-lived+bulk=saturating-direction-sweep+shape=minecraft-composite+lanes=dual+impairment=owd50-iid2pct-jitter10+metric=interactive-rtt-percentiles
 hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full | 66 | baseline | interactive-scaling@flows=4+offer=sequential
 hol_probe::hol_rtt100_ge5_four_interactive_concurrent_frame_delivery = full | 20 | orthogonal | interactive-scaling@flows=4+offer=concurrent
 rtp_mux_jitter::jitter_duallane_constitution_gate = default | 40 | baseline@constitution | M2@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=offered-load-latency
@@ -620,7 +622,7 @@ it — it does, on an absent id).
 ```gate-budgets
 default = 300
 standard = 600
-full = 2210
+full = 2400
 perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.clean-band = mandate_smoke::probe_m4_clean_band_composition
@@ -646,6 +648,7 @@ baseline.interactive = rtp_mux_jitter::jitter_interactive_solo
 baseline.latency-sweep = rtp_mux_jitter::jitter_latency_dimension_arms
 baseline.lone-tail = rtp_mux_jitter::jitter_request_response_arms
 baseline.m3-bulk = mandate_smoke::m3_bulk_goodput_fraction
+baseline.minecraft-shaped = minecraft_contested::mc_downstream_saturating_bulk
 baseline.mux-over-rtp = mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
 baseline.non-loss-impairment = rtp_mux_jitter::jitter_nonloss_impairments
 baseline.reorder = rtp_mux_jitter::jitter_reorder_direction
@@ -672,6 +675,7 @@ members.interactive = interactive-cadence*
 members.latency-sweep = latency-sweep*
 members.lone-tail = lone-tail*
 members.m3-bulk = m3-bulk*
+members.minecraft-shaped = minecraft-shaped*
 members.mux-over-rtp = mux-over-rtp*
 members.non-loss-impairment = non-loss-impairment*
 members.reorder = reorder-*
@@ -721,6 +725,11 @@ attribution@baseline-family=mux-over-rtp = the family is now declared for the tw
 attribution@baseline-family=hol-verify4 = `hol_verify4::v4_clean_muxbulk` and `v4_ge5_muxbulk` are internally coherent (`bulk-lane-ab`) and one dimension apart, so only their costs are missing — the `#[ignore]` reason states no wall-clock; one measurement per row declares the family with no cell change.
 attribution@baseline-family=fec-recovery = `hol_probe::hol_rtp_mux_fec_default_on_recovery` is now declared, in the `hol-fec` family and five declared dimensions from that family's reference (bulk, fec, impairment, layer, metric), so it is a composite no existing arm attributes: its context is the `rtp-mux` layer on the fec-gaming fat pipe at 20 % loss with a controller-retention bulk lane, while the reference is the cap400 shaper with FEC on. A single-axis FEC-recovery arm beside either end is what closes this. Its cost is now measured (38 s, its own libtest stamp) — and the family is a two-row family rather than a one-row namespace, which the checker refuses, because a baseline no sibling row states against is a stale reference.
 cost@metric=wall-clock = `mandate_smoke`'s three other arms (M1's, M2's and M4's; M3's is measured and declared above), the four `mux_ceiling_probe` rows, `perf_probe`'s remaining two rows (`probe_rtp_echo_4mib_direct` and `_mss8k`; the hostile pair and the instrument-sanity pair are measured and declared above), `contested_latency`'s one remaining row (`contested_capped_jitter_loss`; its clean reference and the refiled hostile arm are declared), `mux_over_rtp_perf`'s one remaining row (`mux_over_rtp_small_stream_while_bulk_perf`; the lossy smoke and the 400 MiB hostile arm are declared) and `hol_verify4`'s two rows have a coherent family or one repairable cell but no wall-clock in any document; each needs one measurement of its own tier's invocation — the tier's `--ignored` run, or a plain `cargo test --release -p rtp_mux --test <target> -- --exact <test>` for a default-tier row — before its family can be declared, because a cost the declaration invents is worse than a cost it records as pending. The 43 `hol_probe` rows this line used to name are measured now: 36 are declared above on their own stamps, and the other seven — the two default-tier FEC instrument arms (0.000 s each) and the five dual-lane rows (16.9-19.6 s each) — carry their measured costs on the `dual-lane` line above and in the cost-provenance paragraph, so those rows are unblocked except for their family.
+minecraft-shaped@impairment=reorder = the arm's round-trip series pairs each echo arrival with the most recent send, so it is not reorder-safe and the tripwire cannot read a reordered link's tail (measured: a 700 ms one-way jitter fault left the p99 inside its bound and the fault was deleted rather than kept as a selector that cannot fail). A per-round-trip id echoed back and matched would close this; the arm declares a link with 2 % iid loss and 10 ms jitter and no reordering.
+minecraft-shaped@classifier=shape-based = the lane decision is caller-declared on this crate's public path (`connect_stream`'s no-lane default is interactive; `connect_stream_with_lane` takes the class), and the stack's one shape classifier (`mux::DualStreamOpener::open_migrating` against `AUTO_BULK_THRESHOLD`) is not re-exported here, so no arm can put traffic through a classifier. The arms assert only that the traffic stayed on the lane the product's own default names, read back from `ServerStream::source_lane`.
+minecraft-shaped@flows=4 = the composite runs one interactive lane, not M4's four flows; M4's arms own the four-flow split and its fairness bounds.
+minecraft-shaped@shape=periodic-keepalive = the round trip runs at the input cadence (40/s), not the protocol's 15 s periodic keepalive; a 15 s-period shape is not carried by any arm here.
+minecraft-shaped@chain=deployed-proxy = the arms are loopback with the two lanes behind separate netem proxies, which is the deployed topology's shape but not BungeeCord; no field-scale claim is made from them.
 M1@lane=single = the constitution's M1 arms run on the production dual-lane topology; a single-connection transport tail is covered by rtp's burst-loss and bufferbloat gates, whose perf declarations are pending, and is not claimed here.
 M3@lane=single = M3 is asserted on the deployment's bulk lane (`dual_lane_mandates`); the single-connection goodput floor belongs to rtp, whose declaration is pending.
 cpu-cost@metric=cpu = per-datagram CPU cost is measured by owning-symbol attribution (`tools/samply_hotspots.py`), not by a scenario in this crate.
@@ -2140,6 +2149,106 @@ clean arm above), and a flow count other than four (the sink attributes
 samples by first-byte tag, whose range caps at seven flows; four is the
 production shape).
 
+### The Minecraft-shaped composite: a saturating downstream bulk behind the operator's own traffic
+
+`rtp_mux/tests/minecraft_contested.rs` holds two `full`-tier arms that measure
+the traffic shape the operator read off their live client's bandwidth/ping
+overlay (Minecraft 26.2 / Fabric, Hypixel via BungeeCord to a Hygot server):
+**one long-lived session**, a small steady upstream and a much larger
+downstream (`60 tx / 2352 rx`, ~1:40 — read-approximate, so the arm reproduces
+the *ratio*, ≈4-5:1 offered at the two lanes' own wires, rather than a count),
+downstream dominated by small datagrams (300 B every 20 ms) with occasional
+512 KiB bursts every 5 s, on a **50 ms one-way / 10 ms jitter / 2 % iid** link
+whose shared downstream capacity is 1 MiB/s. The loss, jitter, capacity, burst
+size and burst period are **assumptions** and are labelled as such in the
+module doc; the tick, the ~100 ms round trip and the 1:40 asymmetry are the
+operator's.
+
+**Both arms call the crate's public entry points and nothing else**:
+`RtpMuxServer::bind` + `RtpMuxServer::serve` with a stream handler on the server
+side; `RtpMuxConnector::with_config(RtpMuxConnectorConfig::standard(..))`,
+`connect_stream` (no lane argument — the product's own default) and
+`connect_stream_with_lane` on the client side, with the two lanes placed behind
+separate netem proxies through the public `BulkAddrSelector`, which is what a
+deployed chain does. **The arm then reads the lane each flow actually landed on
+from `ServerStream::source_lane`** and asserts it: every Minecraft-shaped stream
+must be reported interactive, the bulk stream must be reported bulk, and the
+accepted-stream count must match the opened count. A stream that never arrived,
+or a bulk load that shares the interactive lane, fails loudly — `MC_CONTESTED_FAULT=bulk_interactive`
+is the probe, and it fails with *"the saturating bulk stream was observed on 1
+interactive and 0 bulk lanes"*.
+
+**Finding: `rtp_mux` exposes no shape-based lane classifier.** The lane is a
+caller-declared `LaneClass` argument, and `connect_stream`'s no-lane sibling
+defaults to `Interactive`; the one shape classifier in the stack
+(`mux::DualStreamOpener::open_migrating`, migrating a stream on a write larger
+than `AUTO_BULK_THRESHOLD`) is not re-exported by this crate. So there is
+nothing on the public path for this traffic to be *classified* by, and the arm
+holds the product to the lane its own default names and reads it back. A
+classifier added later would be observed here first.
+
+**Measured, production policy, `MC_RUNS` unset (three runs), window 20 s, load
+8.9-18.2 on ten cores** — pooled over all runs: interactive one-way p50/p90/p99
+`62.0/114.1/217.1` ms (small frames), round trip p50/p90/p99/max
+`103.2/138.3/244.0/287.0` ms, burst p50 `1511.9` ms; saturation chain
+`min_down_backlog_nonzero 0.765`, `min_passed_fraction 0.953`,
+`min_push_await_fraction 1.081`, bulk delivered `0.774` of the shared capacity;
+lane split correct in all three runs. The tripwire is `450 ms`
+(`MC_RTT_P99_TRIPWIRE_MS`), ~1.8x the worst of four pooled observations
+(`194.7-244.0` ms); the panel ceiling is `750 ms`. The bound is a
+**regression** bound, not the product's 250 ms ceiling: this shape's tail is set
+by the lane's own repair at a 100 ms RTT, not by the bulk queue (below), so a
+250 ms assertion would be false on every run — the honest closure is the
+measured bound plus the named hole.
+
+**The direction sweep** (`mc_bulk_direction_decomposition`, one run per
+direction, one dimension apart, load 5.0): downstream `98.5/132.2/194.7/228.5`
+ms, upstream `97.0/138.3/168.6/228.2` ms, both `102.1/140.1/262.9/293.3` ms
+(p50/p90/p99/max of the round trip). Direction moves the **median** (the small
+frames' p50 is 58.0 downstream against 46.2 upstream, so the saturated
+downstream queue costs ~12 ms there) and barely moves the **p99**. The tail is
+therefore not mostly downstream queueing: an interactive lane whose downstream
+link is idle still reads a 168.6 ms p99 and a 1092 ms burst, because a 512 KiB
+burst costs `512 KiB / 1 MiB/s = 512 ms` of serialization *anywhere* plus
+reassembly and repair. The saturating bulk's whole contribution is ~26 ms on
+the p99 and ~185 ms on the burst.
+
+**The one `rtp_mux`-owned lever was measured and refused.**
+`lane_transport::congestion_lane(LaneClass::Bulk)` is the only caller-invisible
+policy here that acts on the bulk connection's standing window, and switching
+it from `Dedicated` to `Shared`, interleaved two runs each at load 9.0-18.2,
+moves the round-trip p99 `244.0 -> 714.4` ms and the p50 `103.2 -> 600.4` ms
+(6x worse at the median), with the round-trip sample count falling `500 -> 66`
+because the lane could no longer keep its own cadence. **`Dedicated` is the
+right value while its documented reason is wrong for this deployment**:
+`lane_transport` justifies it with "no competing traffic over its connection's
+queue", and in this deployment that queue *is* the interactive lane's queue —
+the value survives, the stated reason does not. The tree was restored with
+`touch` and the restored file verified byte-identical to the pre-probe copy.
+
+**One probe was refused as an instrument defect.** A `jitter_tail` fault
+(700 ms of one-way jitter, delay untouched) was written to raise the tripwire's
+tail while leaving the offer intact; it **passed**. The cause is the round-trip
+instrument — the client pairs each echo *arrival* with the most recent *send*,
+so a reordered link attributes one send's round trip to another's arrival. The
+fault was deleted rather than kept as a selector that cannot fail, and the
+limitation is declared below.
+
+**Coverage cells** (family `minecraft-shaped`, baseline
+`minecraft_contested::mc_downstream_saturating_bulk`):
+`minecraft-shaped@session=long-lived+bulk=saturating-s2c+shape=minecraft-composite+lanes=dual+impairment=owd50-iid2pct-jitter10+metric=interactive-rtt-percentiles`
+and the sweep's `...+bulk=saturating-direction-sweep+...` beside it, one
+declared dimension (`bulk`) apart. `full` is raised `2210 -> 2400` as a
+declared change for the two rows' `77 + 77 = 154 s` (libtest's own stamps:
+`76.85 s` and `77.11 s`), measured rather than read: `2173 + 154 = 2327 s` of
+the new ceiling, with 73 s of room for the tier's still-undeclared rows.
+
+**What the arms cannot catch** is declared in `gate-coverage-gaps` below:
+reordering's effect on this lane's round-trip series, the four-flow split, a
+client-uploaded chunk, the deployed proxy chain, byte-level bulk integrity, and
+a shape-based classifier for the lane decision — which does not exist to be
+exercised.
+
 ## Tiers
 
 - **default** — not `#[ignore]`d, so a plain `cargo test -p rtp_mux` runs it.
@@ -2285,6 +2394,8 @@ hol_probe::hol_rtt40_ge1_solo = full
 hol_probe::hol_rtt40_ge1_split = full
 rtp_longrun::longrun_duallane = full
 rtp_longrun::multiflow_duallane = full
+minecraft_contested::mc_bulk_direction_decomposition = full
+minecraft_contested::mc_downstream_saturating_bulk = full
 hol_verify4::v4_clean_muxbulk = perf
 hol_verify4::v4_ge5_muxbulk = perf
 mux_bulk_clean_stall::induced_stall_fires_the_watchdog = full
@@ -2413,6 +2524,8 @@ hol_probe::hol_rtt40_ge1_solo
 hol_probe::hol_rtt40_ge1_split
 rtp_longrun::longrun_duallane
 rtp_longrun::multiflow_duallane
+minecraft_contested::mc_bulk_direction_decomposition
+minecraft_contested::mc_downstream_saturating_bulk
 mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
 mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
 mux_bulk_clean_stall::induced_stall_fires_the_watchdog
@@ -2785,6 +2898,7 @@ mux-fair-longrun = MUX_FAIR_WARMUP_SECS,MUX_FAIR_STEADY_SECS,MUX_FAIR_WINDOW_SEC
 rtp-longrun-arms = RTP_LONGRUN_SECS,RTP_LONGRUN_INTERVAL_SECS,RTP_LONGRUN_STREAMS,RTP_LONGRUN_LOSS_PCT,RTP_LONGRUN_LABEL | - | the multi-minute long-run arms' measurement window and CSV sampling cadence, over the production dual-lane composition: an aggregate interactive p50/p99/max and offered/forwarded wire series plus per-stream rows and the sender controller state, sampled every RTP_LONGRUN_INTERVAL_SECS across a RTP_LONGRUN_SECS window with RTP_LONGRUN_STREAMS interactive streams sharing the lane, RTP_LONGRUN_LOSS_PCT selecting the independent-loss regime and RTP_LONGRUN_LABEL naming the CSV run; the load records the single-flow reference arm's default shape, and the multi-flow arm's 180 s default is prose in the section above rather than folded into one total | longrun-drift@shape=cadence+scale=multi-minute+metric=p50-p99-max-series, longrun-fairness@arm=multi-flow+metric=per-stream-p99, longrun-bulk@scale=multi-minute+metric=goodput, longrun-repair@metric=fec-and-rtx-breakdown, longrun-rate@metric=rule-of-three+unit=interval | RTP_LONGRUN_SECS=300,RTP_LONGRUN_INTERVAL_SECS=10,RTP_LONGRUN_STREAMS=1,total=RTP_LONGRUN_SECS,wall=304.57s,bound=1.0e-1/interval
 hostile-goodput-probe = NETEM_PERF_WINDOW_SECONDS,NETEM_PERF_WARMUP_SECONDS,NETEM_PERF_LINK_PROFILE,NETEM_PERF_MSS_BYTES,NETEM_PERF_SEED,NETEM_PERF_REVISION,NETEM_PERF_DIAGNOSTIC_MODE,NETEM_PERF_FEC,RTP_RTX_DUP | - | the time-boxed counting-sink goodput window over the hostile link profiles: the window and its discarded warmup are the sizing pair, the profile selects the link (validated against the goodput probe's own list), the MSS and seed select the dial and its reproducible draw, the revision labels the PerfTrace artifact, NETEM_PERF_DIAGNOSTIC_MODE=1 makes the median sub-window goodput floor informational rather than asserted, and NETEM_PERF_FEC and RTP_RTX_DUP select the paired arms' FEC envelope and retransmission-armor treatment; the reported quantity is the median of the sub-window goodputs against the goodput floor, with every delivered byte verified by the sink | hostile-goodput@shape=counting-sink+window=30s+metric=median-subwindow-goodput, hostile-integrity@metric=every-delivered-byte-verified, probe-diagnostic-bypass@knob=NETEM_PERF_DIAGNOSTIC_MODE+effect=floor-becomes-informational, probe-treatment@knob=NETEM_PERF_FEC+mode=fec-off-or-on, probe-treatment@knob=RTP_RTX_DUP+mode=armor-off-or-on | NETEM_PERF_WINDOW_SECONDS=30,NETEM_PERF_WARMUP_SECONDS=20,total=NETEM_PERF_WINDOW_SECONDS+NETEM_PERF_WARMUP_SECONDS,wall=51s
 hostile-message-latency-probe = NETEM_PERF_WINDOW_SECONDS,NETEM_PERF_WARMUP_SECONDS,NETEM_PERF_LINK_PROFILE,NETEM_PERF_MSS_BYTES,NETEM_PERF_SEED,NETEM_PERF_REVISION,NETEM_PERF_FEC,RTP_RTX_DUP | - | the sparse-message one-way latency probe over the periodic hostile bottleneck profiles: 64 B timestamped messages every 100 ms for NETEM_PERF_WINDOW_SECONDS after a NETEM_PERF_WARMUP_SECONDS ramp, with netem sampled every 50 ms and a four-second straggler allowance, reporting one-way latency p50/p95/p99 and frame delivery; the profile is validated against the message probe's own periodic-only list, and NETEM_PERF_FEC and RTP_RTX_DUP select the paired arms' treatment as above | hostile-message@shape=timestamped-messages+window=30s+metric=one-way-p50-p95-p99, hostile-message-delivery@metric=delivered-frame-count, probe-treatment@knob=NETEM_PERF_FEC+mode=fec-off-or-on, probe-treatment@knob=RTP_RTX_DUP+mode=armor-off-or-on | NETEM_PERF_WINDOW_SECONDS=30,NETEM_PERF_WARMUP_SECONDS=5,total=NETEM_PERF_WINDOW_SECONDS+NETEM_PERF_WARMUP_SECONDS,wall=40s
+minecraft-contested-arms = MC_CONTESTED_FAULT,MC_RUNS,MC_WINDOW_SECS | - | the Minecraft-shaped composite's fault selector, run count and window: `MC_CONTESTED_FAULT` selects one of four input perturbations that each remove the property one assertion guards (`slow`, +250 ms one-way, drives the round-trip p99 tripwire past its bound; `no_bulk` opens the bulk stream but asks for a zero-length push, so the saturation chain fails; `offer_cut` offers a tenth of the tick, so the offer floor fails; `bulk_interactive` opens the bulk stream on the interactive lane, so the lane assertion fails), `MC_RUNS` is the number of independent runs the asserting arm repeats (default 3, each ~25 s of ramp + window + grace with a fresh session, seed and link pair), and `MC_WINDOW_SECS` sizes the measured window (default 20 s, four burst periods and ~1000 small frames); the fault selector sizes nothing and the window is a duration, so the load arithmetic derives from `MC_RUNS` with the window at its declared default, and a longer window scales the wall proportionally | minecraft-shaped-p99@shape=composite+metric=interactive-rtt-p99, minecraft-shaped-saturation@bulk=saturating-s2c+metric=backlog-and-passed-fraction, minecraft-shaped-direction@bulk=sweep+metric=interactive-rtt-p99, minecraft-shaped-lane@metric=observed-source-lane, minecraft-shaped-vacuity@fault=MC_CONTESTED_FAULT+targets=rtt-tripwire-and-offer-and-saturation-and-lane | MC_RUNS=3,total=MC_RUNS,wall=76.85s,bound=1.2e-1/run
 vacuity-fault-selectors = MANDATE_SMOKE_FAULT,HOL_PROBE_FAULT,SPIKE_SURVIVAL_FAULT,RTP_MUX_COLD_CONNECTION_FAULT | - | the red-proof input perturbations, not measurements: MANDATE_SMOKE_FAULT selects one smoke arm's perturbed input (a slowed or re-shaped link, a starved or dropped flow, or an offer cut to a tenth of the cadence), HOL_PROBE_FAULT the concurrent arms' offering serialization or throttle, SPIKE_SURVIVAL_FAULT the skipped spike, the mid-spike session churn or the late churn, and RTP_MUX_COLD_CONNECTION_FAULT the pre-fix sequential birth surrogate; each exists so the arm it perturbs can be shown to fail from the measurement path, each is unset in every real run, and none sizes anything, so this row's load is refused rather than invented | smoke-vacuity@fault=MANDATE_SMOKE_FAULT+targets=M1-M2-M3-M4, offer-vacuity@fault=HOL_PROBE_FAULT+targets=concurrent-offer-floor, spike-vacuity@fault=SPIKE_SURVIVAL_FAULT+targets=session-identity, birth-vacuity@fault=RTP_MUX_COLD_CONNECTION_FAULT+targets=dual-lane-birth
 ```
 
