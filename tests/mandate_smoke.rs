@@ -6124,7 +6124,7 @@ fn mc_nic_arm(name: &'static str, cc_link: Option<rtp::cc::CcSignalHub>) -> ArmS
 /// constraint, asserted on the bulk sink's own delivered bytes.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "opt-in: the Minecraft-shape CC-signal arm prints [mandate-smoke mc_*] rows \
-            without a MANDATE line, so it belongs to a declared perf-tier arm rather than \
+            without a MANDATE line, so it belongs to a declared full-tier arm rather than \
             the always-run M1-M4 set; run with --ignored --nocapture"]
 async fn m1_nic_minecraft_saturating_downstream() {
     let plain = run_arm(mc_nic_arm("mc_plain", None)).await;

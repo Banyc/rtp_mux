@@ -227,7 +227,9 @@ rtp_mux_jitter::jitter_interactive_with_loss = perf | 35 | orthogonal@interactiv
 rtp_mux_jitter::jitter_interactive_with_bulk = perf | 65 | composite(rate,load)@interactive | interactive-cadence@lane=interactive+flows=1+shape=cadence+loss=none+rate=1MiBps+load=bulk-burst-2MiB-per-3s+metric=latency-percentiles
 rtp_mux_jitter::jitter_interactive_bulk_and_loss = perf | 35 | composite(loss,rate,load)@interactive | interactive-cadence@lane=interactive+flows=1+shape=cadence+loss=2pct-iid+rate=1MiBps+load=bulk-burst-2MiB-per-3s+metric=latency-percentiles
 mandate_smoke::m3_bulk_goodput_fraction = default | 108 | baseline@m3-bulk | m3-bulk@lane=bulk+rate=1MiBps+load=saturated+window=6s+metric=capacity-fraction
-mandate_smoke::m1_nic_minecraft_saturating_downstream = perf | 33 | composite(bulk-mode,shared-shaper,mechanism)@mc-nic | mc-nic@lane=dual+shape=cadence+scale=300B+period=20ms+bulk=saturating+shaper=shared-uplink+mechanism=cc-signal+metric=p99-and-max
+minecraft_contested::mc_nic_cross_lane_signal = full | 154 | baseline@mc-nic | mc-nic@lane=dual+shape=cadence+scale=300B+period=20ms+bulk=saturating+shaper=shared-downstream+mechanism=cc-signal+metric=p99-and-bulk-delivery
+mandate_smoke::m1_nic_minecraft_saturating_downstream = full | 33 | composite(shaper,metric)@mc-nic | mc-nic@lane=dual+shape=cadence+scale=300B+period=20ms+bulk=saturating+shaper=shared-uplink+mechanism=cc-signal+metric=p99-and-max
+ibfq_nic_mandate::ibfq_nic_ab_against_the_untouched_dual_lane = full | 63 | composite(scale,period,shaper,mechanism,metric)@mc-nic | mc-nic@lane=dual+shape=cadence+scale=256B+period=25ms+bulk=saturating+shaper=shared-uplink+mechanism=per-nic-fair-queue+metric=p99-and-bulk-goodput-and-backlog
 dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction = full | 45 | orthogonal@m3-bulk | m3-bulk@lane=bulk+rate=1MiBps+load=saturated+window=15s+metric=capacity-fraction
 rtp_mux_jitter::jitter_bulk_idle_restart_arm = perf | 35 | composite(rate,load,window,metric)@m3-bulk | m3-bulk@lane=bulk+rate=2Mbps-c2s+load=idle-restart-bursts-512KiB+window=34s+metric=delivered-goodput
 rtp_mux_jitter::jitter_latency_dimension_arms = perf | 385 | baseline@latency-sweep | latency-sweep@sweep=shared-capacity-ack-path-cellular+metric=latency-percentiles-and-goodput
@@ -344,7 +346,16 @@ same lane, the same seeds, the same offer, polled together instead of one
 after another, and the two-flow rung declared with it is that same serialized
 offer at half the flow count. The two `interactive-scaling` rows keep the
 costs they already declared (66 s and 20 s, re-measured 69.0 s and 19.5 s),
-and no previously declared row's tier, cost, relation or cells change.
+and no previously declared row's tier, cost, relation or cells change. The
+block is authoritative over this history, and later rows move the ceiling
+again: `m1_hostile_p99_replicated` adds 204 s and the `full` sum crosses the
+2400 s ceiling, and this revision files the three `mc-nic` cross-lane rows
+(`mc_nic_cross_lane_signal` 154 s, `ibfq_nic_ab_against_the_untouched_dual_lane`
+63 s, `m1_nic_minecraft_saturating_downstream` 33 s), so `full` is raised as a
+declared change (2400 -> 2900) and the checker prints `full 2781.00/2900.00s`.
+The `perf` tier needs no raise: `m1_nic_minecraft_saturating_downstream` was
+filed there while asserting in its own body, so the tier correction alone
+returns `perf` to 3495.00/3500.00s.
 
 **Cost provenance.** No cost here is invented. Of the twelve rows the earlier
 revisions declared, `jitter_duallane_constitution_gate` is the "~40 s
@@ -624,7 +635,7 @@ it — it does, on an absent id).
 ```gate-budgets
 default = 300
 standard = 600
-full = 2400
+full = 2900
 perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.clean-band = mandate_smoke::probe_m4_clean_band_composition
@@ -650,6 +661,7 @@ baseline.interactive = rtp_mux_jitter::jitter_interactive_solo
 baseline.latency-sweep = rtp_mux_jitter::jitter_latency_dimension_arms
 baseline.lone-tail = rtp_mux_jitter::jitter_request_response_arms
 baseline.m3-bulk = mandate_smoke::m3_bulk_goodput_fraction
+baseline.mc-nic = minecraft_contested::mc_nic_cross_lane_signal
 baseline.minecraft-shaped = minecraft_contested::mc_downstream_saturating_bulk
 baseline.mux-over-rtp = mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
 baseline.non-loss-impairment = rtp_mux_jitter::jitter_nonloss_impairments
@@ -677,6 +689,7 @@ members.interactive = interactive-cadence*
 members.latency-sweep = latency-sweep*
 members.lone-tail = lone-tail*
 members.m3-bulk = m3-bulk*
+members.mc-nic = mc-nic*
 members.minecraft-shaped = minecraft-shaped*
 members.mux-over-rtp = mux-over-rtp*
 members.non-loss-impairment = non-loss-impairment*
@@ -2516,6 +2529,9 @@ rtp_longrun::longrun_duallane = full
 rtp_longrun::multiflow_duallane = full
 minecraft_contested::mc_bulk_direction_decomposition = full
 minecraft_contested::mc_downstream_saturating_bulk = full
+ibfq_nic_mandate::ibfq_nic_ab_against_the_untouched_dual_lane = full
+minecraft_contested::mc_nic_cross_lane_signal = full
+mandate_smoke::m1_nic_minecraft_saturating_downstream = full
 hol_verify4::v4_clean_muxbulk = perf
 hol_verify4::v4_ge5_muxbulk = perf
 mux_bulk_clean_stall::induced_stall_fires_the_watchdog = full
@@ -2648,6 +2664,9 @@ rtp_longrun::longrun_duallane
 rtp_longrun::multiflow_duallane
 minecraft_contested::mc_bulk_direction_decomposition
 minecraft_contested::mc_downstream_saturating_bulk
+ibfq_nic_mandate::ibfq_nic_ab_against_the_untouched_dual_lane
+minecraft_contested::mc_nic_cross_lane_signal
+mandate_smoke::m1_nic_minecraft_saturating_downstream
 mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
 mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
 mux_bulk_clean_stall::induced_stall_fires_the_watchdog
@@ -2742,7 +2761,7 @@ netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
 rtp/src/testkit/rtp.rs::send_timestamped_messages = 1
 rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
-rtp_mux/src/testkit/dual.rs::dual_mux_client_connect_lane_rtp_via = 1
+rtp_mux/src/testkit/dual.rs::dual_mux_client_connect_lane_rtp_via_cc_link = 1
 rtp_mux/src/testkit/mux_over_rtp.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
 rtp_mux/src/testkit/mux_over_rtp.rs::spawn_mux_over_rtp_server_core = 1
 tests/mandate_smoke.rs::band_composition = 3
@@ -2752,7 +2771,7 @@ tests/rtp_mux_jitter.rs::assert_sane = 2
 
 ## The env-scaled opt-in surface
 
-Seven surfaces in this crate are scaled from the process environment rather
+Nine surfaces in this crate are scaled from the process environment rather
 than from an `#[ignore]` set, so no `gate-manifest` tier, no
 `gate-default-required` line and no `gate-perf-design` row can see them: the
 same green arm runs a 4 s window or a 15 s one, three reps or thirty, a 300 s
@@ -2762,7 +2781,7 @@ the checker: a name this crate's sources read from the environment and no
 declared surface names is an error, and a declared name the sources never
 read is a stale declaration.
 
-All seven rows are **scriptless** (`-`). Not one of these names is set by a
+All nine rows are **scriptless** (`-`). Not one of these names is set by a
 script of this crate — the checker's `_crate_scripts` finds no file at all
 in the script suffixes it scans (`.sh`/`.py`/`.nu`/`.js`/`.ts`/…) under the
 crate root — and the runner that does set two of them, the harness's
@@ -3023,6 +3042,7 @@ hostile-goodput-probe = NETEM_PERF_WINDOW_SECONDS,NETEM_PERF_WARMUP_SECONDS,NETE
 hostile-message-latency-probe = NETEM_PERF_WINDOW_SECONDS,NETEM_PERF_WARMUP_SECONDS,NETEM_PERF_LINK_PROFILE,NETEM_PERF_MSS_BYTES,NETEM_PERF_SEED,NETEM_PERF_REVISION,NETEM_PERF_FEC,RTP_RTX_DUP | - | the sparse-message one-way latency probe over the periodic hostile bottleneck profiles: 64 B timestamped messages every 100 ms for NETEM_PERF_WINDOW_SECONDS after a NETEM_PERF_WARMUP_SECONDS ramp, with netem sampled every 50 ms and a four-second straggler allowance, reporting one-way latency p50/p95/p99 and frame delivery; the profile is validated against the message probe's own periodic-only list, and NETEM_PERF_FEC and RTP_RTX_DUP select the paired arms' treatment as above | hostile-message@shape=timestamped-messages+window=30s+metric=one-way-p50-p95-p99, hostile-message-delivery@metric=delivered-frame-count, probe-treatment@knob=NETEM_PERF_FEC+mode=fec-off-or-on, probe-treatment@knob=RTP_RTX_DUP+mode=armor-off-or-on | NETEM_PERF_WINDOW_SECONDS=30,NETEM_PERF_WARMUP_SECONDS=5,total=NETEM_PERF_WINDOW_SECONDS+NETEM_PERF_WARMUP_SECONDS,wall=40s
 minecraft-contested-arms = MC_CONTESTED_FAULT,MC_RUNS,MC_WINDOW_SECS | - | the Minecraft-shaped composite's fault selector, run count and window: `MC_CONTESTED_FAULT` selects one of four input perturbations that each remove the property one assertion guards (`slow`, +250 ms one-way, drives the round-trip p99 tripwire past its bound; `no_bulk` opens the bulk stream but asks for a zero-length push, so the saturation chain fails; `offer_cut` offers a tenth of the tick, so the offer floor fails; `bulk_interactive` opens the bulk stream on the interactive lane, so the lane assertion fails), `MC_RUNS` is the number of independent runs the asserting arm repeats (default 3, each ~25 s of ramp + window + grace with a fresh session, seed and link pair), and `MC_WINDOW_SECS` sizes the measured window (default 20 s, four burst periods and ~1000 small frames); the fault selector sizes nothing and the window is a duration, so the load arithmetic derives from `MC_RUNS` with the window at its declared default, and a longer window scales the wall proportionally | minecraft-shaped-p99@shape=composite+metric=interactive-rtt-p99, minecraft-shaped-saturation@bulk=saturating-s2c+metric=backlog-and-passed-fraction, minecraft-shaped-direction@bulk=sweep+metric=interactive-rtt-p99, minecraft-shaped-lane@metric=observed-source-lane, minecraft-shaped-vacuity@fault=MC_CONTESTED_FAULT+targets=rtt-tripwire-and-offer-and-saturation-and-lane | MC_RUNS=3,total=MC_RUNS,wall=76.85s,bound=1.2e-1/run
 vacuity-fault-selectors = MANDATE_SMOKE_FAULT,HOL_PROBE_FAULT,SPIKE_SURVIVAL_FAULT,RTP_MUX_COLD_CONNECTION_FAULT | - | the red-proof input perturbations, not measurements: MANDATE_SMOKE_FAULT selects one smoke arm's perturbed input (a slowed or re-shaped link, a starved or dropped flow, or an offer cut to a tenth of the cadence), HOL_PROBE_FAULT the concurrent arms' offering serialization or throttle, SPIKE_SURVIVAL_FAULT the skipped spike, the mid-spike session churn or the late churn, and RTP_MUX_COLD_CONNECTION_FAULT the pre-fix sequential birth surrogate; each exists so the arm it perturbs can be shown to fail from the measurement path, each is unset in every real run, and none sizes anything, so this row's load is refused rather than invented | smoke-vacuity@fault=MANDATE_SMOKE_FAULT+targets=M1-M2-M3-M4, offer-vacuity@fault=HOL_PROBE_FAULT+targets=concurrent-offer-floor, spike-vacuity@fault=SPIKE_SURVIVAL_FAULT+targets=session-identity, birth-vacuity@fault=RTP_MUX_COLD_CONNECTION_FAULT+targets=dual-lane-birth
+perf-tooling-process-env = HOME,IBFQ_AB_DIR,NETEM_RENDER_BROWSER,PATH,PERF_ARCHIVE_DIR,PERF_BASELINE_DIR,TMPDIR | - | the crate's perf tooling and evidence sinks read these straight from the process environment rather than from any declared knob: HOME and PATH locate the cargo home and the browser the renderer shells out to, TMPDIR is the producer's scratch root, PERF_ARCHIVE_DIR and PERF_BASELINE_DIR are `perf-history`'s run-archive and baseline roots, NETEM_RENDER_BROWSER overrides the rasterizer's browser, and IBFQ_AB_DIR names where the ibfq arm writes its CDF panel and CSVs; none is set by a script of this crate and none sizes a count, so no arithmetic derives from this surface and its load is refused rather than invented | tooling-env@knob=HOME+effect=cargo-home-fallback, tooling-env@knob=PATH+effect=browser-lookup, tooling-env@knob=TMPDIR+effect=producer-scratch-root, tooling-env@knob=NETEM_RENDER_BROWSER+effect=browser-override, tooling-env@knob=PERF_ARCHIVE_DIR+effect=archive-root, tooling-env@knob=PERF_BASELINE_DIR+effect=baseline-root, tooling-evidence@knob=IBFQ_AB_DIR+effect=ab-panel-and-csv-sink
 ```
 
 ## The cross-lane CC signal: is it wired, and does it buy the shared tail?
@@ -3081,6 +3101,8 @@ verdict) turned the controller-branch assertion red with the observed values
 `active 0.928` against `absent 0.941`, while the `shared_probe` positive control
 still read 6 380 - so the arm fails on the suppression and not on the wiring.
 The restored `rtp` tree was verified byte-clean (`jj diff --stat` = 0 files).
+
+**The three NIC cross-lane arms this revision files.** `ibfq_nic_mandate::ibfq_nic_ab_against_the_untouched_dual_lane` (63 s), `minecraft_contested::mc_nic_cross_lane_signal` (154 s) and `mandate_smoke::m1_nic_minecraft_saturating_downstream` (33 s) land as `full`-tier gates in the `mc-nic` family; they measure a `CcLink`'s effect on a shared queue through three independent harnesses. On a loaded host (load 17-34 on ten cores) the first two fail their own tail-queue assertions: `ibfq`'s median p99 backlog stays at the shaper's 128 KiB cap in **both** arms (cc_link 126 615 B against baseline 128 553 B, against a `<= baseline x 0.5` bound), and `mc_nic`'s signal p99 reads 235.0 ms against the baseline's 217.8 ms. That is the same reading `cc_link_ab` above records at load 4.5-10.9 - the shared queue is full in both arms and the interactive p99 does not move - so the failure is recorded here rather than silenced as a declaration: a re-run on an unloaded host is what would separate a load artefact from a mechanism that does not bound the queue, and no assertion, window or bound of either arm was changed to admit the declaration.
 
 ## Opt-in targets outside this manifest
 

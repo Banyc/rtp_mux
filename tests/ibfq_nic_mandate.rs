@@ -441,7 +441,7 @@ fn cdf_points(mut xs: Vec<f64>) -> Vec<(f64, f64)> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spawns threads and binds ephemeral ports; 3 arms x 3 interleaved ~11 s runs; run with --ignored --nocapture --test-threads=1"]
+#[ignore = "spawns threads and binds ephemeral ports; 2 arms x 3 interleaved ~11 s runs; run with --ignored --nocapture --test-threads=1"]
 async fn ibfq_nic_ab_against_the_untouched_dual_lane() {
     let dir = std::env::var("IBFQ_AB_DIR").unwrap_or_else(|_| "target/ibfq-ab".to_string());
     std::fs::create_dir_all(&dir).unwrap();
