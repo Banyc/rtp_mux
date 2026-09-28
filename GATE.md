@@ -774,7 +774,7 @@ asserts nothing about an offer schedule.
 
 The one command that measures all three mandates together and leaves
 machine-checkable evidence is the `mandate_smoke` target; `tools/mandate-check`
-(`crates/netem_test/tools/mandate-check`) runs it, renders one panel per
+(`crates/rtp_mux/tools/mandate-check`) runs it, renders one panel per
 mandate, prints a verdict block and writes `mandate-check.json` and the
 evidence files (`M1/M2/M3/M4.json`/`.csv`):
 
@@ -2782,12 +2782,12 @@ declared surface names is an error, and a declared name the sources never
 read is a stale declaration.
 
 All nine rows are **scriptless** (`-`). Not one of these names is set by a
-script of this crate — the checker's `_crate_scripts` finds no file at all
+script of this crate — the checker's `crate_scripts` finds no file at all
 in the script suffixes it scans (`.sh`/`.py`/`.nu`/`.js`/`.ts`/…) under the
-crate root — and the runner that does set two of them, the harness's
-`netem_test/tools/mandate-check`, is not a script
-of this crate. The checker's runner field can only name a script of the crate
-it checks, so `-` is the honest record here and the prose names the external
+crate root — and the runner that does set two of them, this crate's
+`tools/mandate-check`, carries none of those suffixes, so it is not a script
+the checker can name. The checker's runner field can only name a script of the
+crate it checks, so `-` is the honest record here and the prose names the
 runner instead.
 
 Every name below is resolved from the sources, not from a list written here,
