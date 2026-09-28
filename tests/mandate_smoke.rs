@@ -3656,6 +3656,18 @@ struct FairRun {
     imbalance: f64,
     window: Duration,
     wall: Duration,
+    /// Every delivered sample as `(flow tag, elapsed s, one-way latency ms)`,
+    /// on-time and late alike -- the series the percentiles are read from, kept
+    /// so a band composition can be read off the same numbers the summary was.
+    samples: Vec<(u8, f64, f64)>,
+    /// Datagrams the arm's own forward shaper (client to server) dropped.
+    /// The loss realization the latency tail is made of, read from the
+    /// instrument rather than inferred from the latency.
+    c2s_dropped: u64,
+    /// Datagrams the forward shaper received and forwarded, so the drop count
+    /// above has a denominator the arm measured rather than one it assumed.
+    c2s_received: u64,
+    c2s_forwarded: u64,
 }
 
 /// The fairness window. The share statistic's resolution is one delivered
@@ -3893,7 +3905,7 @@ async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
             let mut futs = Vec::with_capacity(M4_FLOWS);
             for (index, (tag, write)) in streams.iter_mut().enumerate() {
                 if write.write_all(&[*tag]).await.is_err() {
-                    return (vec![0u64; M4_FLOWS], Vec::new(), Vec::new());
+                    return (vec![0u64; M4_FLOWS], Vec::new(), Vec::new(), (0, 0, 0));
                 }
                 let delay = if index == 0 { Duration::ZERO } else { stagger };
                 let run_for = window.saturating_sub(delay);
@@ -3949,24 +3961,34 @@ async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
             // One last drain, so a sample that raced the loop's own check is
             // classified rather than read as lost.
             late.extend(std::mem::take(&mut *collector.lock().unwrap()));
+            let c2s = int_pair.snapshot_c2s().stats;
+            let c2s_dropped = c2s.dropped;
+            let (c2s_received, c2s_forwarded) = (c2s.received, c2s.forwarded);
             int_pair.stop();
             bulk_pair.stop();
-            (sent_per_flow, on_time, late)
+            (
+                sent_per_flow,
+                on_time,
+                late,
+                (c2s_dropped, c2s_received, c2s_forwarded),
+            )
         })
         .await;
-    let (sent_per_flow, on_time, late) = outcome;
+    let (sent_per_flow, on_time, late, (c2s_dropped, c2s_received, c2s_forwarded)) = outcome;
 
-    let bucket = |samples: Vec<(u8, f64, f64)>| {
+    let bucket = |samples: &[(u8, f64, f64)]| {
         let mut per_flow: Vec<Vec<f64>> = vec![Vec::new(); M4_FLOWS];
-        for (tag, _elapsed, latency) in samples {
+        for (tag, _elapsed, latency) in samples.iter().copied() {
             if let Some(flow) = (0..M4_FLOWS).find(|&i| m4_flow_tag(i) == tag) {
                 per_flow[flow].push(latency);
             }
         }
         per_flow
     };
-    let on_time_per_flow = bucket(on_time);
-    let late_per_flow = bucket(late);
+    let mut samples: Vec<(u8, f64, f64)> = on_time.clone();
+    samples.extend_from_slice(&late);
+    let on_time_per_flow = bucket(&on_time);
+    let late_per_flow = bucket(&late);
     let delivered: Vec<u64> = (0..M4_FLOWS)
         .map(|flow| {
             (on_time_per_flow[flow].len() + late_per_flow[flow].len()) as u64 * MSG_BYTES as u64
@@ -4021,6 +4043,10 @@ async fn run_fairness_arm(spec: FairArmSpec) -> FairRun {
         max_share,
         imbalance,
         window,
+        samples,
+        c2s_dropped,
+        c2s_received,
+        c2s_forwarded,
         wall: wall.elapsed(),
     }
 }
@@ -4476,6 +4502,273 @@ async fn m4_clean_lane_p99_ceiling() {
         p99_max <= M4_CLEAN_P99_CEILING_MS,
         "[M4 level] the four-flow clean lane's p99 {p99_max:.1} ms exceeds the {M4_CLEAN_P99_CEILING_MS} ms interactive ceiling (p50 {p50_max:.1}, per-flow p99 {:?}): the production shape runs {M4_FLOWS} flows on the one interactive lane, and it must meet the same ceiling M1 asserts for one -- a multi-flow tail breach is a product regression even though M1's one-flow arm cannot see it",
         run.flows.iter().map(|f| f.summary.p99).collect::<Vec<_>>(),
+    );
+}
+
+// ────────── M4 clean band: what the clean lane's tail is made of ──────────
+
+/// The largest one-way latency the clean link can produce with **no loss and
+/// no repair**: `OWD + JITTER`. One authority for the number, read by the band
+/// probe below. A message above it required either a dropped datagram (the
+/// lane repaired one) or a mechanism the link's own profile cannot produce.
+const CLEAN_ONE_WAY_CEILING_MS: f64 = 30.0;
+
+/// The band probe's bins, in ms. The first two are at or below the link's own
+/// no-loss ceiling; the rest are the repair band the four-flow tail is made of,
+/// split finely enough to tell a *clump* (isolated rung repairs at one offset)
+/// from a *spread* (a queue draining, i.e. a stall).
+const BAND_EDGES: [(f64, f64); 12] = [
+    (0.0, 25.0),
+    (25.0, 30.0),
+    (30.0, 40.0),
+    (40.0, 50.0),
+    (50.0, 60.0),
+    (60.0, 70.0),
+    (70.0, 80.0),
+    (80.0, 90.0),
+    (90.0, 100.0),
+    (100.0, 150.0),
+    (150.0, 250.0),
+    (250.0, f64::INFINITY),
+];
+
+/// The arm the band probe reads: M4's own clean arm, with the link's loss
+/// optionally closed (`noloss`, the attribution diagnostic's own arm) and
+/// carrying its own fault namespace (`M4_BAND_*`) so a probe of this instrument
+/// cannot read as a probe of M4's or of the level arm's.
+///
+/// Its one probe, `M4_BAND_delay`, adds one-way delay to the forward shaper and
+/// closes the link's loss, so every offered message lands above the no-loss
+/// ceiling while the shaper drops nothing: it is the **vacuity demonstration**
+/// for the body assertion below, which must reject a lane whose body is not the
+/// clean link it declares, and it fails naming the observed p50.
+fn m4_band_arm(noloss: bool) -> FairArmSpec {
+    let mut spec = fairness_arms("M4")
+        .into_iter()
+        .next()
+        .expect("the M4 arm set always carries its clean arm first");
+    // A new arm's window is its own, and the family's own cheapest one is the
+    // one this reading needs: the composition is a *rate*, so 8 s of the 4-flow
+    // cadence (about 6300 delivered samples) resolves it as well as 12 s does,
+    // and the shortened window is what lets both this arm and its loss-closed
+    // diagnostic be declared inside the `perf` tier's remaining headroom
+    // (`rtp_mux/GATE.md`, gate-budgets).
+    spec.window = M4_QUICK_WINDOW;
+    if noloss {
+        spec.int_c2s.loss = 0;
+        spec.int_s2c.loss = 0;
+    }
+    if let Some(fault) = fault("M4_BAND") {
+        let extra_ms = match fault.as_str() {
+            "M4_BAND_delay" => Some(40),
+            _ => None,
+        };
+        if let Some(extra_ms) = extra_ms {
+            spec.int_c2s.latency += Duration::from_millis(extra_ms);
+            spec.int_c2s.loss = 0;
+            spec.int_s2c.loss = 0;
+        }
+    }
+    spec
+}
+
+/// The four-flow clean lane's tail, attributed to the loss realization it is
+/// made of, and binned so its *shape* is readable.
+///
+/// The level arm asserts the clean p99 against M1's ceiling, and M4 asserts the
+/// split; neither says **what the tail above the link's own no-loss ceiling is
+/// made of** — a lane whose tail is a clump at one rung's offset and a lane
+/// whose tail is a queue draining are both "inside the ceiling" and are not the
+/// same product. The reading is report-only (no mandated bound: the
+/// instrument's own sanity is what it asserts), and it is the cause attribution
+/// the level and fairness arms cannot give. Its assertions are instrument
+/// integrity -- the body sits in the clean link's own `OWD +- JITTER` band, and
+/// the bins cover the series -- with `M4_BAND_delay` as the body assertion's
+/// vacuity demonstration.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "report-only clean-lane band composition probe; ~16 s; run with --ignored --nocapture"]
+async fn probe_m4_clean_band_composition() {
+    let _serial = SERIAL.lock().await;
+    band_composition(m4_band_arm(false)).await;
+}
+
+/// The same arm with the link's **loss closed** and nothing else changed: the
+/// band instrument's own attribution diagnostic, as a declared arm of the same
+/// family rather than a fault flag on the arm above.
+///
+/// It is what showed the tail is not all loss: with the shaper's drop count at
+/// zero the lane still produced a non-empty tail in every run measured (16 of
+/// 9600 at the second run, 41 of 9568 at the first), so "a message above the
+/// link's own no-loss ceiling was paid for by a dropped datagram" is **false on
+/// this instrument** and is not asserted — the reading is the two counts side
+/// by side. What the pair does give is the split: the loss-on arm reaches ~90 ms
+/// and the loss-off arm stops at ~39 ms, so the part of the band the loss
+/// realization cannot explain is the part below ~39 ms.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "report-only clean-lane band composition probe (loss closed); ~16 s; run with --ignored --nocapture"]
+async fn probe_m4_clean_band_composition_noloss() {
+    let _serial = SERIAL.lock().await;
+    band_composition(m4_band_arm(true)).await;
+}
+
+/// One band-composition measurement: run the arm, bin every delivered sample's
+/// one-way latency, and print the composition, the tail's own values, its
+/// per-flow split and its time clustering, beside the forward shaper's own
+/// received/forwarded/dropped counts.
+///
+/// The assertions are instrument integrity, and each is falsifiable: the arm
+/// delivered something; the bins hold exactly the series; and the body sits in
+/// the clean link's own `OWD +- JITTER` band, which `M4_BAND_delay` fails by
+/// name with the observed p50 (`63.0 ms, outside the clean link's own [20,30] ms
+/// band`).
+async fn band_composition(spec: FairArmSpec) {
+    let run = with_timeout(ARM_DEADLINE, "m4/band", run_fairness_arm(spec)).await;
+    let samples = &run.samples;
+    let mut counts = [0usize; BAND_EDGES.len()];
+    for s in samples {
+        let y = s.2;
+        for (i, (lo, hi)) in BAND_EDGES.iter().enumerate() {
+            if y >= *lo && y < *hi {
+                counts[i] += 1;
+                break;
+            }
+        }
+    }
+    let total = samples.len();
+    let tail: usize = samples
+        .iter()
+        .filter(|s| s.2 > CLEAN_ONE_WAY_CEILING_MS)
+        .count();
+    // Per flow, and in time: a per-packet random delay spreads evenly across
+    // the four flows and scatters in time, while a stall concentrates.
+    let mut per_flow_tail = [0usize; M4_FLOWS];
+    let mut per_flow_max = [0.0f64; M4_FLOWS];
+    for s in samples {
+        let flow = (0..M4_FLOWS).find(|&i| m4_flow_tag(i) == s.0);
+        if let Some(flow) = flow {
+            per_flow_max[flow] = per_flow_max[flow].max(s.2);
+            if s.2 > CLEAN_ONE_WAY_CEILING_MS {
+                per_flow_tail[flow] += 1;
+            }
+        }
+    }
+    let mut tail_times: Vec<f64> = samples
+        .iter()
+        .filter(|s| s.2 > CLEAN_ONE_WAY_CEILING_MS)
+        .map(|s| s.1)
+        .collect();
+    tail_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let clustered = tail_times
+        .windows(2)
+        .filter(|w| w[1] - w[0] <= 0.100)
+        .count();
+    let bands: Vec<String> = BAND_EDGES
+        .iter()
+        .zip(counts.iter())
+        .map(|((lo, hi), c)| {
+            let hi = if hi.is_finite() {
+                format!("{hi:.0}")
+            } else {
+                "inf".to_owned()
+            };
+            if total == 0 {
+                format!("[{lo:.0},{hi}):{c}")
+            } else {
+                format!(
+                    "[{lo:.0},{hi}):{c}({:.2}%)",
+                    100.0 * *c as f64 / total as f64
+                )
+            }
+        })
+        .collect();
+    println!(
+        "[m4-band] flows={} samples={} c2s_received={} c2s_forwarded={} c2s_dropped={} drop_pct={:.3} tail_over_{}ms={} ({:.3}%) p50={:.1} p99={:.1} max={:.1} bands={}",
+        M4_FLOWS,
+        total,
+        run.c2s_received,
+        run.c2s_forwarded,
+        run.c2s_dropped,
+        if run.c2s_received == 0 {
+            0.0
+        } else {
+            100.0 * run.c2s_dropped as f64 / run.c2s_received as f64
+        },
+        CLEAN_ONE_WAY_CEILING_MS as u64,
+        tail,
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * tail as f64 / total as f64
+        },
+        run.flows.iter().map(|f| f.summary.p50).fold(0.0, f64::max),
+        run.flows.iter().map(|f| f.summary.p99).fold(0.0, f64::max),
+        run.flows.iter().map(|f| f.summary.max).fold(0.0, f64::max),
+        bands.join(" "),
+    );
+    // The tail's own values, not only its bins: a clump at one repair offset
+    // and a ramp read the same in a histogram when the ramp is short.
+    let mut tail_values: Vec<f64> = samples
+        .iter()
+        .map(|s| s.2)
+        .filter(|&y| y > CLEAN_ONE_WAY_CEILING_MS)
+        .collect();
+    tail_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "[m4-band] tail values (sorted, ms): {}",
+        tail_values
+            .iter()
+            .map(|y| format!("{y:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!(
+        "[m4-band] per-flow tail={per_flow_tail:?} max={:?} tail_clustered_within_100ms={clustered} of {} tail samples",
+        per_flow_max.map(|m| format!("{m:.1}")),
+        tail_times.len(),
+    );
+    println!(
+        "[m4-band] tail times (s): {}",
+        tail_times
+            .iter()
+            .map(|t| format!("{t:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    // Instrument sanity, in the order a degenerate reading would break it: the
+    // arm measured something, every measured sample landed in exactly one band,
+    // and the lane it measured is the clean link it declares (its body sits
+    // inside `OWD + JITTER`).
+    assert!(
+        total > 0,
+        "[m4-band] the arm delivered no sample: a band composition of nothing is not a measurement",
+    );
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        total,
+        "[m4-band] the band bins hold {} of {total} samples: the composition is not the series",
+        counts.iter().sum::<usize>(),
+    );
+    let p50_max = run.flows.iter().map(|f| f.summary.p50).fold(0.0, f64::max);
+    // Reported, not asserted, and the `M4_BAND_noloss` diagnostic is why: the
+    // same arm with the link's loss closed still produced a non-empty tail in
+    // every run measured, so "a message above the ceiling was paid for by a
+    // dropped datagram" is **false on this instrument** and asserting it would
+    // be asserting that the arm has loss configured. What the two numbers
+    // together say -- how much of the tail the drop count can account for -- is
+    // the reading, so they are printed side by side.
+    println!(
+        "[m4-band] tail_over_ceiling={tail} c2s_dropped={} tail_per_drop={:.4}",
+        run.c2s_dropped,
+        if run.c2s_dropped == 0 {
+            f64::INFINITY
+        } else {
+            tail as f64 / run.c2s_dropped as f64
+        },
+    );
+    assert!(
+        (20.0..=CLEAN_ONE_WAY_CEILING_MS).contains(&p50_max),
+        "[m4-band] the arm's body p50 is {p50_max:.1} ms, outside the clean link's own [{:.0},{CLEAN_ONE_WAY_CEILING_MS:.0}] ms band: this is not the link the arm declares",
+        OWD.as_millis() as f64 - JITTER.as_millis() as f64,
     );
 }
 

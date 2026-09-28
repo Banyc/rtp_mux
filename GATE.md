@@ -234,6 +234,8 @@ mandate_smoke::m1_lone_tail_field_rtt = full | 20 | composite(depth,impairment)@
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep = full | 38 | orthogonal@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1-and-2+impairment=owd100-ge5pct-jitter100ms+metric=p99-and-over250-share
 mandate_smoke::m1_lone_tail_rung_distribution = full | 75 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-ge5pct-jitter100ms+metric=rung-count-vs-burst-law
 mandate_smoke::m1_lone_tail_loss_model = full | 150 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-iid5pct-vs-ge5pct-mean8-jitter100ms+metric=rung-count-vs-loss-model
+mandate_smoke::probe_m4_clean_band_composition = perf | 12 | baseline@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=loss2pct-iid+jitter=5ms+metric=tail-band-composition
+mandate_smoke::probe_m4_clean_band_composition_noloss = perf | 12 | orthogonal@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=none+metric=tail-band-composition
 hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
 hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
 hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
@@ -618,6 +620,7 @@ standard = 600
 full = 1900
 perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
+baseline.clean-band = mandate_smoke::probe_m4_clean_band_composition
 baseline.constitution = rtp_mux_jitter::jitter_duallane_constitution_gate
 baseline.contested = contested_latency::contested_capped_clean
 baseline.dual-lane = hol_probe::dual_lane_asym_frame_delivers_and_tears_down
@@ -642,6 +645,7 @@ baseline.m3-bulk = mandate_smoke::m3_bulk_goodput_fraction
 baseline.mux-over-rtp = mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
 baseline.non-loss-impairment = rtp_mux_jitter::jitter_nonloss_impairments
 baseline.reorder = rtp_mux_jitter::jitter_reorder_direction
+members.clean-band = clean-band*
 members.constitution = M*
 members.contested = contested*
 members.dual-lane = hol-dual-lane*
@@ -2083,6 +2087,8 @@ mandate_smoke::m1_lone_tail_field_rtt = full
 mandate_smoke::m1_lone_tail_field_rtt_depth_sweep = full
 mandate_smoke::m1_lone_tail_loss_model = full
 mandate_smoke::m1_lone_tail_rung_distribution = full
+mandate_smoke::probe_m4_clean_band_composition = perf
+mandate_smoke::probe_m4_clean_band_composition_noloss = perf
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
 rtp_mux::rtp_mux_explorer_relays_onto_better_path = full
@@ -2284,6 +2290,7 @@ rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
 rtp_mux/src/testkit/dual.rs::dual_mux_client_connect_lane_rtp_via = 1
 rtp_mux/src/testkit/mux_over_rtp.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
 rtp_mux/src/testkit/mux_over_rtp.rs::spawn_mux_over_rtp_server_core = 1
+tests/mandate_smoke.rs::band_composition = 3
 tests/rtp_mux_jitter.rs::assert_reportable = 2
 tests/rtp_mux_jitter.rs::assert_sane = 2
 ```
