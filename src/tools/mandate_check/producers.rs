@@ -28,6 +28,10 @@ pub struct Producer {
     pub default_path: String,
     pub cargo_args: Vec<String>,
     pub test_args: Vec<String>,
+    /// A second invocation of the same target for opt-in (e.g. `#[ignore]`d)
+    /// evidence arms whose readings supplement a verdict section. Empty for a
+    /// producer that has none.
+    pub extra_test_args: Vec<String>,
     pub sections: Vec<String>,
     pub verdicts: Vec<String>,
     pub log: String,
@@ -300,6 +304,19 @@ fn producer_problem(entry: &Json, seen: &[String]) -> Option<String> {
             ));
         }
     }
+    if let Some(value) = object.get("extra_test_args") {
+        let some_strings = value.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .all(|token| token.as_str().is_some_and(|text| !text.is_empty()))
+        });
+        if !some_strings {
+            return Some(format!(
+                "the producer {} gives extra_test_args no list of tokens",
+                repr(Some(id)),
+            ));
+        }
+    }
     for key in ["sections", "verdicts"] {
         let some_strings = object
             .get(key)
@@ -373,6 +390,7 @@ fn producer_from_json(entry: &Json) -> Option<Producer> {
         default_path: text("default_path")?,
         cargo_args: string_list(entry.get("cargo_args")),
         test_args: string_list(entry.get("test_args")),
+        extra_test_args: string_list(entry.get("extra_test_args")),
         sections: string_list(entry.get("sections")),
         verdicts: string_list(entry.get("verdicts")),
         log: text("log")?,
@@ -670,10 +688,16 @@ pub fn prepare_output_dir(
         }
     }
     for mandate in mandate_ids {
-        for suffix in [".json", ".csv"] {
-            let stale = out_dir.join(format!("{mandate}{suffix}"));
-            if stale.is_file() {
-                let _ = std::fs::remove_file(stale);
+        for stem in [
+            mandate.clone(),
+            format!("{mandate}_extra"),
+            format!("{mandate}.merged"),
+        ] {
+            for suffix in [".json", ".csv"] {
+                let stale = out_dir.join(format!("{stem}{suffix}"));
+                if stale.is_file() {
+                    let _ = std::fs::remove_file(stale);
+                }
             }
         }
     }
@@ -734,6 +758,19 @@ pub fn producer_command(cargo: &Path, producer: &Producer) -> Vec<String> {
     out.push("--".to_string());
     out.extend(super::TIMING_ARGS.iter().map(|token| token.to_string()));
     out.extend(producer.test_args.iter().cloned());
+    out
+}
+
+/// One producer's opt-in evidence invocation: the same target and cargo argv,
+/// with the declared `extra_test_args` after the runner's timing flags. It runs
+/// the arms a producer keeps out of its default invocation (e.g. `#[ignore]`d
+/// evidence arms) and writes their supplement beside the mandate's evidence.
+pub fn producer_extra_command(cargo: &Path, producer: &Producer) -> Vec<String> {
+    let mut out = vec![cargo.display().to_string()];
+    out.extend(producer.cargo_args.iter().cloned());
+    out.push("--".to_string());
+    out.extend(super::TIMING_ARGS.iter().map(|token| token.to_string()));
+    out.extend(producer.extra_test_args.iter().cloned());
     out
 }
 

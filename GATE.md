@@ -138,7 +138,8 @@ move them.
 
 M4 runs the bulk lane **idle**, so no arm in this file measures the trade the
 product makes the moment that lane competes. `mandate_smoke::m4_tcp_competition`
-(`full` tier, report-only) adds the missing half: the production dual-lane mux
+(`full` tier; asserts the bulk-share floor, reports the interactive tail) adds
+the missing half: the production dual-lane mux
 client with its bulk lane **saturating** one shared `BottleneckShaper`,
 alongside an `rtp` connection running the test-only AIMD reference law
 (`reference_aimd = true`) on the same shaper. The interactive lane carries
@@ -157,8 +158,9 @@ of the shaper, the two bulk flows' aggregate `0.776` (all three flows over the
 queue `0.945`), and per-flow interactive p99 `523`–`764` ms with max up to
 `805` ms — i.e. **2.1–3.1× M1's 250 ms ceiling** while the bulk lane takes
 `0.349` and the reference `0.651` of their pair. That is the unmeasured cost
-this arm exists to surface, and it is why the arm is report-only: the product
-bound is derived from this reading, not asserted here.
+this arm exists to surface. The arm asserts the **bulk-share** half (the floor
+derived below) and reports the interactive half: a bound above M1's ceiling
+would launder that breach as a pass, which the workspace forbids.
 
 Two honest caveats travel with the row. **The competitor is an `rtp` AIMD
 reference running inside `rtp`'s own feedback loop, not wire TCP** — it is a
@@ -175,10 +177,53 @@ competitor's backoff (measured `1015` ms, `4.1×` the ceiling, with the buffer a
 
 Its vacuity is its own fault namespace: `MANDATE_SMOKE_FAULT=M4_TCP_STALL_BULK`
 writes nothing on the mux bulk lane for the window, so its delivered-byte
-counter stays zero and the arm's bulk-presence sanity fails by name while the
+counter stays zero and the bulk-share floor fails by name while the
 competitor's saturation, the interactive delivery and every latency still
 print (measured: `bulk_share=0.0000` at `bulk_delivered=0`, the arm's own
 `FAIL` line emitted before the panic).
+
+#### Asserted: the bulk-share floor; reported: the interactive breach
+
+`tools/mandate-check` runs the arm and renders its two panels into M4's
+evidence. The arm writes them as a supplement (`M4_extra.json`/`.csv`); the
+runner merges the supplement into `M4.json`/`.csv` before it renders the
+mandate, so the M4 `panels` array and `plots/` carry `M4-tcp_bulk_share.svg`
+and `M4-tcp_interactive_tail.svg` beside the fairness panels, each with its
+forced `.summary.txt`, and the run prints both summaries. The arm stays out of
+the default invocation (`#[ignore]`d, `full` tier, 17 s): the producer
+registry's `extra_test_args` run it a second time
+(`--ignored --nocapture m4_tcp_competition`) and append its output to the
+producer log.
+
+**The bulk-share floor is asserted.** `M4_TCP_BULK_SHARE_FLOOR = 0.17` is
+derived from the arm's first measurement, not picked: the bulk lane's share of
+the two bulk flows is `0.349`, and the floor is that reading halved
+(`0.349 / 2 = 0.1745`, rounded down to `0.17`). The measured share passes at
+`2.05x` the floor, so 12 s-window movement cannot fail it; the fault reads
+`bulk_share=0.0000` and fails the bound **by name** — `the product bulk lane's
+share ... is 0.0000, below the 0.17 bulk-share floor (M4_TCP_BULK_SHARE_FLOOR,
+derived from the first measurement 0.349 ...)`, exit `101`. The bound is a bulk
+**presence** floor, not a fairness claim: the measured `0.349` is `0.70x` the
+equal split, so a floor at the fair share would fail every run. Its coverage
+cell is the `mandate_smoke::m4_tcp_competition` row in the declared perf rows
+below.
+
+**The interactive p99 is reported, not asserted — this is an open M1 defect.**
+Per-flow p99 `523`-`764` ms with max up to `805` ms (`2.1`-`3.1x`
+`M1_CEILING_MS`), every flow still delivering `1.000`. A battery run of the
+merged panel reads the same shape and a wider band — per-flow p99
+`537`-`938` ms with peak up to `998` ms, `2.1`-`4.0x` the ceiling — so the
+breach is not one draw. The
+`M4-tcp_interactive_tail` panel draws the `250 ms` ceiling at the scale the
+breach happens on and its forced summary states the reading; no bound above the
+ceiling is introduced, because a passing guard there would launder the breach
+as a pass. **Arm read from:** `mandate_smoke::m4_tcp_competition`. **Fix
+direction:** the tail is queue-level contention on the one shared drop-tail
+bottleneck, so the fix is queue-level separation (the `ibfq`/`cc_link`
+direction), not a transport timer; the `ibfq`-family arms' own queue bounds
+currently fail at load, so that direction is open work rather than a landed
+lever. **Status: NOT A PASS** — an M1 breach with a named fix direction, not a
+satisfied mandate.
 
 ### Declared perf rows
 

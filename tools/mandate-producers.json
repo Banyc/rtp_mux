@@ -19,6 +19,11 @@
       "test_args": [
         "--nocapture"
       ],
+      "extra_test_args": [
+        "--ignored",
+        "--nocapture",
+        "m4_tcp_competition"
+      ],
       "sections": [
         "M1",
         "M2",

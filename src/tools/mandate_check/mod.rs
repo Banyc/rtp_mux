@@ -89,7 +89,7 @@ pub const PRODUCER_KEYS: [&str; 10] = [
 /// a producer owns. The arm coverage declaration and its mandate id set are the
 /// mandate owner's, so the owner names them here rather than the tool assuming
 /// a path.
-pub const OPTIONAL_PRODUCER_KEYS: [&str; 2] = ["declaration", "baseline"];
+pub const OPTIONAL_PRODUCER_KEYS: [&str; 3] = ["declaration", "baseline", "extra_test_args"];
 pub const REVISION_TIMEOUT_SECONDS: f64 = 30.0;
 pub const LOG_TAIL_LINES: usize = 20;
 
@@ -1504,14 +1504,47 @@ pub fn battery(args: &Args) -> (i32, Option<PathBuf>) {
             record.tree_id = tree_id;
             record.tree_id_source = tree_id_source;
         }
-        let run = match exec::run_producer(&command, crate_dir, &out_dir, args.quick, args.timeout)
-        {
-            Ok(run) => run,
-            Err(error) => {
-                eprintln!("mandate-check: error: {}: {error}", entry.id);
-                return (EXIT_EVIDENCE_FAILURE, None);
+        let mut run =
+            match exec::run_producer(&command, crate_dir, &out_dir, args.quick, args.timeout) {
+                Ok(run) => run,
+                Err(error) => {
+                    eprintln!("mandate-check: error: {}: {error}", entry.id);
+                    return (EXIT_EVIDENCE_FAILURE, None);
+                }
+            };
+        // A producer may keep opt-in evidence arms out of its default
+        // invocation (an `#[ignore]`d full-tier arm). The declared
+        // `extra_test_args` run the same target a second time; their output is
+        // appended to the log and their exit status joins the producer's, so a
+        // failed opt-in arm fails the run rather than being dropped. The
+        // supplement they write (`<mandate>_extra.json`/`.csv`) is merged into
+        // the mandate's evidence by `exec::render_mandate`.
+        if !entry.extra_test_args.is_empty() {
+            let extra_command = producers::producer_extra_command(&cargo, entry);
+            run.output.push_str(&format!(
+                "[mandate-check] opt-in evidence invocation: {}\n",
+                extra_command.join(" ")
+            ));
+            match exec::run_producer(
+                &extra_command,
+                crate_dir,
+                &out_dir,
+                args.quick,
+                args.timeout,
+            ) {
+                Ok(extra) => {
+                    run.output.push_str(&extra.output);
+                    if run.exit_code == Some(0) || run.exit_code.is_none() {
+                        run.exit_code = extra.exit_code;
+                    }
+                    run.timed_out |= extra.timed_out;
+                }
+                Err(error) => {
+                    eprintln!("mandate-check: error: {}: {error}", entry.id);
+                    return (EXIT_EVIDENCE_FAILURE, None);
+                }
             }
-        };
+        }
         codes.push(evaluate_producer(
             args,
             entry,

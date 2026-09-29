@@ -5567,10 +5567,14 @@ async fn m4_hostile_lane_p99_ceiling() {
 //     ceiling, so a fair-but-slow split (the bulk lane yielding capacity, but
 //     filling the bottleneck's queue while it does) is visible.
 //
-// Report-only. It asserts only the instrument's own sanity -- the competitor
-// saturates, the interactive samples are non-empty, and every interactive flow
-// delivered -- because the product bound must be derived from the first
-// measurement this arm produces, not guessed here. Its own fault namespace is
+// **Asserted:** the bulk lane's share against `M4_TCP_BULK_SHARE_FLOOR`, a
+// product bound derived from the arm's first measurement. **Reported, not
+// asserted:** the interactive tail, whose first reading is 2.1-3.1x M1's
+// ceiling -- a passing guard there would launder a real M1 breach as a pass, so
+// the ceiling is drawn on `M4-tcp_interactive_tail` and the breach is declared
+// as an open defect in `GATE.md` instead. The instrument's own sanity -- the
+// competitor saturates, the interactive samples are non-empty, and every
+// interactive flow delivered -- is asserted too. Its own fault namespace is
 // `M4_TCP_*`, so a probe of this arm cannot read as a probe of any other.
 
 /// The arm's fault selector, owned by this arm alone. `M4_TCP_STALL_BULK`
@@ -5602,6 +5606,19 @@ fn m4_tcp_fault() -> Option<String> {
 /// this arm produces is the input the product bound is derived from; the floor
 /// only has to catch a reference that stopped contesting.
 const M4_TCP_SATURATION_FLOOR: f64 = 0.5;
+
+/// The **product** bulk lane's share floor, asserted by [`m4_tcp_competition`]
+/// and drawn on the `tcp_bulk_share` panel. Derived from the arm's first
+/// measurement, not picked: the 12 s window on the pinned build reads the bulk
+/// lane's share of the two bulk flows as `0.349`, and the floor is that reading
+/// halved (`0.349 / 2 = 0.1745`) and rounded down to two decimals, `0.17`. The
+/// headroom is deliberate: the measured share passes at `2.05x` the floor, so
+/// run-to-run movement in a 12 s window cannot fail the bound, while the fault
+/// this arm's own namespace produces (`MANDATE_SMOKE_FAULT=M4_TCP_STALL_BULK`,
+/// bulk delivered bytes `0`, share `0.000`) fails it by `0.17`. It is a
+/// **presence** floor, not a fairness claim: the measured reading is `0.70x`
+/// the equal split, so a floor at the fair share would fail every run.
+const M4_TCP_BULK_SHARE_FLOOR: f64 = 0.17;
 
 /// The shared uplink's drop-tail buffer, in bytes. It must be **finite**: those
 /// drops are the loss signal the reference's multiplicative decrease acts on,
@@ -5941,29 +5958,123 @@ fn print_m4_tcp_arm(run: &M4TcpRun) {
     );
 }
 
+// ──────────────── M4/TCP: the panels the arm contributes to M4 ────────────────
+
+/// The M4/TCP panels, written into `M4_extra.json`/`M4_extra.csv` by
+/// [`write_supplement`]. They carry the arm's two readings as the mandate's own
+/// panels once `tools/mandate-check` merges the supplement into M4's evidence:
+///
+/// * `tcp_bulk_share` -- the product lane's share of the two bulk flows against
+///   the rtp AIMD reference's, with [`M4_TCP_BULK_SHARE_FLOOR`] drawn and
+///   labelled. This bound **is** asserted; the fault namespace's stall drives
+///   the share to `0.000` and fails it by name.
+/// * `tcp_interactive_tail` -- each interactive flow's p99 and max with M1's
+///   [`M1_CEILING_MS`] drawn and labelled. The ceiling is drawn and the reading
+///   stated, **not asserted**: the first measurement is `523`-`764` ms, i.e.
+///   `2.1`-`3.1x` the ceiling, and a passing "guard" above it would launder a
+///   real M1 breach as a pass (the workspace forbids that; see `GATE.md`). The
+///   open defect is declared beside the arm.
+///
+/// Panel series names are prefixed `tcp_` so they collide with neither M4's
+/// own run values (`clean_share_min`, `hostile_p99_guard`, ...) nor the
+/// plotter's per-arm guard vocabulary; the two panels' bounds are the ones the
+/// declaration's own labels name.
+fn m4_tcp_declaration() -> String {
+    let floor = M4_TCP_BULK_SHARE_FLOOR;
+    let ceiling = M1_CEILING_MS;
+    format!(
+        r#"{{"mandate":"M4","title":"M4/TCP: the bulk lane's share against a loss-based competitor, and the interactive tail it costs","x_label":"flow (1..{flows})","y_label":"value","panels":[{{"id":"tcp_bulk_share","chart":"bar","x_label":"bulk pair (1)","y_label":"share of the pair's delivered bytes","series":[{{"name":"tcp_bulk"}},{{"name":"tcp_competitor"}}],"bounds":[{{"y":{floor},"label":"M4/TCP bulk-share floor {floor}"}}]}},{{"id":"tcp_interactive_tail","chart":"bar","y_label":"latency (ms)","series":[{{"name":"tcp_tail99"}},{{"name":"tcp_peak"}}],"bounds":[{{"y":{ceiling},"label":"M1 ceiling {ceiling} ms"}}]}}]}}"#,
+        flows = M4_FLOWS,
+    )
+}
+
+fn m4_tcp_rows(run: &M4TcpRun) -> Vec<(String, String, f64, f64)> {
+    let competitor = 1.0 - run.bulk_share;
+    let mut rows = vec![
+        (
+            "tcp_bulk_share".to_owned(),
+            "tcp_bulk".to_owned(),
+            1.0,
+            run.bulk_share,
+        ),
+        (
+            "tcp_bulk_share".to_owned(),
+            "tcp_competitor".to_owned(),
+            1.0,
+            competitor,
+        ),
+    ];
+    for (index, flow) in run.flows.iter().enumerate() {
+        let x = (index + 1) as f64;
+        rows.push((
+            "tcp_interactive_tail".to_owned(),
+            "tcp_tail99".to_owned(),
+            x,
+            flow.summary.p99,
+        ));
+        rows.push((
+            "tcp_interactive_tail".to_owned(),
+            "tcp_peak".to_owned(),
+            x,
+            flow.summary.max,
+        ));
+    }
+    rows
+}
+
+/// Write one mandate's **supplement**: an opt-in arm's panels beside the
+/// mandate's own evidence (`{mandate}_extra.json`/`.csv`), the pair
+/// `tools/mandate-check` merges into `{mandate}.json`/`.csv` before it renders
+/// the mandate. The supplement is a separate file pair rather than an append to
+/// `{mandate}.json` because the base evidence is written by a different test in
+/// the same binary and neither may clobber the other.
+fn write_supplement(
+    dir: &Path,
+    mandate: &str,
+    declaration: &str,
+    rows: &[(String, String, f64, f64)],
+) {
+    std::fs::create_dir_all(dir)
+        .unwrap_or_else(|e| panic!("[{mandate}] cannot create evidence directory {dir:?}: {e}"));
+    std::fs::write(dir.join(format!("{mandate}_extra.json")), declaration)
+        .unwrap_or_else(|e| panic!("[{mandate}] cannot write supplement declaration: {e}"));
+    let mut csv = String::from("panel,series,x,y\n");
+    for (panel, series, x, y) in rows {
+        csv.push_str(&format!("{panel},{series},{x:.6},{y:.6}\n"));
+    }
+    std::fs::write(dir.join(format!("{mandate}_extra.csv")), csv)
+        .unwrap_or_else(|e| panic!("[{mandate}] cannot write supplement data CSV: {e}"));
+    eprintln!("[mandate-smoke] wrote {mandate}_extra.json + {mandate}_extra.csv into {dir:?}");
+}
+
 /// M4's missing half: the production bulk lane competing with a loss-based
 /// (TCP-family) flow for one bottleneck's queue, and the interactive lane's tail
 /// while it does.
 ///
-/// Report-only, so the deliverable is the printed pair of readings: the bulk
-/// lane's share against the reference (with the reference's saturation made
-/// visible so the share is meaningful), and each interactive flow's p99/max
-/// against M1's [`M1_CEILING_MS`]. The assertions are the instrument's own
-/// sanity only -- a positive offered count on every interactive flow, non-empty
-/// samples, both bulk flows present, and the reference pair saturating the
-/// shaper -- because the product bound is derived from this arm's first
-/// measurement, not fixed here.
+/// The deliverable is the printed pair of readings: the bulk lane's share
+/// against the reference (with the reference's saturation made visible so the
+/// share is meaningful), and each interactive flow's p99/max against M1's
+/// [`M1_CEILING_MS`]. It asserts the instrument's own sanity -- a positive
+/// offered count on every interactive flow, non-empty samples, both bulk flows
+/// present, and the reference pair saturating the shaper -- **and** one product
+/// bound, the bulk lane's share against [`M4_TCP_BULK_SHARE_FLOOR`], derived
+/// from this arm's first measurement. The interactive p99 is **reported, not
+/// asserted**: the first measurement is `523`-`764` ms, `2.1`-`3.1x` the
+/// ceiling, and a passing guard there would launder a real M1 breach as a pass.
+/// The ceiling is drawn on the `tcp_interactive_tail` panel and the breach is
+/// declared as an open defect in `GATE.md` instead.
 ///
 /// Vacuity: `MANDATE_SMOKE_FAULT=M4_TCP_STALL_BULK` stalls the mux bulk lane for
 /// the whole window, so its delivered-byte counter stays zero and the
-/// bulk-presence sanity fails by name while the rest of the reading still
-/// prints.
+/// bulk-share floor fails by name (`bulk_share=0.0000` against the `0.17`
+/// floor) while the rest of the reading still prints.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "report-only M4-family TCP-competition arm: the bulk lane vs an rtp AIMD reference on one shared shaper; ~20 s; run with --ignored --nocapture"]
+#[ignore = "asserts the bulk-share floor, reports the interactive tail: the bulk lane vs an rtp AIMD reference on one shared shaper; ~20 s; run with --ignored --nocapture"]
 async fn m4_tcp_competition() {
     let _serial = SERIAL.lock().await;
     let run = with_timeout(ARM_DEADLINE, "m4/tcp", run_m4_tcp_arm(WINDOW)).await;
     print_m4_tcp_arm(&run);
+    write_supplement(&out_dir(), "M4", &m4_tcp_declaration(), &m4_tcp_rows(&run));
     let samples: u64 = run.flows.iter().map(|f| f.summary.received).sum();
     let delivered_min = run
         .flows
@@ -6011,6 +6122,19 @@ async fn m4_tcp_competition() {
     assert!(
         run.comp_delivered > 0,
         "[m4-tcp] the rtp AIMD reference delivered {} bytes over the window: the loss-based competitor this arm measures the bulk lane against was not on the link",
+        run.comp_delivered,
+    );
+    assert!(
+        run.bulk_share >= M4_TCP_BULK_SHARE_FLOOR,
+        "[m4-tcp] the product bulk lane's share of the two bulk flows' delivered \
+         bytes is {:.4}, below the {M4_TCP_BULK_SHARE_FLOOR:.2} bulk-share floor \
+         (M4_TCP_BULK_SHARE_FLOOR, derived from the first measurement 0.349; the \
+         mux bulk lane delivered {} B against the reference's {} B): the lane \
+         competing for the bottleneck is not getting its share, and \
+         `MANDATE_SMOKE_FAULT=M4_TCP_STALL_BULK` drives exactly this reading to \
+         0.000",
+        run.bulk_share,
+        run.bulk_delivered,
         run.comp_delivered,
     );
     assert!(

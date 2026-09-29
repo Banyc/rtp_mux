@@ -315,9 +315,22 @@ pub fn render_mandate(
     run_censoring: Option<&str>,
     fault: Option<&str>,
 ) -> (Option<Json>, Vec<String>) {
-    let declaration = out_dir.join(format!("{mandate}.json"));
-    let data = out_dir.join(format!("{mandate}.csv"));
+    let mut declaration = out_dir.join(format!("{mandate}.json"));
+    let mut data = out_dir.join(format!("{mandate}.csv"));
     let mut problems = Vec::new();
+    // An opt-in (e.g. `#[ignore]`d) evidence arm writes its panels as
+    // `<mandate>_extra.json`/`.csv` beside the mandate's own evidence; merge the
+    // two so the mandate's panels carry both readings. A base with no supplement
+    // renders exactly as before.
+    if out_dir.join(format!("{mandate}_extra.json")).is_file() {
+        match merge_supplement(out_dir, mandate) {
+            Ok((merged, merged_csv)) => {
+                declaration = merged;
+                data = merged_csv;
+            }
+            Err(error) => return (None, vec![format!("{mandate}: {error}")]),
+        }
+    }
     for (path, kind) in [(&declaration, "declaration"), (&data, "data CSV")] {
         if !path.is_file() {
             problems.push(format!(
@@ -399,6 +412,83 @@ pub fn render_mandate(
             )],
         ),
     }
+}
+
+/// Merge an opt-in evidence arm's `<mandate>_extra.json`/`.csv` supplement into
+/// the mandate's declared evidence, writing `<mandate>.merged.json`/`.merged.csv`
+/// for the plotter. The base declaration keeps its mandate and axes; its title
+/// is extended so both panels' subjects are named on the merged face, its panels
+/// are followed by the supplement's, and the two CSVs are concatenated under one
+/// header. A panel id already present in the base is not added twice.
+fn merge_supplement(out_dir: &Path, mandate: &str) -> Result<(PathBuf, PathBuf), String> {
+    let base_json = out_dir.join(format!("{mandate}.json"));
+    let extra_json = out_dir.join(format!("{mandate}_extra.json"));
+    let base_csv = out_dir.join(format!("{mandate}.csv"));
+    let extra_csv = out_dir.join(format!("{mandate}_extra.csv"));
+    let mut declaration = json::parse_document(&base_json)
+        .map_err(|error| format!("cannot read {}: {error}", base_json.display()))?;
+    let supplement = json::parse_document(&extra_json)
+        .map_err(|error| format!("cannot read {}: {error}", extra_json.display()))?;
+    let base_panels: Vec<Json> = declaration
+        .get("panels")
+        .and_then(Json::as_array)
+        .map(<[Json]>::to_vec)
+        .unwrap_or_default();
+    let mut present: Vec<String> = base_panels
+        .iter()
+        .filter_map(|panel| panel.get("id").and_then(Json::as_str).map(str::to_string))
+        .collect();
+    let mut panels = base_panels;
+    for panel in supplement
+        .get("panels")
+        .and_then(Json::as_array)
+        .map(<[Json]>::to_vec)
+        .unwrap_or_default()
+    {
+        let id = panel
+            .get("id")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !present.contains(&id) {
+            present.push(id);
+            panels.push(panel);
+        }
+    }
+    let base_title = declaration
+        .get("title")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string();
+    let extra_title = supplement.get("title").and_then(Json::as_str).unwrap_or("");
+    let title = if extra_title.is_empty() {
+        base_title
+    } else {
+        format!("{base_title} + ({extra_title})")
+    };
+    if let Some(map) = declaration.as_object_mut() {
+        map.insert("panels".to_string(), Json::Array(panels));
+        map.insert("title".to_string(), Json::Str(title));
+    }
+    let merged_json = out_dir.join(format!("{mandate}.merged.json"));
+    std::fs::write(&merged_json, format!("{}\n", json::to_string(&declaration)))
+        .map_err(|error| format!("cannot write {}: {error}", merged_json.display()))?;
+    let mut csv = String::from("panel,series,x,y\n");
+    for path in [&base_csv, &extra_csv] {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        for line in text.lines() {
+            if line.trim().is_empty() || line.starts_with("panel,") {
+                continue;
+            }
+            csv.push_str(line);
+            csv.push('\n');
+        }
+    }
+    let merged_csv = out_dir.join(format!("{mandate}.merged.csv"));
+    std::fs::write(&merged_csv, csv)
+        .map_err(|error| format!("cannot write {}: {error}", merged_csv.display()))?;
+    Ok((merged_json, merged_csv))
 }
 
 /// Every written panel must exist, be non-empty, carry series geometry, and
@@ -636,6 +726,49 @@ mod tests {
                 .any(|problem| problem.contains("no series data")),
             "{problems:?}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A supplement's panels and rows are merged into the base evidence without
+    /// dropping either side, which is what makes the runner render a mandate's
+    /// own panels beside an opt-in arm's.
+    #[test]
+    fn a_supplement_is_merged_into_the_mandates_evidence() {
+        let dir = temp("merge");
+        std::fs::write(
+            dir.join("M4.json"),
+            r#"{"mandate":"M4","title":"M4 fairness","x_label":"flow (1..4)","y_label":"value","panels":[{"id":"shares","chart":"bar","series":[{"name":"clean"}],"bounds":[]}]}"#,
+        )
+        .expect("base declaration");
+        std::fs::write(
+            dir.join("M4.csv"),
+            "panel,series,x,y\nshares,clean,1,0.25\n",
+        )
+        .expect("base csv");
+        std::fs::write(
+            dir.join("M4_extra.json"),
+            r#"{"mandate":"M4","title":"M4/TCP","x_label":"flow (1..4)","y_label":"value","panels":[{"id":"tcp_bulk_share","chart":"bar","series":[{"name":"tcp_bulk"},{"name":"tcp_competitor"}],"bounds":[]}]}"#,
+        )
+        .expect("supplement declaration");
+        std::fs::write(
+            dir.join("M4_extra.csv"),
+            "panel,series,x,y\ntcp_bulk_share,tcp_bulk,1,0.349\ntcp_bulk_share,tcp_competitor,1,0.651\n",
+        )
+        .expect("supplement csv");
+        let (json_path, csv_path) = merge_supplement(&dir, "M4").expect("merge");
+        let document = json::parse_document(&json_path).expect("merged declaration");
+        let ids: Vec<&str> = document
+            .get("panels")
+            .and_then(Json::as_array)
+            .expect("panels")
+            .iter()
+            .filter_map(|panel| panel.get("id").and_then(Json::as_str))
+            .collect();
+        assert_eq!(ids, vec!["shares", "tcp_bulk_share"]);
+        let rows = std::fs::read_to_string(&csv_path).expect("merged csv");
+        assert!(rows.contains("shares,clean,1,0.25"), "{rows}");
+        assert!(rows.contains("tcp_bulk_share,tcp_bulk,1,0.349"), "{rows}");
+        assert_eq!(rows.matches("panel,series,x,y").count(), 1, "{rows}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
