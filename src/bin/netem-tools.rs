@@ -109,6 +109,17 @@ struct MandateCheck {
     /// run the battery only; do not archive or compare the run
     #[arg(long)]
     no_history: bool,
+    /// name a panel you opened and read, repeatably; the run marks every
+    /// rendered panel read or UNREAD by absolute path and refuses PASS when a
+    /// panel is not covered by a record you gave
+    #[arg(long = "panels-read", value_name = "PANEL")]
+    panels_read: Vec<String>,
+    /// a file of panel names you opened and read (one per line, `#` comments)
+    #[arg(long = "panels-read-file", value_name = "path")]
+    panels_read_file: Option<PathBuf>,
+    /// refuse PASS when no record of the panels that were read is present
+    #[arg(long = "require-panels-read")]
+    require_panels_read: bool,
     /// label this archived run with a name instead of its timestamp
     #[arg(long, value_name = "name")]
     history_label: Option<String>,
@@ -128,6 +139,9 @@ impl From<MandateCheck> for MandateCheckArgs {
             fault: cli.fault,
             no_history: cli.no_history,
             history_label: cli.history_label,
+            panels_read: cli.panels_read,
+            panels_read_file: cli.panels_read_file,
+            require_panels_read: cli.require_panels_read,
         }
     }
 }

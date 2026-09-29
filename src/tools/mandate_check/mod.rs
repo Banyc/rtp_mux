@@ -40,6 +40,7 @@ pub mod exec;
 pub mod history;
 pub mod lines;
 pub mod producers;
+pub mod receipt;
 pub mod timings;
 pub mod value;
 
@@ -201,6 +202,12 @@ pub struct Args {
     /// The wrapper's own flag: skip the archive/compare step.
     pub no_history: bool,
     pub history_label: Option<String>,
+    /// The panels the operator reports opening (`--panels-read`, repeatable).
+    pub panels_read: Vec<String>,
+    /// A file of panel names the operator reports opening.
+    pub panels_read_file: Option<PathBuf>,
+    /// `--require-panels-read`: refuse a run whose receipt is absent.
+    pub require_panels_read: bool,
 }
 
 impl Default for Args {
@@ -217,6 +224,9 @@ impl Default for Args {
             fault: None,
             no_history: false,
             history_label: None,
+            panels_read: Vec::new(),
+            panels_read_file: None,
+            require_panels_read: false,
         }
     }
 }
@@ -383,6 +393,9 @@ pub struct Report {
     pub censoring: BTreeMap<String, CensoringRecord>,
     pub delivery_granularity: BTreeMap<String, delivery::DeliveryReading>,
     pub arm_declaration: ArmDeclarationRecord,
+    /// The panel read-receipt: which rendered panels the operator reports
+    /// opening, and the refusals that leaves.
+    pub panels_receipt: Option<Json>,
     pub problems: Vec<String>,
 }
 
@@ -472,6 +485,10 @@ impl Report {
         map.insert(
             "delivery_granularity".to_string(),
             Json::Object(granularity),
+        );
+        map.insert(
+            "panels_receipt".to_string(),
+            self.panels_receipt.clone().unwrap_or(Json::Null),
         );
         map.insert(
             "arm_declaration".to_string(),
@@ -710,6 +727,7 @@ pub fn build_report(
             source: None,
             declared_cells: 0,
         },
+        panels_receipt: None,
         problems: Vec::new(),
     }
 }
@@ -1284,6 +1302,12 @@ pub fn verdict_block(report: &Report) -> Vec<String> {
     }
     let duration = report.duration_seconds;
     let order = &report.mandate_order;
+    if let Some(receipt) = &report.panels_receipt {
+        lines.extend(receipt::panel_lines(receipt));
+        if let Some(note) = receipt.get("note").and_then(Json::as_str) {
+            lines.push(note.to_string());
+        }
+    }
     let passed = order
         .iter()
         .filter(|mandate| {
@@ -1315,6 +1339,10 @@ pub fn verdict_block(report: &Report) -> Vec<String> {
             "{passed}/{} mandate(s) passed, {panels} plot(s)",
             order.len()
         )
+    };
+    let summary = match report.panels_receipt.as_ref().map(receipt::verdict_clause) {
+        Some(clause) => format!("{summary}, {clause}"),
+        None => summary,
     };
     lines.push(format!(
         "verdict: {}  exit={}  {summary}{}",
@@ -1552,6 +1580,27 @@ pub fn battery(args: &Args) -> (i32, Option<PathBuf>) {
     report.delivery_granularity = granularity;
     if !granularity_problems.is_empty() {
         report.problems.extend(granularity_problems);
+        codes.push(EXIT_EVIDENCE_FAILURE);
+    }
+    // The panel read record. It is resolved from the operator's own flags and
+    // files and evaluated last, so it can only escalate: an evidence failure
+    // refuses PASS, it never explains a mandate's failure away. What it makes
+    // mechanical is that an unread panel is *loud* in this run's output — every
+    // rendered panel is named by absolute path and marked `read` or `UNREAD` —
+    // not that anyone's eyes reached the pixels.
+    let rendered = receipt::rendered_panels(
+        &report
+            .mandates
+            .values()
+            .flat_map(|record| record.plots.iter().cloned())
+            .collect::<Vec<String>>(),
+    );
+    let (resolved, mut receipt_problems) = receipt::resolve(args, &out_dir);
+    let (receipt_record, evaluation_problems) = receipt::evaluate(&resolved, &rendered);
+    receipt_problems.extend(evaluation_problems);
+    report.panels_receipt = Some(receipt_record);
+    if !receipt_problems.is_empty() {
+        report.problems.extend(receipt_problems);
         codes.push(EXIT_EVIDENCE_FAILURE);
     }
     let exit_code = if codes.contains(&EXIT_EVIDENCE_FAILURE) {
