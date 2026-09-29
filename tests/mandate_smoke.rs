@@ -99,7 +99,7 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -5630,17 +5630,186 @@ const M4_TCP_BULK_SHARE_FLOOR: f64 = 0.17;
 /// than the queue growing without a loss to react to.
 const M4_TCP_SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
 
+/// The bottleneck's own queueing over one M4/TCP window, plus the interactive
+/// lane's client->server link counters. The shared-buffer backlog is sampled
+/// from [`BottleneckShaper::backlog_bytes`] while the window runs; its maximum
+/// is the largest queueing delay the bottleneck itself imposed (converted to
+/// time at [`SHARED_UP_RATE_BPS`]) and is the whole of term (a). The shaper's
+/// `dropped` counter is the tail-drop signal the reference's AIMD acts on; the
+/// interactive counters are its `NetemPair`'s c2s direction, read before the
+/// pair is stopped.
+#[derive(Clone, Copy, Debug, Default)]
+struct M4LinkEvidence {
+    shaper_max_backlog_bytes: u64,
+    shaper_mean_backlog_bytes: u64,
+    shaper_backlog_samples: u64,
+    shaper_dropped: u64,
+    interactive_received: u64,
+    interactive_forwarded: u64,
+    interactive_dropped: u64,
+}
+
+/// The interactive lane's repair activity over one window, read from an rtp
+/// metrics observer on the **client** connection (the same counters the crate's
+/// wire-measured repair ladder reads). `rungs` is `attempts + tail_probes`: one
+/// per repair transmission the send space fired. The reason fields name which
+/// evidence armed each rung; `armor_duplicates` counts the
+/// `RetransmissionArmorDuplicate` events (one per copy datagram actually
+/// written) and `parity_sent` is the FEC flush's cumulative parity datagrams.
+/// `max_write_waiters`/`max_in_flight` are the client-side send-path queue
+/// depth (term (c)): a writer awaiting the connection is a message held in the
+/// client's own egress before the shaper.
+#[derive(Clone, Copy, Debug, Default)]
+struct M4RepairEvidence {
+    rungs: u64,
+    first_attempts: u64,
+    repeat_attempts: u64,
+    rto_reason: u64,
+    reorder_reason: u64,
+    fast_loss_reason: u64,
+    pre_outage_reason: u64,
+    tail_probes: u64,
+    armor_duplicates: u64,
+    parity_sent: u64,
+    max_write_waiters: u64,
+    max_in_flight: u64,
+}
+
+/// Atomic cell written by [`m4_repair_observer`]. Cumulative counters are kept
+/// as running maxima so a reading cannot regress when the underlay is briefly
+/// backpressured; `rung_timeline` keeps one `base`-clock stamp per rung so a
+/// repair can be read against the message arrivals the sink reports.
+#[derive(Default)]
+struct M4RepairTaps {
+    rungs: AtomicU64,
+    first_attempts: AtomicU64,
+    repeat_attempts: AtomicU64,
+    rto_reason: AtomicU64,
+    reorder_reason: AtomicU64,
+    fast_loss_reason: AtomicU64,
+    pre_outage_reason: AtomicU64,
+    tail_probes: AtomicU64,
+    parity_sent: AtomicU64,
+    max_write_waiters: AtomicU64,
+    max_in_flight: AtomicU64,
+    armor_duplicates: AtomicU64,
+    rung_timeline: Mutex<Vec<f64>>,
+}
+
+impl M4RepairTaps {
+    fn repair(&self) -> M4RepairEvidence {
+        M4RepairEvidence {
+            rungs: self.rungs.load(Ordering::Relaxed),
+            first_attempts: self.first_attempts.load(Ordering::Relaxed),
+            repeat_attempts: self.repeat_attempts.load(Ordering::Relaxed),
+            rto_reason: self.rto_reason.load(Ordering::Relaxed),
+            reorder_reason: self.reorder_reason.load(Ordering::Relaxed),
+            fast_loss_reason: self.fast_loss_reason.load(Ordering::Relaxed),
+            pre_outage_reason: self.pre_outage_reason.load(Ordering::Relaxed),
+            tail_probes: self.tail_probes.load(Ordering::Relaxed),
+            armor_duplicates: self.armor_duplicates.load(Ordering::Relaxed),
+            parity_sent: self.parity_sent.load(Ordering::Relaxed),
+            max_write_waiters: self.max_write_waiters.load(Ordering::Relaxed),
+            max_in_flight: self.max_in_flight.load(Ordering::Relaxed),
+        }
+    }
+
+    fn rung_times(&self) -> Vec<f64> {
+        self.rung_timeline.lock().unwrap().clone()
+    }
+}
+
+/// An observer on the interactive lane's **client** connection that records the
+/// repair counters and the client-side send-path queue depth. A state snapshot
+/// is taken on each application-frame write (`SendFrameBuffer`), each received
+/// ACK (`ReceiveAckPacket`) and each RTT sample, which brackets every rung the
+/// send space fires to within the interactive cadence. The
+/// `RetransmissionArmorDuplicate` event is counted without a snapshot: rtp
+/// emits exactly one per copy datagram, and the copy is already on the wire.
+/// Every rung is stamped on the arm's own `base` clock, so a repair can be read
+/// against the message arrivals the sink reports on that same clock.
+fn m4_repair_observer(base: Instant) -> (MetricsObserver, Arc<M4RepairTaps>) {
+    let taps = Arc::new(M4RepairTaps::default());
+    let observer = MetricsObserver::selective(
+        |event, _elapsed| match event {
+            MetricsEvent::RetransmissionArmorDuplicate => MetricsInterest::EventOnly,
+            MetricsEvent::SendFrameBuffer
+            | MetricsEvent::ReceiveAckPacket
+            | MetricsEvent::RttSample => MetricsInterest::Snapshot,
+            _ => MetricsInterest::Skip,
+        },
+        {
+            let taps = Arc::clone(&taps);
+            move |observation: MetricsObservation| {
+                if observation.event == MetricsEvent::RetransmissionArmorDuplicate {
+                    taps.armor_duplicates.fetch_add(1, Ordering::Relaxed);
+                }
+                let Some(snapshot) = observation.snapshot else {
+                    return;
+                };
+                let counters = snapshot.retransmission_counters;
+                let rungs = counters.attempts + counters.tail_probes;
+                let prior = taps.rungs.fetch_max(rungs, Ordering::Relaxed);
+                if rungs > prior {
+                    taps.rung_timeline
+                        .lock()
+                        .unwrap()
+                        .push(base.elapsed().as_secs_f64());
+                }
+                taps.first_attempts
+                    .fetch_max(counters.first_attempts, Ordering::Relaxed);
+                taps.repeat_attempts
+                    .fetch_max(counters.repeat_attempts, Ordering::Relaxed);
+                taps.rto_reason
+                    .fetch_max(counters.rto_reason, Ordering::Relaxed);
+                taps.reorder_reason
+                    .fetch_max(counters.reorder_reason, Ordering::Relaxed);
+                taps.fast_loss_reason
+                    .fetch_max(counters.fast_loss_reason, Ordering::Relaxed);
+                taps.pre_outage_reason
+                    .fetch_max(counters.pre_outage_reason, Ordering::Relaxed);
+                taps.tail_probes
+                    .fetch_max(counters.tail_probes, Ordering::Relaxed);
+                if let Some(fec) = snapshot.fec_counters {
+                    taps.parity_sent
+                        .fetch_max(fec.parity_sent, Ordering::Relaxed);
+                }
+                taps.max_write_waiters
+                    .fetch_max(snapshot.application_write_waiters as u64, Ordering::Relaxed);
+                taps.max_in_flight
+                    .fetch_max(snapshot.in_flight_packets as u64, Ordering::Relaxed);
+            }
+        },
+    );
+    (observer, taps)
+}
+
 /// One interactive flow's outcome on the competing lane: what it offered, what
-/// it got back, and the latency summary its tail bound is read from.
+/// it got back, and the latency summary its tail bound is read from, plus the
+/// split of its samples at the no-loss ceiling the arm measured
+/// (`min_latency + shaper_max_queue_ms`). A sample at or below the ceiling is
+/// explainable by propagation plus the bottleneck's own largest queue; a sample
+/// above it cannot be, and its extra latency is a repair that unblocked the
+/// stream.
 struct M4TcpFlow {
     tag: u8,
     sent: u64,
     received: u64,
     summary: HolSummary,
+    min_ms: f64,
+    ceiling_ms: f64,
+    no_repair_count: u64,
+    no_repair_p50: f64,
+    no_repair_p99: f64,
+    repaired_count: u64,
+    repaired_p50: f64,
+    repaired_p99: f64,
+    repaired_max: f64,
 }
 
 /// One M4/TCP arm's outcome: the two bulk flows' delivered bytes and the share
-/// and saturation they imply, plus the interactive flows that share their queue.
+/// and saturation they imply, plus the interactive flows that share their queue
+/// and the measured evidence the tail is decomposed from.
 struct M4TcpRun {
     flows: Vec<M4TcpFlow>,
     /// Bytes the product's mux bulk lane delivered to its sink over the window.
@@ -5655,6 +5824,15 @@ struct M4TcpRun {
     comp_fraction: f64,
     /// The two bulk flows' aggregate as a fraction of the shaper's capacity.
     aggregate_fraction: f64,
+    /// Term (a): the largest queueing delay the shared bottleneck imposed over
+    /// the window, in ms, from the sampled backlog and [`SHARED_UP_RATE_BPS`].
+    shaper_max_queue_ms: f64,
+    /// The bottleneck's own counters and the interactive lane's c2s counters.
+    link: M4LinkEvidence,
+    /// Term (b): the interactive lane's repair activity over the window.
+    repair: M4RepairEvidence,
+    /// The `base`-clock stamp of every rung the interactive lane fired.
+    rung_times: Vec<f64>,
     window: Duration,
     wall: Duration,
 }
@@ -5694,6 +5872,7 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
     let int_rtp = LaneRtpConfig::frame_reordering(true, prompt_tuning());
     let bulk_rtp = LaneRtpConfig::production_bulk();
     let base = Instant::now();
+    let (repair_observer, repair_taps) = m4_repair_observer(base);
     let mut tasks = TestScope::new();
     let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
     let outcome = tasks
@@ -5712,6 +5891,35 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
             // packets queue behind the two bulk flows, which is the cost this
             // arm exists to measure.
             let shaper = BottleneckShaper::new(SHARED_UP_RATE_BPS, M4_TCP_SHAPER_LIMIT_BYTES);
+            // Sample the shared buffer's own backlog for the whole window: the
+            // largest value is the largest queueing delay the bottleneck itself
+            // imposed, and its mean is the queue the interactive lane lived in.
+            // The sampler is a scoped test task, so a panic in it is caught and
+            // a forgotten stop cannot outlive the arm's scope.
+            let shaper_backlog_max = Arc::new(AtomicU64::new(0));
+            let shaper_backlog_sum = Arc::new(AtomicU64::new(0));
+            let shaper_backlog_samples = Arc::new(AtomicU64::new(0));
+            let shaper_sampler_stop = Arc::new(AtomicBool::new(false));
+            {
+                let shaper = shaper.clone();
+                let max = Arc::clone(&shaper_backlog_max);
+                let sum = Arc::clone(&shaper_backlog_sum);
+                let count = Arc::clone(&shaper_backlog_samples);
+                let stop = Arc::clone(&shaper_sampler_stop);
+                let task_tx_sampler = task_tx.clone();
+                submit_test_task(
+                    &task_tx_sampler,
+                    Box::pin(async move {
+                        while !stop.load(Ordering::Relaxed) {
+                            let backlog = shaper.backlog_bytes(Instant::now());
+                            max.fetch_max(backlog, Ordering::Relaxed);
+                            sum.fetch_add(backlog, Ordering::Relaxed);
+                            count.fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    }),
+                );
+            }
             let int_pair = NetemPair::spawn_shared(
                 int_addr,
                 link(41, OWD, JITTER, 0, 0),
@@ -5742,7 +5950,7 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
                 bulk_pair.client_addr(),
                 int_rtp,
                 bulk_rtp,
-                None,
+                Some(repair_observer.clone()),
                 None,
                 Some(rtp::cc::CcSignalHub::new()),
             )
@@ -5839,6 +6047,21 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
             };
             let (sent_per_flow, (), ()) = tokio::join!(interactive, bulk_fut, comp_fut);
 
+            // The shaper's own queue is read before the pairs are stopped, at
+            // the same point in the run as the latency samples. Stop the
+            // sampler first so its maximum cannot pick up the post-window
+            // drain.
+            shaper_sampler_stop.store(true, Ordering::Relaxed);
+            let shaper_max_backlog = shaper_backlog_max.load(Ordering::Relaxed);
+            let shaper_backlog_sample_count = shaper_backlog_samples.load(Ordering::Relaxed);
+            let shaper_mean_backlog = if shaper_backlog_sample_count == 0 {
+                0
+            } else {
+                shaper_backlog_sum.load(Ordering::Relaxed) / shaper_backlog_sample_count
+            };
+            let shaper_dropped = shaper.dropped();
+            let int_c2s = int_pair.stats_c2s();
+
             for (_, write) in streams.iter_mut() {
                 let _ = write.shutdown();
             }
@@ -5853,27 +6076,89 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
             int_pair.stop();
             bulk_pair.stop();
             comp_pair.stop();
-            (sent_per_flow, samples, bulk_delivered, comp_delivered)
+            (
+                sent_per_flow,
+                samples,
+                bulk_delivered,
+                comp_delivered,
+                shaper_max_backlog,
+                shaper_mean_backlog,
+                shaper_backlog_sample_count,
+                shaper_dropped,
+                int_c2s,
+            )
         })
         .await;
-    let (sent_per_flow, samples, bulk_delivered, comp_delivered) = outcome;
+    let (
+        sent_per_flow,
+        samples,
+        bulk_delivered,
+        comp_delivered,
+        shaper_max_backlog,
+        shaper_mean_backlog,
+        shaper_backlog_sample_count,
+        shaper_dropped,
+        int_c2s,
+    ) = outcome;
 
-    let mut per_flow: Vec<Vec<f64>> = vec![Vec::new(); M4_FLOWS];
-    for (tag, _elapsed, latency) in samples.iter().copied() {
+    // Term (a): the shaper's own queue, in ms. A message can queue behind the
+    // bulk flows for at most this long; the ceiling the samples are split at
+    // adds it to the flow's own measured floor, which is the firmest bound the
+    // arm's own evidence supports on a message no repair touched.
+    let shaper_max_queue_ms = if SHARED_UP_RATE_BPS > 0 {
+        shaper_max_backlog as f64 * 8.0 * 1000.0 / SHARED_UP_RATE_BPS as f64
+    } else {
+        0.0
+    };
+
+    let mut per_flow: Vec<Vec<(f64, f64)>> = vec![Vec::new(); M4_FLOWS];
+    for (tag, elapsed, latency) in samples.iter().copied() {
         if let Some(flow) = (0..M4_FLOWS).find(|&i| m4_flow_tag(i) == tag) {
-            per_flow[flow].push(latency);
+            per_flow[flow].push((elapsed, latency));
         }
     }
     let mut flows = Vec::with_capacity(M4_FLOWS);
-    for (flow, samples) in per_flow.into_iter().enumerate() {
+    for (flow, raw) in per_flow.into_iter().enumerate() {
         let sent = sent_per_flow.get(flow).copied().unwrap_or(0);
-        let received = samples.len() as u64;
-        let summary = summarize(samples, sent, received, 0, 0.0);
+        let received = raw.len() as u64;
+        let min_ms = raw
+            .iter()
+            .map(|(_, latency)| *latency)
+            .fold(f64::INFINITY, f64::min);
+        let ceiling_ms = if min_ms.is_finite() {
+            min_ms + shaper_max_queue_ms
+        } else {
+            f64::INFINITY
+        };
+        let mut no_repair: Vec<f64> = Vec::new();
+        let mut repaired: Vec<f64> = Vec::new();
+        for (_, latency) in raw.iter().copied() {
+            if latency <= ceiling_ms {
+                no_repair.push(latency);
+            } else {
+                repaired.push(latency);
+            }
+        }
+        let no_repair_count = no_repair.len() as u64;
+        let no_repair_summary = summarize(no_repair, no_repair_count, no_repair_count, 0, 0.0);
+        let repaired_count = repaired.len() as u64;
+        let repaired_summary = summarize(repaired, repaired_count, repaired_count, 0, 0.0);
+        let all: Vec<f64> = raw.iter().map(|(_, latency)| *latency).collect();
+        let summary = summarize(all, sent, received, 0, 0.0);
         flows.push(M4TcpFlow {
             tag: m4_flow_tag(flow),
             sent,
             received,
             summary,
+            min_ms,
+            ceiling_ms,
+            no_repair_count,
+            no_repair_p50: no_repair_summary.p50,
+            no_repair_p99: no_repair_summary.p99,
+            repaired_count,
+            repaired_p50: repaired_summary.p50,
+            repaired_p99: repaired_summary.p99,
+            repaired_max: repaired_summary.max,
         });
     }
     // The shaper's serialization capacity over the window, in bytes. The
@@ -5904,6 +6189,18 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
         bulk_share,
         comp_fraction,
         aggregate_fraction,
+        shaper_max_queue_ms,
+        link: M4LinkEvidence {
+            shaper_max_backlog_bytes: shaper_max_backlog,
+            shaper_mean_backlog_bytes: shaper_mean_backlog,
+            shaper_backlog_samples: shaper_backlog_sample_count,
+            shaper_dropped,
+            interactive_received: int_c2s.received,
+            interactive_forwarded: int_c2s.forwarded,
+            interactive_dropped: int_c2s.dropped,
+        },
+        repair: repair_taps.repair(),
+        rung_times: repair_taps.rung_times(),
         window,
         wall: wall.elapsed(),
     }
@@ -5956,6 +6253,105 @@ fn print_m4_tcp_arm(run: &M4TcpRun) {
         window = run.window,
         wall = run.wall.as_secs_f64(),
     );
+    // Term (a): the bottleneck's own queue, sampled while the window ran.
+    eprintln!(
+        "[m4-decomp shaper] max_backlog_bytes={mb} max_queue_ms={mq:.1} \
+         mean_backlog_bytes={mean} backlog_samples={ns} dropped={sd} \
+         interactive_received={ir} interactive_forwarded={ifw} interactive_dropped={idp}",
+        mb = run.link.shaper_max_backlog_bytes,
+        mq = run.shaper_max_queue_ms,
+        mean = run.link.shaper_mean_backlog_bytes,
+        ns = run.link.shaper_backlog_samples,
+        sd = run.link.shaper_dropped,
+        ir = run.link.interactive_received,
+        ifw = run.link.interactive_forwarded,
+        idp = run.link.interactive_dropped,
+    );
+    // Term (b): the interactive lane's repair activity, read from the client
+    // connection's own metrics observer. The reason fields name the evidence
+    // that armed each rung; the rung timeline is the `base`-clock stamp of each
+    // one, and the last field is how many stamps were kept.
+    let repair = run.repair;
+    eprintln!(
+        "[m4-decomp repair] rungs={rungs} first={first} repeat={repeat} rto={rto} \
+         reorder={reorder} fast_loss={fast_loss} pre_outage={pre_outage} \
+         tail_probes={tail} armor_duplicates={armor} parity_sent={parity} \
+         max_write_waiters={waiters} max_in_flight={inflight} rung_times_kept={nrt}",
+        rungs = repair.rungs,
+        first = repair.first_attempts,
+        repeat = repair.repeat_attempts,
+        rto = repair.rto_reason,
+        reorder = repair.reorder_reason,
+        fast_loss = repair.fast_loss_reason,
+        pre_outage = repair.pre_outage_reason,
+        tail = repair.tail_probes,
+        armor = repair.armor_duplicates,
+        parity = repair.parity_sent,
+        waiters = repair.max_write_waiters,
+        inflight = repair.max_in_flight,
+        nrt = run.rung_times.len(),
+    );
+    // The per-flow split at the no-loss ceiling.
+    for flow in &run.flows {
+        eprintln!(
+            "[m4-decomp flow {tag}] min={min:6.1} ceiling={ceil:6.1} \
+             no_repair n={nr:>4} p50={nrp50:6.1} p99={nrp99:6.1} \
+             repaired n={rp:>4} p50={rpp50:6.1} p99={rpp99:6.1} max={rpmax:7.1} \
+             repaired_share={share:.3}",
+            tag = flow.tag as char,
+            min = flow.min_ms,
+            ceil = flow.ceiling_ms,
+            nr = flow.no_repair_count,
+            nrp50 = flow.no_repair_p50,
+            nrp99 = flow.no_repair_p99,
+            rp = flow.repaired_count,
+            rpp50 = flow.repaired_p50,
+            rpp99 = flow.repaired_p99,
+            rpmax = flow.repaired_max,
+            share = flow.repaired_count as f64 / flow.received.max(1) as f64,
+        );
+    }
+    // The decomposition of the interactive p99. The queue's share is capped at
+    // the shaper's own measured maximum because a message cannot wait longer
+    // than the buffer it is queued in; the residue above `floor + queue` is the
+    // part only a repair can explain. Client-side waiters are reported beside
+    // it: if the send path never blocked, term (c) is not material and the
+    // split stands.
+    let floor_ms = run
+        .flows
+        .iter()
+        .map(|flow| flow.min_ms)
+        .fold(f64::INFINITY, f64::min);
+    let p99_ms = run
+        .flows
+        .iter()
+        .map(|flow| flow.summary.p99)
+        .fold(0.0, f64::max);
+    let p99_excess = (p99_ms - floor_ms).max(0.0);
+    let queue_attributable = run.shaper_max_queue_ms.min(p99_excess);
+    let repair_attributable = (p99_excess - queue_attributable).max(0.0);
+    let dominant = if repair_attributable > queue_attributable {
+        "loss-repair(b)"
+    } else {
+        "bottleneck-queue(a)"
+    };
+    let repaired_total: u64 = run.flows.iter().map(|flow| flow.repaired_count).sum();
+    let received_total: u64 = run.flows.iter().map(|flow| flow.received).sum();
+    eprintln!(
+        "[m4-decomp total] floor_ms={floor:.1} p99_ms={p99:.1} p99_excess_ms={excess:.1} \
+         shaper_queue_attributable_ms={qs:.1} repair_attributable_ms={rs:.1} \
+         repaired_samples={rep}/{recv} client_waiters={waiters} client_in_flight={inflight} \
+         dominant={dominant}",
+        floor = floor_ms,
+        p99 = p99_ms,
+        excess = p99_excess,
+        qs = queue_attributable,
+        rs = repair_attributable,
+        rep = repaired_total,
+        recv = received_total,
+        waiters = run.repair.max_write_waiters,
+        inflight = run.repair.max_in_flight,
+    );
 }
 
 // ──────────────── M4/TCP: the panels the arm contributes to M4 ────────────────
@@ -5983,7 +6379,7 @@ fn m4_tcp_declaration() -> String {
     let floor = M4_TCP_BULK_SHARE_FLOOR;
     let ceiling = M1_CEILING_MS;
     format!(
-        r#"{{"mandate":"M4","title":"M4/TCP: the bulk lane's share against a loss-based competitor, and the interactive tail it costs","x_label":"flow (1..{flows})","y_label":"value","panels":[{{"id":"tcp_bulk_share","chart":"bar","x_label":"bulk pair (1)","y_label":"share of the pair's delivered bytes","series":[{{"name":"tcp_bulk"}},{{"name":"tcp_competitor"}}],"bounds":[{{"y":{floor},"label":"M4/TCP bulk-share floor {floor}"}}]}},{{"id":"tcp_interactive_tail","chart":"bar","y_label":"latency (ms)","series":[{{"name":"tcp_tail99"}},{{"name":"tcp_peak"}}],"bounds":[{{"y":{ceiling},"label":"M1 ceiling {ceiling} ms"}}]}}]}}"#,
+        r#"{{"mandate":"M4","title":"M4/TCP: the bulk lane's share against a loss-based competitor, and the interactive tail it costs","x_label":"flow (1..{flows})","y_label":"value","panels":[{{"id":"tcp_bulk_share","chart":"bar","x_label":"bulk pair (1)","y_label":"share of the pair's delivered bytes","series":[{{"name":"tcp_bulk"}},{{"name":"tcp_competitor"}}],"bounds":[{{"y":{floor},"label":"M4/TCP bulk-share floor {floor}"}}]}},{{"id":"tcp_interactive_tail","chart":"bar","y_label":"latency (ms)","series":[{{"name":"tcp_tail99"}},{{"name":"tcp_peak"}}],"bounds":[{{"y":{ceiling},"label":"M1 ceiling {ceiling} ms"}}]}},{{"id":"tcp_decomp","chart":"bar","x_label":"flow (1..{flows})","y_label":"latency (ms)","series":[{{"name":"tcp_no_repair_tail99"}},{{"name":"tcp_repaired_tail99"}},{{"name":"tcp_no_loss_ceiling"}}],"bounds":[{{"y":{ceiling},"label":"M1 ceiling {ceiling} ms"}}]}}]}}"#,
         flows = M4_FLOWS,
     )
 }
@@ -6017,6 +6413,24 @@ fn m4_tcp_rows(run: &M4TcpRun) -> Vec<(String, String, f64, f64)> {
             "tcp_peak".to_owned(),
             x,
             flow.summary.max,
+        ));
+        rows.push((
+            "tcp_decomp".to_owned(),
+            "tcp_no_repair_tail99".to_owned(),
+            x,
+            flow.no_repair_p99,
+        ));
+        rows.push((
+            "tcp_decomp".to_owned(),
+            "tcp_repaired_tail99".to_owned(),
+            x,
+            flow.repaired_p99,
+        ));
+        rows.push((
+            "tcp_decomp".to_owned(),
+            "tcp_no_loss_ceiling".to_owned(),
+            x,
+            flow.ceiling_ms,
         ));
     }
     rows
@@ -6063,6 +6477,32 @@ fn write_supplement(
 /// ceiling, and a passing guard there would launder a real M1 breach as a pass.
 /// The ceiling is drawn on the `tcp_interactive_tail` panel and the breach is
 /// declared as an open defect in `GATE.md` instead.
+///
+/// The arm also **decomposes** that tail, from its own instruments, into the
+/// three additive terms a sender can or cannot move:
+///
+/// * **(a) bottleneck queueing** -- the shared shaper's own backlog, sampled
+///   while the window runs; its maximum, at [`SHARED_UP_RATE_BPS`], is the
+///   longest a message can wait in the buffer, and is drawn beside the arm's
+///   tail panels on `tcp_decomp` as `tcp_no_loss_ceiling`;
+/// * **(b) loss repair** -- an rtp metrics observer on the interactive lane's
+///   client connection counts the repair rungs and their reasons, and each
+///   flow's samples are split at the no-loss ceiling
+///   (`flow_min_latency + shaper_max_queue_ms`): samples above it cannot be
+///   propagation plus the bottleneck's queue, so their excess is a repair;
+/// * **(c) client-side queueing** -- the connection's own
+///   `application_write_waiters`/`in_flight_packets`, sampled by the same
+///   observer. If the send path never blocked, no message waited in the
+///   client's egress.
+///
+/// The floor of the split is the flow's own minimum latency and the queue term
+/// is the shaper's own measured maximum, so the split rests on two measurements,
+/// not on a constant. The `tcp_decomp` panel draws the no-repair and repaired
+/// p99 beside that ceiling; when repair dominates, `bottleneck-queue(a)` versus
+/// `loss-repair(b)` is printed on the `[m4-decomp total]` line. The interactive
+/// p99 itself remains **unasserted** -- its first reading is still 2.2-2.8x the
+/// ceiling, and the decomposition is evidence about the defect, not a licence to
+/// assert it.
 ///
 /// Vacuity: `MANDATE_SMOKE_FAULT=M4_TCP_STALL_BULK` stalls the mux bulk lane for
 /// the whole window, so its delivered-byte counter stays zero and the
@@ -6149,6 +6589,28 @@ async fn m4_tcp_competition() {
         run.aggregate_fraction,
         (SHARED_UP_RATE_BPS as f64 / 8.0) * run.window.as_secs_f64(),
         run.bulk_share,
+    );
+    // The decomposition's own instruments must have measured something, or a
+    // zero would read as "no queue, no repair". The backlog sampler ran, the
+    // interactive link counters were read, and -- unless the bottleneck never
+    // dropped a datagram, in which case no repair is owed -- the repair observer
+    // saw a rung fire. Instrument sanity, not product bounds: the interactive
+    // tail itself stays reported and unasserted.
+    assert!(
+        run.link.shaper_backlog_samples > 0,
+        "[m4-tcp] the shaper-backlog sampler took {} sample(s): a zero backlog series would make the queueing term (a) read as zero whether or not the bottleneck queued",
+        run.link.shaper_backlog_samples,
+    );
+    assert!(
+        run.link.interactive_received > 0,
+        "[m4-tcp] the interactive lane's c2s link received {} datagram(s): the link counters the decomposition reads were not wired",
+        run.link.interactive_received,
+    );
+    assert!(
+        run.repair.rungs > 0 || run.link.shaper_dropped == 0,
+        "[m4-tcp] the interactive repair observer saw {} rung(s) while the shared shaper tail-dropped {} datagram(s): drops occurred but no repair was observed, so the repair term (b) would read as zero from a detached observer",
+        run.repair.rungs,
+        run.link.shaper_dropped,
     );
 }
 
