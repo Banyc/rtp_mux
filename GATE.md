@@ -134,6 +134,52 @@ after another. Its per-flow numbers are therefore single-flow numbers
 repeated, and no scheduler that starves a flow while another is active can
 move them.
 
+### M4/TCP: what competing with a loss-based flow costs the interactive lane
+
+M4 runs the bulk lane **idle**, so no arm in this file measures the trade the
+product makes the moment that lane competes. `mandate_smoke::m4_tcp_competition`
+(`full` tier, report-only) adds the missing half: the production dual-lane mux
+client with its bulk lane **saturating** one shared `BottleneckShaper`,
+alongside an `rtp` connection running the test-only AIMD reference law
+(`reference_aimd = true`) on the same shaper. The interactive lane carries
+M4's four-flow cadence and runs with the real cross-lane `CcSignalHub`, so the
+bulk lane's path reads `shared` and its delay-first controller yields — the
+production behaviour whose cost this arm measures. It reads **both** quantities
+the trade is made of, and neither may be omitted: the bulk lane's delivered
+share against the competitor, with the pair's aggregate as a fraction of the
+shaper's capacity so the competitor is seen to saturate; and each interactive
+flow's p99/max against M1's 250 ms ceiling, so a fair-but-slow split is
+visible.
+
+The arm's first measurement (12 s window, `rtp v0.0.106`, the pinned build, a
+128 KiB shared drop-tail buffer) reads bulk share `0.349`, competitor `0.505`
+of the shaper, the two bulk flows' aggregate `0.776` (all three flows over the
+queue `0.945`), and per-flow interactive p99 `523`–`764` ms with max up to
+`805` ms — i.e. **2.1–3.1× M1's 250 ms ceiling** while the bulk lane takes
+`0.349` and the reference `0.651` of their pair. That is the unmeasured cost
+this arm exists to surface, and it is why the arm is report-only: the product
+bound is derived from this reading, not asserted here.
+
+Two honest caveats travel with the row. **The competitor is an `rtp` AIMD
+reference running inside `rtp`'s own feedback loop, not wire TCP** — it is a
+loss-based additive-increase/multiplicative-decrease law sharing the
+`BottleneckShaper`, so it measures the delay-first lane's response to a
+TCP-family competitor, not to a real peer's stack. **The shaper has a finite
+128 KiB drop-tail buffer and the three links add no random loss**: those
+overflow drops are the loss signal the reference's multiplicative decrease acts
+on, so it is a loss-based competitor rather than a greedy flow. An unbounded
+(loss-free) queue leaves the reference with nothing to back off on, and the
+interactive tail then measures queue growth without bound rather than a
+competitor's backoff (measured `1015` ms, `4.1×` the ceiling, with the buffer at
+`0`) — which is not the TCP-family competitor this arm is about.
+
+Its vacuity is its own fault namespace: `MANDATE_SMOKE_FAULT=M4_TCP_STALL_BULK`
+writes nothing on the mux bulk lane for the window, so its delivered-byte
+counter stays zero and the arm's bulk-presence sanity fails by name while the
+competitor's saturation, the interactive delivery and every latency still
+print (measured: `bulk_share=0.0000` at `bulk_delivered=0`, the arm's own
+`FAIL` line emitted before the panic).
+
 ### Declared perf rows
 
 The rows below declare twenty-six families in the `gate-perf-design` grammar:
@@ -241,6 +287,7 @@ mandate_smoke::m1_lone_tail_rung_distribution = full | 75 | composite(depth,impa
 mandate_smoke::m1_lone_tail_loss_model = full | 150 | composite(depth,impairment,metric)@lone-tail | lone-tail@lane=dual+shape=request-response+depth=1+impairment=owd25-iid5pct-vs-ge5pct-mean8-jitter100ms+metric=rung-count-vs-loss-model
 mandate_smoke::probe_m4_clean_band_composition = perf | 12 | baseline@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=loss2pct-iid+jitter=5ms+metric=tail-band-composition
 mandate_smoke::probe_m4_clean_band_composition_noloss = perf | 12 | orthogonal@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=none+metric=tail-band-composition
+mandate_smoke::m4_tcp_competition = full | 17 | composite(flows,load,mechanism,metric,shaper)@constitution | M4@lane=dual+shape=cadence+flows=4+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=loss-based-competitor+metric=bulk-share-and-interactive-tail
 hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
 hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
 hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
@@ -2551,6 +2598,7 @@ mandate_smoke::m1_lone_tail_rung_distribution = full
 mandate_smoke::m1_lone_tail_cover_wire = full
 mandate_smoke::probe_m4_clean_band_composition = perf
 mandate_smoke::probe_m4_clean_band_composition_noloss = perf
+mandate_smoke::m4_tcp_competition = full
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
 rtp_mux::rtp_mux_explorer_relays_onto_better_path = full
@@ -2718,6 +2766,7 @@ mandate_smoke::m4_interactive_lane_fairness
 mandate_smoke::m4_clean_lane_p99_ceiling
 mandate_smoke::m4_clean_lane_fair_latency
 mandate_smoke::m4_hostile_lane_p99_ceiling
+mandate_smoke::m4_tcp_competition
 ```
 
 ## Perf-tier reach into asserting helpers

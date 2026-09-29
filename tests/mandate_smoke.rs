@@ -112,6 +112,7 @@ use netem_test::kit::stats::{HolSummary, summarize};
 use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
 use netem_test::{BottleneckShaper, LossModel, NetemConfig, NetemPair};
 use rtp::metrics::{MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver};
+use rtp::testkit::rtp::{spawn_rtp_bulk_upload_with_options_via, spawn_rtp_byte_sink_server_via};
 use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
     dual_mux_client_connect_lane_rtp_via_cc_link,
@@ -5546,6 +5547,484 @@ async fn m4_hostile_lane_p99_ceiling() {
         p99_max <= M4_HOSTILE_P99_CEILING_MS,
         "[M4 hostile level] the four-flow hostile lane's p99 {p99_max:.1} ms exceeds its {M4_HOSTILE_P99_CEILING_MS:.1} ms ceiling (p50 {p50_max:.1}, per-flow p99 {:?}): the production shape runs {M4_FLOWS} flows on the one interactive lane, and its hostile tail is bounded only by M4's loose {M1_HOSTILE_P99_GUARD_MS:.0} ms per-flow guard -- a level regression past {M4_HOSTILE_P99_CEILING_MS:.1} ms (1.07x the recorded worst, {guard_tighter:.2}x tighter than that guard) is a product regression M1's one-flow clean arm cannot see",
         run.flows.iter().map(|f| f.summary.p99).collect::<Vec<_>>(),
+    );
+}
+
+// ───── M4/TCP: what competing with a loss-based flow costs the interactive lane ─────
+//
+// M4 runs the bulk lane **idle**, so it cannot see the trade the product makes
+// the moment that lane competes. This arm adds the missing half: the production
+// dual-lane mux client with its bulk lane **saturating** one shared
+// `BottleneckShaper`, alongside an `rtp` connection running the
+// `#[cfg(feature = "testing")]` AIMD reference law (`reference_aimd = true`)
+// on the same shaper. It reads both quantities the trade is made of, and
+// neither may be omitted:
+//
+//   * the bulk lane's delivered share against the competitor's, with the pair's
+//     aggregate as a fraction of the shaper's capacity -- the competitor must be
+//     seen to saturate, or the share means nothing;
+//   * the interactive flows' p99 and max, per flow, printed against M1's
+//     ceiling, so a fair-but-slow split (the bulk lane yielding capacity, but
+//     filling the bottleneck's queue while it does) is visible.
+//
+// Report-only. It asserts only the instrument's own sanity -- the competitor
+// saturates, the interactive samples are non-empty, and every interactive flow
+// delivered -- because the product bound must be derived from the first
+// measurement this arm produces, not guessed here. Its own fault namespace is
+// `M4_TCP_*`, so a probe of this arm cannot read as a probe of any other.
+
+/// The arm's fault selector, owned by this arm alone. `M4_TCP_STALL_BULK`
+/// writes nothing on the mux bulk lane for the whole window, so the bulk
+/// delivered-byte counter stays zero and the arm's own bulk-presence sanity
+/// (the denominator of the share it measures) fails by name while every other
+/// reading -- the competitor's saturation, the interactive flows' delivery and
+/// latency -- still prints. It is the demonstration that the arm's reading can
+/// fail from the measurement path.
+fn m4_tcp_fault() -> Option<String> {
+    let value = std::env::var("MANDATE_SMOKE_FAULT").ok()?;
+    let value = value.trim();
+    if value.is_empty() || !value.starts_with("M4_TCP") {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+/// The saturation sanity floor: the two bulk flows (the product's mux bulk lane
+/// and the AIMD reference) together must deliver at least this fraction of the
+/// shaper's serialization capacity, or the competitor is not contesting the
+/// link and the share this arm measures is not a comparison against a competent
+/// loss-based competitor. This is an **instrument** floor on the reference, not
+/// a product goodput bound: rtp's own loss-based A/B sets its analogous floor at
+/// `0.80` against a two-reference aggregate (see
+/// `MIN_LOSS_AB_AGGREGATE_FRACTION_OF_CAP` in `rtp/tests/shared_bottleneck.rs`);
+/// this arm's aggregate also carries the interactive lane's own tiny share of
+/// the same queue, so its floor is deliberately slack. The first measurement
+/// this arm produces is the input the product bound is derived from; the floor
+/// only has to catch a reference that stopped contesting.
+const M4_TCP_SATURATION_FLOOR: f64 = 0.5;
+
+/// The shared uplink's drop-tail buffer, in bytes. It must be **finite**: those
+/// drops are the loss signal the reference's multiplicative decrease acts on,
+/// so an unbounded (loss-free) queue leaves the reference a greedy flow that
+/// never decreases and the arm measures queue growth without bound (measured:
+/// interactive p99 ~1015 ms, 4.1x M1's ceiling, with the buffer at 0). The
+/// 128 KiB value is the one the `rtp` loss-based A/B (`tests/shared_bottleneck`)
+/// and the `cc_link`/`ibfq` arms use, so the competitor's AIMD engages rather
+/// than the queue growing without a loss to react to.
+const M4_TCP_SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
+
+/// One interactive flow's outcome on the competing lane: what it offered, what
+/// it got back, and the latency summary its tail bound is read from.
+struct M4TcpFlow {
+    tag: u8,
+    sent: u64,
+    received: u64,
+    summary: HolSummary,
+}
+
+/// One M4/TCP arm's outcome: the two bulk flows' delivered bytes and the share
+/// and saturation they imply, plus the interactive flows that share their queue.
+struct M4TcpRun {
+    flows: Vec<M4TcpFlow>,
+    /// Bytes the product's mux bulk lane delivered to its sink over the window.
+    bulk_delivered: u64,
+    /// Bytes the rtp AIMD reference delivered to its own sink over the window.
+    comp_delivered: u64,
+    /// `bulk / (bulk + comp)`; the product lane's share of the two bulk flows.
+    bulk_share: f64,
+    /// The competitor's own delivered bytes as a fraction of the shaper's
+    /// capacity -- positive `bulk_share` against a non-saturated competitor is
+    /// not a comparison.
+    comp_fraction: f64,
+    /// The two bulk flows' aggregate as a fraction of the shaper's capacity.
+    aggregate_fraction: f64,
+    window: Duration,
+    wall: Duration,
+}
+
+/// Write a continuous cyclic payload back to back until `run_for` elapses --
+/// the saturating offer both bulk flows carry. `offset` is advanced by exactly
+/// the bytes each write commits, so the byte stream's own pattern is continuous
+/// across writes (both sinks verify `(offset + j) % 251` byte by byte, so a
+/// burst that restarts the pattern would silently stop the counter).
+async fn m4_tcp_saturate(write: &mut (impl AsyncWrite + Unpin), payload: &[u8], run_for: Duration) {
+    let deadline = Instant::now() + run_for;
+    let mut offset = 0usize;
+    while Instant::now() < deadline {
+        match write.write(&payload[offset..]).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => offset = (offset + n) % payload.len(),
+        }
+    }
+}
+
+/// Run one M4/TCP arm: the production dual-lane client, `M4_FLOWS` interactive
+/// flows on the interactive lane, a **saturating** stream on the mux bulk lane,
+/// and an rtp AIMD reference on the same shared `BottleneckShaper`.
+///
+/// The interactive lane runs with the real cross-lane `CcSignalHub`
+/// ([`dual_mux_client_connect_lane_rtp_via_cc_link`]), so the bulk lane's path
+/// reads `shared` and its delay-first controller yields -- the production
+/// behaviour this arm measures the cost of. The shared shaper has a finite
+/// drop-tail buffer ([`M4_TCP_SHAPER_LIMIT_BYTES`]); those drops are the loss
+/// signal the reference's multiplicative decrease acts on, so it is a
+/// loss-based competitor rather than a greedy flow. The three links add no
+/// per-link random loss -- the queue's own overflow is the loss.
+async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
+    let fault = m4_tcp_fault();
+    let stall_bulk = fault.as_deref() == Some("M4_TCP_STALL_BULK");
+    let wall = Instant::now();
+    let int_rtp = LaneRtpConfig::frame_reordering(true, prompt_tuning());
+    let bulk_rtp = LaneRtpConfig::production_bulk();
+    let base = Instant::now();
+    let mut tasks = TestScope::new();
+    let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+    let outcome = tasks
+        .run(async {
+            let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
+                spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via(
+                    &task_tx, base, int_rtp, bulk_rtp,
+                )
+                .await
+                .unwrap();
+            let (comp_addr, comp_delivered) = spawn_rtp_byte_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
+
+            // One uplink queue all three flows cross: the interactive lane's
+            // packets queue behind the two bulk flows, which is the cost this
+            // arm exists to measure.
+            let shaper = BottleneckShaper::new(SHARED_UP_RATE_BPS, M4_TCP_SHAPER_LIMIT_BYTES);
+            let int_pair = NetemPair::spawn_shared(
+                int_addr,
+                link(41, OWD, JITTER, 0, 0),
+                link(42, OWD, JITTER, 0, 0),
+                Some(shaper.clone()),
+                None,
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                bulk_addr,
+                link(43, OWD, JITTER, 0, 0),
+                link(44, OWD, JITTER, 0, 0),
+                Some(shaper.clone()),
+                None,
+            )
+            .unwrap();
+            let comp_pair = NetemPair::spawn_shared(
+                comp_addr,
+                link(45, OWD, JITTER, 0, 0),
+                link(46, OWD, JITTER, 0, 0),
+                Some(shaper.clone()),
+                None,
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via_cc_link(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                int_rtp,
+                bulk_rtp,
+                None,
+                None,
+                Some(rtp::cc::CcSignalHub::new()),
+            )
+            .await
+            .unwrap();
+
+            // One collector drains the shared tagged channel for the whole arm,
+            // keeping `(tag, elapsed, latency)` so each sample is attributable
+            // to its flow.
+            let collector = Arc::new(Mutex::new(Vec::<(u8, f64, f64)>::new()));
+            let collector_sink = Arc::clone(&collector);
+            let task_tx_collector = task_tx.clone();
+            submit_test_task(
+                &task_tx_collector,
+                Box::pin(async move {
+                    while let Some((tag, latency)) = latencies.recv().await {
+                        collector_sink.lock().unwrap().push((
+                            tag,
+                            base.elapsed().as_secs_f64(),
+                            latency,
+                        ));
+                    }
+                }),
+            );
+
+            let mut streams = Vec::with_capacity(M4_FLOWS);
+            for flow in 0..M4_FLOWS {
+                let (mut read, write) = opener.open(LaneClass::Interactive).await.unwrap();
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; 8 * 1024];
+                        while let Ok(n) = read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }),
+                );
+                streams.push((m4_flow_tag(flow), write));
+            }
+            let mut futs = Vec::with_capacity(M4_FLOWS);
+            for (tag, write) in streams.iter_mut() {
+                if write.write_all(&[*tag]).await.is_err() {
+                    break;
+                }
+                let write = &mut *write;
+                futs.push(async move {
+                    send_timestamped_messages(write, base, MSG_BYTES, CADENCE, window).await
+                });
+            }
+
+            let (mut bulk_read, bulk_write) = opener.open(LaneClass::Bulk).await.unwrap();
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n) = bulk_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }),
+            );
+            let mut comp_write = spawn_rtp_bulk_upload_with_options_via(
+                &task_tx,
+                comp_pair.client_addr(),
+                false,
+                rtp::CongestionLane::Dedicated,
+                rtp::FrameMode::default(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let payload = cyclic_payload(BULK_BURST_BYTES);
+            let interactive = async move { join_all(futs).await };
+            let bulk_payload = payload.clone();
+            let bulk_fut = async move {
+                if stall_bulk {
+                    tokio::time::sleep(window).await;
+                    return;
+                }
+                let mut write = bulk_write;
+                if write.write_all(b"B").await.is_err() {
+                    return;
+                }
+                m4_tcp_saturate(&mut write, &bulk_payload, window).await;
+            };
+            let comp_fut = async move {
+                m4_tcp_saturate(&mut comp_write, &payload, window).await;
+            };
+            let (sent_per_flow, (), ()) = tokio::join!(interactive, bulk_fut, comp_fut);
+
+            for (_, write) in streams.iter_mut() {
+                let _ = write.shutdown();
+            }
+
+            // Drain the repair/queue stragglers before reading the summary, then
+            // read both bulk counters and the interactive samples at the same
+            // point in the run.
+            tokio::time::sleep(GRACE).await;
+            let samples = std::mem::take(&mut *collector.lock().unwrap());
+            let bulk_delivered = bulk_counter.load(Ordering::Relaxed);
+            let comp_delivered = comp_delivered.load(Ordering::Relaxed);
+            int_pair.stop();
+            bulk_pair.stop();
+            comp_pair.stop();
+            (sent_per_flow, samples, bulk_delivered, comp_delivered)
+        })
+        .await;
+    let (sent_per_flow, samples, bulk_delivered, comp_delivered) = outcome;
+
+    let mut per_flow: Vec<Vec<f64>> = vec![Vec::new(); M4_FLOWS];
+    for (tag, _elapsed, latency) in samples.iter().copied() {
+        if let Some(flow) = (0..M4_FLOWS).find(|&i| m4_flow_tag(i) == tag) {
+            per_flow[flow].push(latency);
+        }
+    }
+    let mut flows = Vec::with_capacity(M4_FLOWS);
+    for (flow, samples) in per_flow.into_iter().enumerate() {
+        let sent = sent_per_flow.get(flow).copied().unwrap_or(0);
+        let received = samples.len() as u64;
+        let summary = summarize(samples, sent, received, 0, 0.0);
+        flows.push(M4TcpFlow {
+            tag: m4_flow_tag(flow),
+            sent,
+            received,
+            summary,
+        });
+    }
+    // The shaper's serialization capacity over the window, in bytes. The
+    // interactive lane crosses the same queue, but the share this arm reads is
+    // between the two bulk flows; only the aggregate is compared against the
+    // shaper, so the reference's saturation is visible beside the share.
+    let cap_bytes = (SHARED_UP_RATE_BPS as f64 / 8.0) * window.as_secs_f64();
+    let agg = bulk_delivered + comp_delivered;
+    let bulk_share = if agg == 0 {
+        0.0
+    } else {
+        bulk_delivered as f64 / agg as f64
+    };
+    let comp_fraction = if cap_bytes > 0.0 {
+        comp_delivered as f64 / cap_bytes
+    } else {
+        0.0
+    };
+    let aggregate_fraction = if cap_bytes > 0.0 {
+        agg as f64 / cap_bytes
+    } else {
+        0.0
+    };
+    M4TcpRun {
+        flows,
+        bulk_delivered,
+        comp_delivered,
+        bulk_share,
+        comp_fraction,
+        aggregate_fraction,
+        window,
+        wall: wall.elapsed(),
+    }
+}
+
+fn print_m4_tcp_arm(run: &M4TcpRun) {
+    for flow in &run.flows {
+        eprintln!(
+            "[m4-tcp flow {tag}] sent={sent:>5} recv={recv:>5} delivery={del:.3} \
+             p50={p50:7.1} p90={p90:7.1} p99={p99:7.1} max={max:8.1} p99_vs_ceiling={ratio:.3}",
+            tag = flow.tag as char,
+            sent = flow.sent,
+            recv = flow.received,
+            del = flow.summary.delivery_pct,
+            p50 = flow.summary.p50,
+            p90 = flow.summary.p90,
+            p99 = flow.summary.p99,
+            max = flow.summary.max,
+            ratio = flow.summary.p99 / M1_CEILING_MS,
+        );
+    }
+    // The interactive lane crosses the same queue, so its own delivered bytes
+    // are the third term of the shaper's saturation: the bulk-pair aggregate
+    // plus this is what shows the whole bottleneck is full, and explains why
+    // the bulk+reference aggregate alone can sit below 1.0 with the shaper busy.
+    let interactive_delivered: u64 = run
+        .flows
+        .iter()
+        .map(|f| f.received.saturating_mul(MSG_BYTES as u64))
+        .sum();
+    let shaper_bytes = (SHARED_UP_RATE_BPS as f64 / 8.0) * run.window.as_secs_f64();
+    let all_flows_fraction = if shaper_bytes > 0.0 {
+        (run.bulk_delivered + run.comp_delivered + interactive_delivered) as f64 / shaper_bytes
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[m4-tcp] bulk_delivered={bulk} comp_delivered={comp} interactive_delivered={int} \
+         bulk_share={share:.4} comp_fraction_of_shaper={comp_frac:.4} \
+         aggregate_fraction_of_shaper={agg:.4} all_flows_fraction_of_shaper={all:.4} \
+         shaper_bytes={cap:.0} window={window:?} wall={wall:.1}s",
+        bulk = run.bulk_delivered,
+        comp = run.comp_delivered,
+        int = interactive_delivered,
+        share = run.bulk_share,
+        comp_frac = run.comp_fraction,
+        agg = run.aggregate_fraction,
+        all = all_flows_fraction,
+        cap = shaper_bytes,
+        window = run.window,
+        wall = run.wall.as_secs_f64(),
+    );
+}
+
+/// M4's missing half: the production bulk lane competing with a loss-based
+/// (TCP-family) flow for one bottleneck's queue, and the interactive lane's tail
+/// while it does.
+///
+/// Report-only, so the deliverable is the printed pair of readings: the bulk
+/// lane's share against the reference (with the reference's saturation made
+/// visible so the share is meaningful), and each interactive flow's p99/max
+/// against M1's [`M1_CEILING_MS`]. The assertions are the instrument's own
+/// sanity only -- a positive offered count on every interactive flow, non-empty
+/// samples, both bulk flows present, and the reference pair saturating the
+/// shaper -- because the product bound is derived from this arm's first
+/// measurement, not fixed here.
+///
+/// Vacuity: `MANDATE_SMOKE_FAULT=M4_TCP_STALL_BULK` stalls the mux bulk lane for
+/// the whole window, so its delivered-byte counter stays zero and the
+/// bulk-presence sanity fails by name while the rest of the reading still
+/// prints.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "report-only M4-family TCP-competition arm: the bulk lane vs an rtp AIMD reference on one shared shaper; ~20 s; run with --ignored --nocapture"]
+async fn m4_tcp_competition() {
+    let _serial = SERIAL.lock().await;
+    let run = with_timeout(ARM_DEADLINE, "m4/tcp", run_m4_tcp_arm(WINDOW)).await;
+    print_m4_tcp_arm(&run);
+    let samples: u64 = run.flows.iter().map(|f| f.summary.received).sum();
+    let delivered_min = run
+        .flows
+        .iter()
+        .map(|f| f.summary.received)
+        .fold(u64::MAX, u64::min);
+    let sent_min = run.flows.iter().map(|f| f.sent).fold(u64::MAX, u64::min);
+    let p99_max = run.flows.iter().map(|f| f.summary.p99).fold(0.0, f64::max);
+    let max_max = run.flows.iter().map(|f| f.summary.max).fold(0.0, f64::max);
+    let pass = samples > 0
+        && delivered_min > 0
+        && sent_min > 0
+        && run.bulk_delivered > 0
+        && run.comp_delivered > 0
+        && run.aggregate_fraction >= M4_TCP_SATURATION_FLOOR;
+    // Deliberately not a `MANDATE` line and not a `[mandate-smoke …]` arm row:
+    // `tools/mandate-check` owns the M1-M4 id set and attributes arm rows to the
+    // mandate whose `MANDATE` line follows them, so a row printed here would be
+    // read as M4's own measurement. This arm's verdict is its own line and its
+    // own exit status.
+    println!(
+        "[m4-tcp] {} flows={} samples={} bulk_share={:.4} comp_delivered={} \
+         comp_fraction_of_shaper={:.4} aggregate_fraction_of_shaper={:.4} \
+         saturation_floor={:.2} bulk_delivered={} p99_max={:.1} max_max={:.1} \
+         ceiling={:.1} window_s={:.1} wall_s={:.1}",
+        verdict(pass),
+        M4_FLOWS,
+        samples,
+        run.bulk_share,
+        run.comp_delivered,
+        run.comp_fraction,
+        run.aggregate_fraction,
+        M4_TCP_SATURATION_FLOOR,
+        run.bulk_delivered,
+        p99_max,
+        max_max,
+        M1_CEILING_MS,
+        run.window.as_secs_f64(),
+        run.wall.as_secs_f64(),
+    );
+    assert!(
+        sent_min > 0 && samples > 0 && delivered_min > 0,
+        "[m4-tcp] the arm measured {samples} delivered interactive sample(s) with per-flow sent {sent_min}.. and delivered min {delivered_min}: an interactive lane with no offer, no samples or a flow that delivered nothing is an instrument failure, not a reading",
+    );
+    assert!(
+        run.comp_delivered > 0,
+        "[m4-tcp] the rtp AIMD reference delivered {} bytes over the window: the loss-based competitor this arm measures the bulk lane against was not on the link",
+        run.comp_delivered,
+    );
+    assert!(
+        run.bulk_delivered > 0,
+        "[m4-tcp] the mux bulk lane delivered {} bytes over the window, so the bulk-vs-reference share is undefined (the lane is not competing; `MANDATE_SMOKE_FAULT=M4_TCP_STALL_BULK` produces exactly this): the arm's own bulk-presence sanity would fail here while the competitor and the interactive flows still print",
+        run.bulk_delivered,
+    );
+    assert!(
+        run.aggregate_fraction >= M4_TCP_SATURATION_FLOOR,
+        "[m4-tcp] the two bulk flows together delivered {:.0} B = {:.4} of the {:.0} B shaper capacity, below the {M4_TCP_SATURATION_FLOOR:.2} saturation floor: the reference is not contesting the link, so the bulk share {:.4} cannot be read as a comparison against a competent loss-based competitor",
+        (run.bulk_delivered + run.comp_delivered) as f64,
+        run.aggregate_fraction,
+        (SHARED_UP_RATE_BPS as f64 / 8.0) * run.window.as_secs_f64(),
+        run.bulk_share,
     );
 }
 
