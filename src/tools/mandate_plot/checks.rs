@@ -2788,6 +2788,88 @@ pub fn check_crossing_series_governed(
     problems
 }
 
+/// The number and side a bar bound caption's crossing clause states, or `None`
+/// when the label carries no such clause.
+fn crossing_count_phrase(text: &str) -> Option<(usize, usize, &'static str)> {
+    let found = crossing_count_re().search(text)?;
+    let count: usize = found.group(1).unwrap_or_default().parse().ok()?;
+    let total: usize = found.group(2).unwrap_or_default().parse().ok()?;
+    let side = if found.group(3).unwrap_or_default() == "beyond" {
+        "beyond"
+    } else {
+        "under"
+    };
+    Some((count, total, side))
+}
+
+/// Problems that leave a bar bound caption's crossing count contradicting the
+/// bars and the line the panel draws.
+///
+/// The caption is what a reader trusts instead of measuring the pixels, so a
+/// count the drawn bars and the drawn line contradict is worse than no caption.
+/// This reads both the caption and the geometry back out of the artifact, so it
+/// cannot pass on a panel whose text never reached the SVG, and it cannot be
+/// satisfied by the generator agreeing with itself.
+pub fn check_crossing_count_stated(panel_id: &str, markup: &str) -> Vec<String> {
+    let lines = drawn_bound_lines(markup);
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    // Every drawn bar's own height, including a value at the baseline whose
+    // mark is hollow. A filled bar's is its `y`; a floor mark's is the baseline
+    // it sits on.
+    let mut heights: Vec<f64> = bar_boxes(markup)
+        .iter()
+        .map(|(_x0, y0, _x1, _y1)| *y0)
+        .collect();
+    heights.extend(zero_bar_marks(markup).iter().map(|mark| mark.box_.3));
+    if heights.is_empty() {
+        return Vec::new();
+    }
+    let mut problems = Vec::new();
+    let mut seen: std::collections::BTreeSet<(String, i64)> = std::collections::BTreeSet::new();
+    for (declared, _line, (_x0, _y0, _x1, bottom)) in label_boxes(markup) {
+        let Some((stated, total, side)) = crossing_count_phrase(&declared) else {
+            continue;
+        };
+        // The drawn bound line this label sits beside: the one nearest its box.
+        let Some(line_y) = lines.iter().cloned().min_by(|a, b| {
+            (a - bottom)
+                .abs()
+                .partial_cmp(&(b - bottom).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) else {
+            continue;
+        };
+        // A wrapped label repeats the phrase on its title-bearing first line
+        // and, if the wrap lands inside it, on a continuation; report one.
+        if !seen.insert((declared.clone(), (line_y * 100.0).round() as i64)) {
+            continue;
+        }
+        let beyond = heights.iter().filter(|height| **height < line_y).count();
+        let under = heights.iter().filter(|height| **height > line_y).count();
+        let drawn = if side == "beyond" { beyond } else { under };
+        if stated == drawn && total == heights.len() {
+            continue;
+        }
+        problems.push(format!(
+            "panel {}: the drawn bound caption {} states {} of {} bar(s) {} it, and the \
+             bars the panel draws beside that line ({} px) are {} beyond and {} under \
+             it: the caption is what the reader trusts instead of the pixels, so a count \
+             its own geometry contradicts is worse than no caption",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(&declared),
+            stated,
+            total,
+            side,
+            f1(line_y),
+            beyond,
+            under
+        ));
+    }
+    problems
+}
+
 // -- a label's fit, and a note's ---------------------------------------------
 
 /// Problems that make a drawn bound label leave the panel's plot area.
@@ -4655,6 +4737,42 @@ mod tests {
         let markup = draw::svg_bar_chart("t", "x", "value", &series, &bounds, None, None, "");
         assert_eq!(bar_boxes(&markup).len(), 3);
         assert!(check_bar_separation("latency", &markup).is_empty());
+    }
+
+    #[test]
+    fn a_bar_caption_whose_crossing_count_contradicts_its_bars_is_refused() {
+        // The M2-latency shape: clean 25.4, hostile 112.9, lone_tail 161.7 read
+        // against a 100 ms bound that governs the clean arm only. One bar is
+        // under the drawn line and two are beyond it, and the caption the
+        // renderer writes states exactly that.
+        let series = bars_of(
+            "p99_ms",
+            vec![(1.0, 25.377), (2.0, 112.855), (3.0, 161.719_958)],
+        );
+        let mut bound = Bound::new(100.0, "M2 non-degrading p99 bound (ms)".to_string());
+        bound.x = Some((1.0, 1.0));
+        let markup = draw::svg_bar_chart("t", "x", "value", &series, &[bound], None, None, "");
+        assert!(markup.contains("1 of 3 bars under it"), "{markup}");
+        assert!(
+            check_crossing_count_stated("latency", &markup).is_empty(),
+            "{markup}"
+        );
+        // Red: the caption states a count the geometry contradicts. The check
+        // reads both the caption and the geometry back out of the artifact, so
+        // it reddens and names what it measured.
+        let wrong = markup.replace("1 of 3 bars under it", "2 of 3 bars under it");
+        assert!(
+            wrong.contains("2 of 3 bars under it"),
+            "the mutation applied"
+        );
+        let problems = check_crossing_count_stated("latency", &wrong);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("2 of 3 bars under it"), "{problems:?}");
+        assert!(problems[0].contains("1 under"), "{problems:?}");
+        assert!(problems[0].contains("2 beyond"), "{problems:?}");
+        // A count of zero is a claim about the drawn geometry too.
+        let none = markup.replace("1 of 3 bars under it", "0 of 3 bars under it");
+        assert_eq!(check_crossing_count_stated("latency", &none).len(), 1);
     }
 
     #[test]

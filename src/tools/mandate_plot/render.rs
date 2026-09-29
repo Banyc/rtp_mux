@@ -730,6 +730,7 @@ pub fn panel_markup(
     ));
     if chart == Chart::Bar {
         problems.extend(checks::check_bar_separation(&panel.id, &markup));
+        problems.extend(checks::check_crossing_count_stated(&panel.id, &markup));
         problems.extend(checks::check_zero_bar_marks(
             &panel.id, &series, axis, &markup,
         )?);

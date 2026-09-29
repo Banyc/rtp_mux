@@ -279,6 +279,15 @@ fn drawn_bound_re() -> &'static Regex {
     ONCE.get_or_init(|| regex(r#"<line class="bound"[^>]*\by1="([-0-9.]+)""#))
 }
 
+/// The crossing-count clause a bar bound's caption states: `N of M bars <side>
+/// it`. Only a bar panel ever states it (`governed_label` is called with
+/// `crossing = true` from the bar renderer), so the phrase is a bar-panel
+/// caption and nothing else.
+fn crossing_count_re() -> &'static Regex {
+    static ONCE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| regex(r"([0-9]+) of ([0-9]+) bars? (under|beyond) it"))
+}
+
 fn bound_label_title_re() -> &'static Regex {
     static ONCE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| regex_dotall(r"<title>.*?</title>"))
