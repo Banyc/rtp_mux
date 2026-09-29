@@ -225,6 +225,21 @@ currently fail at load, so that direction is open work rather than a landed
 lever. **Status: NOT A PASS** — an M1 breach with a named fix direction, not a
 satisfied mandate.
 
+**The repair tail was tested against the transport's own proactive redundancy
+and does not move.** Eight interleaved reps per arm on `m4_tcp_competition`
+(baseline / in-stream group FEC / recovery armour) read interactive p99 medians
+`721.3` / `722.6` / `731.0` ms — inside the arm's `553`-`970` ms run-to-run band
+— with the repaired-sample share `0.43`-`0.47` for every arm. The lever never
+engages: `armor_duplicates=0` in all 24 runs and `parity_sent` never exceeds
+`26` datagrams (0 in most), because rtp withholds proactive redundancy unless
+there is spare capacity and the congestion controller is not reading a building
+queue — and under a saturated bottleneck there is none. So the repair share of
+the tail above is **not** reachable by the existing sender-side redundancy path;
+opening that gate would inflate the interactive lane's wire on a saturated link
+(an M2 cost) rather than remove the queue. The lever is recorded as a testkit
+measurement capability only (`LaneRtpConfig::with_instream_group_fec` /
+`with_retransmission_armor`, inert by default) and is not a product change.
+
 ### Declared perf rows
 
 The rows below declare twenty-six families in the `gate-perf-design` grammar:

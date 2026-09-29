@@ -2091,6 +2091,17 @@ pub struct LaneRtpConfig {
     /// interactive-lane constructors take it; every other lane leaves it `None`
     /// and keeps rtp's own stock seed.
     pub initial_send_rate: Option<f64>,
+    /// Whether the lane opts into in-stream multi-symbol group parity
+    /// (`rtp::udp::ConnectConfig::instream_group_fec`).  `None` -- the default --
+    /// leaves the transport's own process default (the
+    /// `RTP_INSTREAM_GROUP_FEC` environment) in force; `Some` overrides it for
+    /// this lane only, so a lane that does not opt in cannot observe this knob.
+    pub instream_group_fec: Option<bool>,
+    /// Whether the lane enables recovery-send armour duplicates
+    /// (`rtp::udp::ConnectConfig::retransmission_armor`).  `None` -- the default
+    /// -- leaves the transport's own process default (the `RTP_RTX_DUP`
+    /// environment) in force; `Some` overrides it for this lane only.
+    pub retransmission_armor: Option<bool>,
 }
 
 impl LaneRtpConfig {
@@ -2103,6 +2114,8 @@ impl LaneRtpConfig {
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
             initial_send_rate: None,
+            instream_group_fec: None,
+            retransmission_armor: None,
         }
     }
 
@@ -2135,6 +2148,8 @@ impl LaneRtpConfig {
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
             initial_send_rate: None,
+            instream_group_fec: None,
+            retransmission_armor: None,
         }
     }
 
@@ -2149,6 +2164,8 @@ impl LaneRtpConfig {
             initial_send_rate: crate::lane_transport::initial_send_rate(
                 mux::LaneClass::Interactive,
             ),
+            instream_group_fec: None,
+            retransmission_armor: None,
         }
     }
 
@@ -2163,7 +2180,25 @@ impl LaneRtpConfig {
             initial_send_rate: crate::lane_transport::initial_send_rate(
                 mux::LaneClass::Interactive,
             ),
+            instream_group_fec: None,
+            retransmission_armor: None,
         }
+    }
+
+    /// Opt the lane into in-stream multi-symbol group parity; `None` (the
+    /// constructors' default) keeps the transport's process default, so this
+    /// is the only way a lane can override it.
+    pub fn with_instream_group_fec(mut self, enabled: bool) -> Self {
+        self.instream_group_fec = Some(enabled);
+        self
+    }
+
+    /// Opt the lane into recovery-send armour duplicates; `None` (the
+    /// constructors' default) keeps the transport's process default, so this
+    /// is the only way a lane can override it.
+    pub fn with_retransmission_armor(mut self, enabled: bool) -> Self {
+        self.retransmission_armor = Some(enabled);
+        self
     }
 }
 
@@ -2179,7 +2214,7 @@ fn lane_connect_config(
     lane: LaneRtpConfig,
     observer: Option<rtp::metrics::MetricsObserver>,
 ) -> rtp::udp::ConnectConfig<'static> {
-    rtp::udp::ConnectConfig {
+    let mut config = rtp::udp::ConnectConfig {
         handshake: false,
         fec: lane.fec,
         mss: if lane.frame_mode.enabled {
@@ -2193,7 +2228,43 @@ fn lane_connect_config(
         congestion_lane: lane.congestion_lane,
         initial_send_rate: lane.initial_send_rate,
         ..rtp::udp::ConnectConfig::default()
+    };
+    // `None` keeps the transport's own process default (its environment), so a
+    // lane that does not opt in is byte-for-byte the config it was before the
+    // override existed.
+    if let Some(enabled) = lane.instream_group_fec {
+        config.instream_group_fec = enabled;
     }
+    if let Some(enabled) = lane.retransmission_armor {
+        config.retransmission_armor =
+            rtp::traffic_shaping::redundancy::RetransmissionArmorConfig::from(enabled);
+    }
+    config
+}
+
+/// The accept config one lane's server listener opens with: the kit's per-lane
+/// transport knobs, with the lane's FEC/armour overrides applied only when the
+/// lane set them.  `None` leaves rtp's own process default in force, so this is
+/// the server-side counterpart of [`lane_connect_config`] and the one authority
+/// for the two levers on the accept path.
+fn lane_accept_config(lane: LaneRtpConfig) -> rtp::udp::AcceptConfig {
+    let mut config = rtp::udp::AcceptConfig {
+        fec: lane.fec,
+        mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+        fec_tuning: lane.fec_tuning,
+        frame_delivery: lane.frame_mode,
+        congestion_lane: lane.congestion_lane,
+        initial_send_rate: lane.initial_send_rate,
+        ..rtp::udp::AcceptConfig::default()
+    };
+    if let Some(enabled) = lane.instream_group_fec {
+        config.instream_group_fec = enabled;
+    }
+    if let Some(enabled) = lane.retransmission_armor {
+        config.retransmission_armor =
+            rtp::traffic_shaping::redundancy::RetransmissionArmorConfig::from(enabled);
+    }
+    config
 }
 
 /// Dual-lane latency-bulk server with two listeners. Continuously pumps each
@@ -2232,6 +2303,8 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
             initial_send_rate: None,
+            instream_group_fec: None,
+            retransmission_armor: None,
         }
     };
     let bulk_rtp = if bulk_frame {
@@ -2243,6 +2316,8 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
             initial_send_rate: None,
+            instream_group_fec: None,
+            retransmission_armor: None,
         }
     };
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
@@ -2283,6 +2358,8 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
             initial_send_rate: None,
+            instream_group_fec: None,
+            retransmission_armor: None,
         }
     };
     let bulk_rtp = if bulk_frame {
@@ -2294,6 +2371,8 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
             fec_tuning: FecTuning::default(),
             congestion_lane: CongestionLane::Shared,
             initial_send_rate: None,
+            instream_group_fec: None,
+            retransmission_armor: None,
         }
     };
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
@@ -2371,19 +2450,15 @@ async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
             heartbeat_interval: Duration::from_secs(5),
             frame_reassembly: lane_rtp.frame_mode.enabled,
         };
+        // `None` keeps the transport's own process default (its environment),
+        // so a lane that does not opt in accepts exactly the config it did
+        // before the override existed.
+        let accept_config = lane_accept_config(lane_rtp);
         spawn_required(
             "dual-mux server task",
             Box::pin(async move {
                 while let Ok(accepted) = listener
-                    .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                        fec: lane_rtp.fec,
-                        mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-                        fec_tuning: lane_rtp.fec_tuning,
-                        frame_delivery: lane_rtp.frame_mode,
-                        congestion_lane: lane_rtp.congestion_lane,
-                        initial_send_rate: lane_rtp.initial_send_rate,
-                        ..rtp::udp::AcceptConfig::default()
-                    })
+                    .accept_without_handshake_with(accept_config.clone())
                     .await
                 {
                     if accept_tx.send((accepted, config.clone())).await.is_err() {
@@ -2505,6 +2580,60 @@ async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lane's two transport overrides are inert when unset and reach *both*
+    /// peer configs when set.  `None` (every constructor's default) must leave
+    /// the transport's own process default in force on the connect and the
+    /// accept path, and `with_*` must override both: a lever wired into only one
+    /// peer is not a config change at all.
+    #[test]
+    fn fec_and_armor_overrides_are_inert_unset_and_reach_both_peers() {
+        let plain = LaneRtpConfig::frame_reordering(true, FecTuning::interactive_prompt());
+        assert_eq!(plain.instream_group_fec, None);
+        assert_eq!(plain.retransmission_armor, None);
+        assert_eq!(
+            lane_connect_config(plain, None).instream_group_fec,
+            rtp::udp::ConnectConfig::default().instream_group_fec,
+            "an unset group-FEC override must leave the connect transport default in force"
+        );
+        assert_eq!(
+            lane_accept_config(plain).instream_group_fec,
+            rtp::udp::AcceptConfig::default().instream_group_fec,
+            "an unset group-FEC override must leave the accept transport default in force"
+        );
+        assert_eq!(
+            lane_connect_config(plain, None)
+                .retransmission_armor
+                .is_enabled(),
+            rtp::udp::ConnectConfig::default()
+                .retransmission_armor
+                .is_enabled(),
+            "an unset armour override must leave the connect transport default in force"
+        );
+        assert_eq!(
+            lane_accept_config(plain).retransmission_armor.is_enabled(),
+            rtp::udp::AcceptConfig::default()
+                .retransmission_armor
+                .is_enabled(),
+            "an unset armour override must leave the accept transport default in force"
+        );
+
+        let levered = plain
+            .with_instream_group_fec(true)
+            .with_retransmission_armor(true);
+        assert!(lane_connect_config(levered, None).instream_group_fec);
+        assert!(lane_accept_config(levered).instream_group_fec);
+        assert!(
+            lane_connect_config(levered, None)
+                .retransmission_armor
+                .is_enabled()
+        );
+        assert!(
+            lane_accept_config(levered)
+                .retransmission_armor
+                .is_enabled()
+        );
+    }
 
     /// Every constructor but [`LaneRtpConfig::production_bulk`] leaves the
     /// lane on rtp's stock `Shared` intent, so a scenario that does not opt
