@@ -50,6 +50,7 @@
 //! cargo test --release -p rtp_mux --test standoff_burst -- --ignored --nocapture --test-threads=1
 //! ```
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -85,8 +86,16 @@ const RUN_FOR: Duration = Duration::from_secs(14);
 /// Drains stragglers before the summary is read.
 const GRACE: Duration = Duration::from_secs(1);
 /// Interleaved reps per arm.  The run-to-run spread is reported beside the
-/// effect; an effect smaller than the spread is not an effect.
-const REPS: usize = 8;
+/// effect; an effect smaller than the spread is not an effect.  Sixteen reps
+/// put the sign test's 5 % threshold at 12/16 and make the paired delta's 95 %
+/// CI tight enough to resolve the effect the predecessors could not: on the
+/// eight-rep arm the paired sd was ~0.23, so sixteen reps carry a ~0.11
+/// half-width and an ~0.14 minimum detectable effect at 80 % power.
+const REPS: usize = 16;
+/// A rep whose bulk or competitor connection delivered no bytes is not a
+/// sample of the mechanism -- the flow was absent.  Re-run it (a bounded
+/// number of times) rather than folding a degenerate ratio into the spread.
+const MAX_REP_ATTEMPTS: usize = 4;
 /// The shared bottleneck both bulk flows and the interactive lane cross.
 const SHAPER_RATE_BPS: u64 = 8_388_608; // 1 MiB/s
 const SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
@@ -140,6 +149,27 @@ fn prompt_tuning() -> rtp::FecTuning {
     }
 }
 
+/// One sample of the bulk lane's CC gate on the shared path: how long the
+/// interactive lane has gone without an application *offer*, and whether the
+/// path currently reads as shared.  This is the stand-off's own input gate,
+/// read from the same `CcSignal` the bulk controller consumes.
+#[derive(Clone, Copy)]
+struct CcSample {
+    t: f64,
+    offered_quiet: Option<f64>,
+    shared: bool,
+}
+
+/// One observation of the bulk controller, read from the public metrics
+/// surface: the send rate it had settled on and the action it took.  Sampled
+/// beside the gate, it shows whether the lane responded to the gate opening.
+#[derive(Clone, Copy)]
+struct ActionSample {
+    t: f64,
+    rate: f64,
+    action: Option<MetricsCongestionAction>,
+}
+
 /// One arm/rep's raw readings.
 struct RawRun {
     counter_samples: Vec<(f64, u64, u64)>,
@@ -148,6 +178,8 @@ struct RawRun {
     bulk_bytes: u64,
     comp_bytes: u64,
     actions: BulkActions,
+    cc_samples: Vec<CcSample>,
+    action_timeline: Vec<ActionSample>,
     shaper_dropped: u64,
     shaper_backlog_max: u64,
 }
@@ -166,23 +198,27 @@ struct BulkActions {
 }
 
 struct ActionTaps {
+    base: Instant,
     samples: AtomicU64,
     drain: AtomicU64,
     loss: AtomicU64,
     probe: AtomicU64,
     gentle: AtomicU64,
     hold: AtomicU64,
+    timeline: Mutex<Vec<ActionSample>>,
 }
 
-impl Default for ActionTaps {
-    fn default() -> Self {
+impl ActionTaps {
+    fn new(base: Instant) -> Self {
         Self {
+            base,
             samples: AtomicU64::new(0),
             drain: AtomicU64::new(0),
             loss: AtomicU64::new(0),
             probe: AtomicU64::new(0),
             gentle: AtomicU64::new(0),
             hold: AtomicU64::new(0),
+            timeline: Mutex::new(Vec::new()),
         }
     }
 }
@@ -213,6 +249,11 @@ fn action_observer(taps: Arc<ActionTaps>) -> MetricsObserver {
                 }
                 _ => {}
             }
+            taps.timeline.lock().unwrap().push(ActionSample {
+                t: taps.base.elapsed().as_secs_f64(),
+                rate: snapshot.send_rate_packets_per_second,
+                action: snapshot.congestion_action,
+            });
         },
     )
 }
@@ -331,7 +372,14 @@ async fn run_arm(arm: Arm) -> RawRun {
             let product_cc = hub
                 .as_ref()
                 .map(|hub| rtp::cc::CcLink::new(hub.clone(), rtp::cc::CcRole::Bulk));
-            let taps = Arc::new(ActionTaps::default());
+            // The stand-off's own input gate: the shared path's CC signal, read
+            // from the same `(src, dst)` group the bulk controller consumes.
+            // Sampling `offered_quiet_for` beside the controller's rate timeline
+            // is what tells "the gate never opened" apart from "the gate opened
+            // and the lane still could not claim share".
+            let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+            let cc_gate = hub.as_ref().map(|hub| hub.group(loopback, loopback).bulk());
+            let taps = Arc::new(ActionTaps::new(base));
             let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via_cc_link(
                 &task_tx,
                 int_pair.client_addr(),
@@ -387,6 +435,32 @@ async fn run_arm(arm: Arm) -> RawRun {
                                 bulk.load(Ordering::Relaxed),
                                 comp.load(Ordering::Relaxed),
                             ));
+                            tokio::time::sleep(SAMPLE_STEP).await;
+                        }
+                    }),
+                );
+            }
+            // CC-gate sampler: the stand-off's input clock and sharedness on
+            // the same cadence as the byte counters, so gate-open can be
+            // located inside each gap to the sample step.
+            let cc_samples = Arc::new(Mutex::new(Vec::<CcSample>::new()));
+            {
+                let gate = cc_gate.clone();
+                let sink = Arc::clone(&cc_samples);
+                let stop = Arc::clone(&sampler_stop);
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        while !stop.load(Ordering::Relaxed) {
+                            if let Some(gate) = gate.as_ref() {
+                                sink.lock().unwrap().push(CcSample {
+                                    t: base.elapsed().as_secs_f64(),
+                                    offered_quiet: gate
+                                        .offered_quiet_for()
+                                        .map(|d| d.as_secs_f64()),
+                                    shared: gate.is_shared(),
+                                });
+                            }
                             tokio::time::sleep(SAMPLE_STEP).await;
                         }
                     }),
@@ -453,6 +527,8 @@ async fn run_arm(arm: Arm) -> RawRun {
             sampler_stop.store(true, Ordering::Relaxed);
             let counter_samples = counters.lock().unwrap().clone();
             let samples = collected.lock().unwrap().clone();
+            let cc_samples = cc_samples.lock().unwrap().clone();
+            let action_timeline = taps.timeline.lock().unwrap().clone();
             let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
             let comp_bytes = comp_delivered.load(Ordering::Relaxed);
             int_pair.stop();
@@ -473,6 +549,8 @@ async fn run_arm(arm: Arm) -> RawRun {
                     gentle: taps.gentle.load(Ordering::Relaxed),
                     hold: taps.hold.load(Ordering::Relaxed),
                 },
+                cc_samples,
+                action_timeline,
                 shaper_dropped: shaper.dropped(),
                 shaper_backlog_max: backlog_max.load(Ordering::Relaxed),
             }
@@ -551,6 +629,136 @@ fn resume_first_max(samples: &[(f64, f64)], burst_starts: &[f64], n: usize) -> f
     max
 }
 
+/// One idle gap's stand-off state, read from the bulk lane's own gate and rate
+/// timeline: when the gate opened (the interactive lane's offer clock crossed
+/// `STANDOFF_WINDOW`), the competing rate it entered at, how far the rate
+/// ramped before the gap ended, and how many competing actions fired.
+struct GapState {
+    index: usize,
+    gap_start: f64,
+    gate_open: Option<f64>,
+    rate_at_open: Option<f64>,
+    rate_at_end: Option<f64>,
+    competing_actions: u64,
+}
+
+/// Locate each gap's gate-open time and rate response.  The gate is the
+/// stand-off's own input: `offered_quiet_for` on the path's `CcSignal`, which
+/// is the same value the bulk controller reads.  The rate response comes from
+/// the bulk connection's public metrics timeline.
+fn gap_diagnosis(
+    cc_samples: &[CcSample],
+    action_timeline: &[ActionSample],
+    burst_starts: &[f64],
+) -> Vec<GapState> {
+    let window = rtp::cc::STANDOFF_WINDOW.as_secs_f64();
+    let mut out = Vec::new();
+    for (index, w) in burst_starts.windows(2).enumerate() {
+        let gap_start = w[0] + BURST_ON.as_secs_f64();
+        let gap_end = w[1];
+        let gate_open = cc_samples
+            .iter()
+            .find(|s| {
+                s.t >= gap_start && s.t < gap_end && s.offered_quiet.is_some_and(|q| q >= window)
+            })
+            .map(|s| s.t);
+        let rate_at = |t: f64| {
+            action_timeline
+                .iter()
+                .find(|a| a.t >= t && a.t < gap_end)
+                .map(|a| a.rate)
+        };
+        let rate_at_open = gate_open.and_then(rate_at);
+        let rate_at_end = action_timeline
+            .iter()
+            .rev()
+            .find(|a| a.t >= gap_start && a.t < gap_end)
+            .map(|a| a.rate);
+        let competing_actions = gate_open.map_or(0, |open| {
+            action_timeline
+                .iter()
+                .filter(|a| {
+                    a.t >= open
+                        && a.t < gap_end
+                        && matches!(
+                            a.action,
+                            Some(MetricsCongestionAction::BandwidthProbe)
+                                | Some(MetricsCongestionAction::LossBackoff)
+                        )
+                })
+                .count() as u64
+        });
+        out.push(GapState {
+            index,
+            gap_start,
+            gate_open,
+            rate_at_open,
+            rate_at_end,
+            competing_actions,
+        });
+    }
+    out
+}
+
+/// Decimated per-sample timeline of one gap (every 100 ms), so the transition
+/// can be read rather than inferred from the summary.
+fn print_gap_timeline(
+    label: &str,
+    cc: &[CcSample],
+    actions: &[ActionSample],
+    gap_start: f64,
+    gap_end: f64,
+) {
+    eprintln!(
+        "[standoff] {label} gap timeline from +0.00s (every 100 ms): quiet_ms shared rate_pps action"
+    );
+    let mut next = gap_start;
+    for s in cc.iter().filter(|s| s.t >= gap_start && s.t < gap_end) {
+        if s.t < next {
+            continue;
+        }
+        next = s.t + 0.1;
+        let act = actions.iter().find(|a| a.t >= s.t);
+        eprintln!(
+            "[standoff]   +{:5.2}s  quiet {:>7}  shared {:5}  rate {:>8.1}  {:?}",
+            s.t - gap_start,
+            s.offered_quiet
+                .map(|q| format!("{:.0}", q * 1000.0))
+                .unwrap_or_else(|| "None".to_string()),
+            s.shared,
+            act.map(|a| a.rate).unwrap_or(f64::NAN),
+            act.and_then(|a| a.action),
+        );
+    }
+}
+
+/// Smallest number of positive signs whose one-sided tail probability under
+/// the no-effect null (`p = 0.5`) is at most 5 %: the sign-test threshold for
+/// `n` paired reps.  At `n = 16` it is 12 (`P(X >= 12) = 0.038`), at `n = 8`
+/// it is 7 (`P = 0.035`).
+fn sign_test_threshold(n: usize) -> usize {
+    let mut row = vec![1u128];
+    for _ in 0..n {
+        let mut next = vec![1u128; row.len() + 1];
+        for i in 1..row.len() {
+            next[i] = row[i - 1] + row[i];
+        }
+        row = next;
+    }
+    let total: u128 = row.iter().sum();
+    let mut tail = 0u128;
+    let mut threshold = 0;
+    for k in (0..=n).rev() {
+        tail += row[k];
+        if tail * 20 <= total {
+            threshold = k;
+        } else {
+            break;
+        }
+    }
+    threshold
+}
+
 fn median(xs: &mut [f64]) -> f64 {
     if xs.is_empty() {
         return f64::NAN;
@@ -568,7 +776,7 @@ fn span(xs: &mut [f64]) -> (f64, f64) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spawns threads and binds ephemeral ports; 2 arms x 8 interleaved ~15 s runs; run with --ignored --nocapture --test-threads=1"]
+#[ignore = "spawns threads and binds ephemeral ports; 2 arms x 16 interleaved ~15 s runs; run with --ignored --nocapture --test-threads=1"]
 async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
     let dir = "target/standoff-burst";
     std::fs::create_dir_all(dir).unwrap();
@@ -576,9 +784,45 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
     let mut reps_csv = String::from(
         "arm,rep,gap_share,bulk_bytes,comp_bytes,resume_p99,resume_max,resume_first_max\n",
     );
+    let mut gaps_csv = String::from(
+        "arm,rep,gap,gap_start,gate_open,compete_s,rate_at_open,rate_at_end,competing_actions\n",
+    );
+    let mut counters_csv = String::from("arm,rep,t,bulk_bytes,comp_bytes\n");
+    let mut interactive_csv = String::from("arm,rep,t,latency_ms\n");
+    let mut attempts_total = 0u64;
+    let mut retried = 0u64;
     for rep in 0..REPS {
-        for arm in [Arm::Yield, Arm::Standoff] {
-            let raw = run_arm(arm).await;
+        // Alternate which arm runs first, so a systematic order bias (thermal,
+        // allocator, cache warming) is common-mode across pairs instead of
+        // being added to the effect the pair is meant to isolate.
+        let order = if rep % 2 == 0 {
+            [Arm::Yield, Arm::Standoff]
+        } else {
+            [Arm::Standoff, Arm::Yield]
+        };
+        for arm in order {
+            let mut attempts = 1u32;
+            let raw = loop {
+                let raw = run_arm(arm).await;
+                if raw.bulk_bytes > 0 && raw.comp_bytes > 0 && !raw.samples.is_empty() {
+                    break raw;
+                }
+                if attempts as usize >= MAX_REP_ATTEMPTS {
+                    break raw;
+                }
+                attempts += 1;
+                retried += 1;
+                eprintln!(
+                    "[standoff] {} rep{rep} attempt {} was degenerate (bulk {} / comp {} bytes, \
+                     {} samples): re-running the rep",
+                    arm.name(),
+                    attempts - 1,
+                    raw.bulk_bytes,
+                    raw.comp_bytes,
+                    raw.samples.len(),
+                );
+            };
+            attempts_total += attempts as u64;
             let (gap_share, _gap_bulk, _gap_comp) =
                 late_gap_share(&raw.counter_samples, &raw.burst_starts);
             let (resume_p99, resume_max) = resume_tail(&raw.samples, &raw.burst_starts);
@@ -621,6 +865,47 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
                 raw.shaper_dropped,
                 raw.shaper_backlog_max,
             );
+            // The gap-state diagnosis: does the gate open, when, and does the
+            // rate respond before the gap closes?
+            let gaps = gap_diagnosis(&raw.cc_samples, &raw.action_timeline, &raw.burst_starts);
+            for g in &gaps {
+                eprintln!(
+                    "[standoff] {:>8} rep{rep} gap{}  +{:.2}s of {:.2}s  gate_open {}  \
+                     rate {:.1} -> {:.1} pps  competing-actions {}",
+                    arm.name(),
+                    g.index,
+                    g.gate_open.map(|t| t - g.gap_start).unwrap_or(f64::NAN),
+                    GAP_MEASURE_TAIL.as_secs_f64(),
+                    g.gate_open
+                        .map(|t| format!("+{:.2}s", t - g.gap_start))
+                        .unwrap_or_else(|| "NEVER".to_string()),
+                    g.rate_at_open.unwrap_or(f64::NAN),
+                    g.rate_at_end.unwrap_or(f64::NAN),
+                    g.competing_actions,
+                );
+                gaps_csv.push_str(&format!(
+                    "{},{rep},{},{:.3},{},{:.3},{:.3},{:.3},{}\n",
+                    arm.name(),
+                    g.index,
+                    g.gap_start,
+                    g.gate_open.unwrap_or(f64::NAN),
+                    g.gate_open.map(|t| t - g.gap_start).unwrap_or(f64::NAN),
+                    g.rate_at_open.unwrap_or(f64::NAN),
+                    g.rate_at_end.unwrap_or(f64::NAN),
+                    g.competing_actions,
+                ));
+            }
+            if rep == 0
+                && let Some(g) = gaps.first()
+            {
+                print_gap_timeline(
+                    arm.name(),
+                    &raw.cc_samples,
+                    &raw.action_timeline,
+                    g.gap_start,
+                    g.gap_start + BURST_OFF.as_secs_f64(),
+                );
+            }
             reps_csv.push_str(&format!(
                 "{},{rep},{:.4},{},{},{:.3},{:.3},{:.3}\n",
                 arm.name(),
@@ -631,10 +916,28 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
                 run.resume_max,
                 run.resume_first_max,
             ));
+            for (t, b, c) in &raw.counter_samples {
+                counters_csv.push_str(&format!("{},{rep},{:.3},{},{}\n", arm.name(), t, b, c));
+            }
+            for (t, latency) in &raw.samples {
+                interactive_csv.push_str(&format!(
+                    "{},{rep},{:.3},{:.3}\n",
+                    arm.name(),
+                    t,
+                    latency
+                ));
+            }
             runs.push((arm, rep, run));
         }
     }
     std::fs::write(format!("{dir}/reps.csv"), &reps_csv).unwrap();
+    std::fs::write(format!("{dir}/gaps.csv"), &gaps_csv).unwrap();
+    std::fs::write(format!("{dir}/counters.csv"), &counters_csv).unwrap();
+    std::fs::write(format!("{dir}/interactive.csv"), &interactive_csv).unwrap();
+    eprintln!(
+        "[standoff] rep attempts {attempts_total} for {} measured reps ({retried} re-runs)",
+        REPS * 2
+    );
 
     let stat = |arm: Arm, f: fn(&Run) -> f64| -> (f64, f64, f64) {
         let mut xs: Vec<f64> = runs
@@ -688,6 +991,29 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
          mean {paired_mean:+.3}, {positive}/{} reps positive",
         paired.len()
     );
+    // The power of the paired design: the per-rep spread, the standard error of
+    // the mean delta, its 95 % CI, and the smallest effect the rep count can
+    // resolve at 80 % power.  A CI that straddles zero is an inconclusive
+    // result, whatever the medians do.
+    let paired_sd = if paired.len() > 1 {
+        (paired
+            .iter()
+            .map(|d| (d - paired_mean).powi(2))
+            .sum::<f64>()
+            / (paired.len() - 1) as f64)
+            .sqrt()
+    } else {
+        f64::NAN
+    };
+    let paired_sem = paired_sd / (paired.len() as f64).sqrt();
+    let ci_lo = paired_mean - 1.96 * paired_sem;
+    let ci_hi = paired_mean + 1.96 * paired_sem;
+    let mde = 2.802 * paired_sem; // (z_{0.975} + z_{0.8}) * sem
+    eprintln!(
+        "[standoff] paired power: mean {paired_mean:+.3}  sd {paired_sd:.3}  sem {paired_sem:.3}  \
+         95 % CI [{ci_lo:+.3},{ci_hi:+.3}]  MDE(80 %) {mde:.3}  n {}",
+        paired.len()
+    );
     eprintln!(
         "[standoff] resume p99  yield {yp99:.1}  standoff {sp99:.1} ms   \
          resume max  yield {ymax:.1}  standoff {smax:.1} ms   \
@@ -695,7 +1021,6 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
     );
     eprintln!("[standoff] data: {dir}/reps.csv");
 
-    // Instrument sanity: every arm measured samples and delivered bulk bytes.
     for (arm, rep, run) in &runs {
         assert!(
             !run.samples.is_empty(),
@@ -717,26 +1042,40 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
         );
     }
     // The product property: the stand-off must materially raise the late-gap
-    // share.  The arms are interleaved rep by rep, so the paired per-rep delta
-    // is the noise-correct statistic.  The raw min/max span is stated but is
-    // not a usable threshold: a single rep whose two bulk byte totals in the
-    // measured tail are near zero pins one arm's share at 0 or 1, and no
-    // mechanism could clear the resulting span.  The paired sign+magnitude
-    // test is what the interleaving buys, and it still rejects the
-    // predecessor's no-effect reading (+0.014 at 4/8): at 8 reps, >= 7
-    // positive pairs is a sign test against the no-effect null at p < 0.05.
+    // share.  The arms are interleaved rep by rep and the order is alternated,
+    // so the paired per-rep delta is the noise-correct statistic.  The raw
+    // min/max span is stated but is not a usable threshold: a single rep whose
+    // two bulk byte totals in the measured tail are near zero pins one arm's
+    // share at 0 or 1, and no mechanism could clear the resulting span.
+    //
+    // The decision is a paired test at a stated confidence, not a sign count:
+    // the 95 % CI of the mean paired delta must exclude zero, and the sign test
+    // must reject the no-effect null.  At 16 reps the 5 % one-sided sign-test
+    // threshold is 12/16 (P(X>=12 | p=0.5) = 0.038); at 8 reps the
+    // predecessor's 7/8 was the same test (P=0.035).  This is that test powered
+    // up, not a weaker one.
     let effect = ss - ys;
     let spread = (ys_hi - ys_lo).max(ss_hi - ss_lo);
     eprintln!(
         "[standoff] effect (median - median) {effect:+.3}, worst-arm share span {spread:.3} \
          (stated, not thresholded)"
     );
+    let sign_threshold = sign_test_threshold(paired.len());
     assert!(
-        paired.len() >= REPS && positive >= paired.len() - 1,
+        paired.len() >= REPS,
+        "[standoff] only {} paired reps were collected",
+        paired.len()
+    );
+    assert!(
+        positive >= sign_threshold,
         "[standoff] the stand-off's late-gap share gain is not consistent: {positive}/{} paired \
-         reps positive (need {} of {})",
-        paired.len(),
-        paired.len() - 1,
+         reps positive (need {sign_threshold} for the 5 % sign test)",
+        paired.len()
+    );
+    assert!(
+        ci_lo > 0.0,
+        "[standoff] the stand-off's paired late-gap share gain is not resolved at 95 % confidence: \
+         mean {paired_mean:+.3}, 95 % CI [{ci_lo:+.3},{ci_hi:+.3}] (sd {paired_sd:.3}, n {})",
         paired.len()
     );
     assert!(

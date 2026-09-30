@@ -289,60 +289,74 @@ interactive p99/max over each resume, and the max over the first `8` interactive
 samples after each resume (`resume_first_max`, before a repair can mask the
 hold's own queue).
 
-**Measured (quiet x86_64 box, 8 interleaved reps, three independent runs).**
-The idle-gap share effect is **not reproducible**, so the mechanism is
-**rejected**.  Run 1 read late-gap bulk share median `0.345` `[0.019, 0.536]`
-disarmed vs `0.588` `[0.399, 1.000]` armed (median delta `+0.242`; paired
-per-rep median `+0.359`, `7/8` positive); run 2 read `0.582` `[0.213, 0.784]`
-vs `0.435` `[0.314, 0.636]` (delta `-0.147`; paired median `+0.024`, `4/8`);
-run 3 read `0.499` `[0.235, 0.573]` vs `0.414` `[0.129, 0.749]` (delta
-`-0.085`; paired median `+0.065`, `5/8`).  Two of three runs put the armed arm
-**below** the disarmed arm, and the paired median is `+0.359` / `+0.024` /
-`+0.065` — the effect is inside the run-to-run spread, so by the workspace's
-own rule it is not an effect.  The raw min/max share span (`0.571`-`0.619`) is
-stated, not thresholded (a rep whose late-gap byte totals are near zero pins an
-arm's share at `0` or `1`); the arm's product assertion is the paired
-sign+magnitude test (`>= 7/8` positive and a positive paired median), which run
-1 passes and runs 2 and 3 fail.  Resume p99/max `361.9`/`366.0` ms disarmed vs
-`343.8`/`348.7` armed (run 1), `357.0`/`362.9` vs `337.0`/`343.5` (run 2),
-`360.0`/`363.6` vs `355.1`/`361.0` (run 3): the armed arm's interactive tail
-stays inside the disarmed band in every run.
+**Measured (quiet x86_64 box, 16 interleaved reps).**  The arm is powered to
+sixteen reps with the arm order alternated rep by rep and a degenerate rep (a
+bulk flow that delivered no bytes) re-run, and it reports the paired mean's
+standard error, its 95 % confidence interval and the minimum detectable effect
+at 80 % power instead of a min/max span.  The late-gap share effect is **not
+resolved**: paired mean `+0.067`, sd `0.377`, sem `0.094`, 95 % CI
+`[-0.118, +0.251]`, MDE(80 %) `0.264`, `9/16` positive.  The interval spans
+zero, so the effect is inside the instrument's noise; resolving an effect of
+the observed size would need ~250 reps.  Arm medians were `0.400`
+`[0.069, 0.969]` disarmed vs `0.527` `[0.000, 0.841]` armed (median delta
+`+0.127`).  The interactive tail is not separated: resume p99 `352.0` vs
+`342.0` ms and max `357.9` vs `343.2` ms (disarmed vs armed), both
+repair-dominated.
+
+**The gap-state diagnosis explains why the share does not move.**  A sampler
+reads the stand-off's own input gate (the path's `CcSignal::offered_quiet_for`)
+beside the bulk connection's rate timeline.  The gate crosses
+`STANDOFF_WINDOW` at `gap_start + 1.50 s` in both arms — it is the offer clock,
+identical in both.  The mechanism's signature is in the rate trajectory: the
+armed arm's send rate **ramps up** across the gap (mean rate delta `+85.9` pps,
+median `+133`, `32/48` gaps positive, entering at a median `63` pps because it
+yielded through the burst) while the disarmed arm's **decays** (mean `-125.5`
+pps, median `-119`, `17/48` positive, entering at `211` pps).  The mechanism
+engages and claims rate.  It does not claim a larger *share*: in the first
+second after gate-open the armed arm's share is `-0.13` (`5/16` positive), and
+it converges to the disarmed arm's as the loss-based competitor's AIMD absorbs
+the extra rate.  The share gain is a transient that decays, not a sustained
+reclaim.
 
 **Do-no-harm holds, but it is not enough.**  The frozen MUST-RUN
 `mandate_smoke::m1_nic_minecraft_saturating_downstream` reads signalled p99
-`168.0` ms / max `175.9` ms (`0/250` samples over the ceiling) on this
-revision, against trunk's `180.2`/`191.8` ms and the `RttSample`-witnessed
-stand-off's `330.5`/`410.6` ms (`13/250`): the offer witness removes the
-self-defeating spiral.  `minecraft_contested::mc_downstream_saturating_bulk`
-passes (pooled p99 `207.0` ms) and `mandate_smoke::m4_tcp_competition`'s
-interactive p99 band is unchanged (per-flow `553`-`741` ms, inside its recorded
-`523`-`764` ms band; `PASS`, exit `0`).  `ibfq_nic_mandate` and `cc_link_ab`
-fail identically on trunk (pre-existing: `cc_link_ab`'s own loss-premise
-assertion never reaches `CC_DATA_LOSS_RATE`, exit `101`; `ibfq`'s `cc_link` p99
-backlog `128441` B vs baseline `116254` B, exit `101`).  Fixing the
-`RttSample` witness is a real do-no-harm result, but the stand-off's own
-promise — reclaiming the idle gap — is not delivered.
+`160.2` ms / max `174.9` ms (`0/250` samples over the ceiling) on this
+revision, against trunk's `180.2`/`191.8` ms: at or below trunk.
+`minecraft_contested::mc_downstream_saturating_bulk` passes (pooled downstream
+p99 `200.1` ms) and `mandate_smoke::m4_tcp_competition` passes (per-flow
+interactive p99 `492`/`533`/`711` ms, exit `0`).  `ibfq_nic_mandate` and
+`cc_link_ab` fail identically on trunk (pre-existing: `cc_link_ab`'s own
+loss-premise assertion never reaches `CC_DATA_LOSS_RATE`, exit `101`; `ibfq`'s
+`cc_link` p99 backlog `125897` B vs baseline `125749` B, exit `101`).  The
+stand-off's own promise — reclaiming the idle gap — is not delivered.
 
 **Vacuity (quiet box, 8 reps each; the mutated expression and its occurrence
 count printed between edit and verdict; restored from a copy + `touch`).**
 `STANDOFF_WINDOW -> 0` (one occurrence of `STANDOFF_WINDOW: Duration =
-Duration::from_millis(0)`) collapses the late-gap effect (delta `+0.012`,
-paired median `+0.010`, `4/8` positive) and the arm fails; the resume p99 moves
-`343.8` -> `347.0` ms and the first-8 max `330.1` -> `321.0` ms, so the
-repair-dominated tail does **not** witness the window.  `STANDOFF_HOLD -> 0`
-(one occurrence) also collapses the effect (delta `-0.020`, `5/8`) but
-**lowers** the first-8 max (`330.1` -> `152.1` ms) rather than spiking it: the
-hold's protective direction is **not established** — an inconclusive probe,
-recorded as such.  The offer witness is load-bearing: forcing
-`CcSignalSource::offer` to a no-op (`return;` at the top of the body, one
-occurrence of `VACUITY(c)`) collapses the armed arm to the disarmed level gap
-share (`0.398` vs `0.424`, delta `-0.026`, `4/8` positive) and the arm fails.
-These three probes were run against the arm's earlier min/max-span assertion;
-each printed a paired statistic that also fails the current paired test.
+Duration::from_millis(0)`) is load-bearing for the competing behaviour — the
+armed arm's late-gap share reverses from `+0.127` to `-0.146` and its
+`Drain`/`QueueHold` actions fall to zero — but it is **not** load-bearing for
+the resume tail: the per-resume first-8 max is unchanged (`146.6` -> `151.8`
+ms) and the first-8 median `140.7` -> `147.5` ms.  `STANDOFF_HOLD -> 0` (one
+occurrence) also leaves the tail unchanged (`146.6` -> `145.9` ms first-8 max;
+`140.7` -> `133.5` ms first-8 median): the hold drains only the product bulk,
+while the competitor alone keeps the 128 KiB queue full, so removing the hold
+does not spike the interactive tail.  The per-resume first-8 measurement **can**
+see the queue the stand-off builds — the armed arm's first-8 max is ~`147` ms
+against the disarmed arm's ~`87`-`106` ms in every run — so the mutations'
+null tail result is a real finding, not a blind instrument.
 
-**Verdict: rejected.**  The offer witness is the right fix for the defective
-activity witness and does no harm, but the mechanism does not demonstrably
-reclaim the idle gap in three runs, so it is not retained.
+**Verdict: rejected.**  The mechanism engages and claims rate during the idle
+gap, but it does not raise the delivered-byte share above the instrument's
+noise — its rate advantage is absorbed by the loss-based competitor's AIMD and
+its share gain is a transient that decays — and its hold does not protect the
+resume tail against that competitor.  The both-true question is not answerable
+in this harness as built: the share against a convergent AIMD competitor
+converges to fair in both arms, so the mechanism has no sustained share to
+reclaim.  Answering it would need a competitor that does not converge (so the
+share is a free variable), or a metric on the reclaim latency itself (the time
+from gate-open to the armed arm's rate crossing the disarmed arm's), not a rep
+count.
 
 ### Declared perf rows
 
@@ -452,7 +466,7 @@ mandate_smoke::m1_lone_tail_loss_model = full | 150 | composite(depth,impairment
 mandate_smoke::probe_m4_clean_band_composition = perf | 12 | baseline@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=loss2pct-iid+jitter=5ms+metric=tail-band-composition
 mandate_smoke::probe_m4_clean_band_composition_noloss = perf | 12 | orthogonal@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=none+metric=tail-band-composition
 mandate_smoke::m4_tcp_competition = full | 17 | composite(flows,load,mechanism,metric,shaper)@constitution | M4@lane=dual+shape=cadence+flows=4+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=loss-based-competitor+metric=bulk-share-and-interactive-tail
-standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail = full | 145 | composite(activity,load,mechanism,metric)@constitution | M4@lane=dual+shape=bursty-cadence+flows=1+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=interactive-standoff+metric=idle-gap-bulk-share-and-resume-tail
+standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail = full | 537 | composite(activity,load,mechanism,metric)@constitution | M4@lane=dual+shape=bursty-cadence+flows=1+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=interactive-standoff+metric=idle-gap-bulk-share-and-resume-tail
 hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
 hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
 hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
@@ -567,7 +581,11 @@ again: `m1_hostile_p99_replicated` adds 204 s and the `full` sum crosses the
 declared change (2400 -> 2900) and the checker prints `full 2781.00/2900.00s`.
 The `perf` tier needs no raise: `m1_nic_minecraft_saturating_downstream` was
 filed there while asserting in its own body, so the tier correction alone
-returns `perf` to 3495.00/3500.00s.
+returns `perf` to 3495.00/3500.00s. The stand-off arm's power fix raises its own
+declared cost (`145` -> `537` s; 16 reps measured `536.0` s wall-clock on the
+quiet box against `266` s for the eight-rep arm), so `full` is raised as a
+declared change (`2900` -> `3400`), which admits the row's own increase and
+leaves room for the tier's still-undeclared rows.
 
 **Cost provenance.** No cost here is invented. Of the twelve rows the earlier
 revisions declared, `jitter_duallane_constitution_gate` is the "~40 s
@@ -847,7 +865,7 @@ it — it does, on an absent id).
 ```gate-budgets
 default = 300
 standard = 600
-full = 2900
+full = 3400
 perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.clean-band = mandate_smoke::probe_m4_clean_band_composition
