@@ -256,6 +256,47 @@ opening that gate would inflate the interactive lane's wire on a saturated link
 measurement capability only (`LaneRtpConfig::with_instream_group_fec` /
 `with_retransmission_armor`, inert by default) and is not a product change.
 
+### The interactive stand-off: activity-gated bulk competition
+
+`rtp`'s bulk (`Dedicated`) lane carries the cross-lane CC link.  The stand-off
+extends that link: while our own interactive lane is active the bulk keeps the
+shipped delay-first policy, and once it has been quiet for
+`rtp::cc::STANDOFF_WINDOW` (`1500 ms`) the bulk competes against the loss-based
+flow on TCP's terms (an absolute additive increase, a `0.5` multiplicative
+decrease per control RTT); when the interactive lane resumes the bulk drains
+below its competing rate for `STANDOFF_HOLD` (`300 ms`) so the queue it filled
+is cleared.  It is armed on a `Dedicated` lane with a CC hub; a connection with
+no CC link, and a hub with the stand-off disarmed
+(`CcSignalHub::without_standoff`, `testing`), keep the shipped policy.
+
+`standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail`
+measures it: two arms, one dimension apart (same hub, stand-off armed vs
+disarmed), on one shared `1 MiB/s` drop-tail shaper against a saturating rtp
+AIMD reference, with a **bursty** interactive lane (a `250 ms` burst every
+`4 s`, so the gap exceeds the window and the stand-off arms).  It reads the
+bulk lane's share of the two bulk flows' bytes over each gap's late part and
+the interactive p99/max over each resume.
+
+**Measured (quiet x86_64 box, 8 interleaved reps):** late-gap bulk share
+median `0.464` `[0.155, 0.595]` disarmed vs `0.478` `[0.063, NaN]` armed — a
+delta of `+0.014` against a worst-arm spread of `0.44`, below the spread, so
+not an effect.  Resume p99/max `357.0`/`362.8` ms disarmed vs `357.9`/`364.0`
+ms armed; the interactive tail is repair-dominated (a `~357 ms` plateau) in
+both, so the hold's queue contribution is not separable at this message rate.
+
+**Do-no-harm fails.**  The frozen MUST-RUN
+`mandate_smoke::m1_nic_minecraft_saturating_downstream` reads signalled p99
+`180.2` ms on trunk and `330.5` ms with the mechanism (13 samples over the
+`250 ms` ceiling): the Minecraft-shaped interactive lane's `RttSample` updates
+gap while its own packets are queued, so the bulk competes with our own
+interactive lane and deepens the queue.  `minecraft_contested::mc_downstream_saturating_bulk`
+still passes.  `ibfq_nic_mandate` and `cc_link_ab` fail identically on trunk
+(pre-existing).  Vacuity: `STANDOFF_WINDOW -> 0` competes always and blows the
+resume p99 to `542.8` ms (from `343.8`); `STANDOFF_HOLD -> 0` is masked by the
+repair tail; forcing `shared_path` true is inconclusive at two reps.  **The
+mechanism is not releasable in this form: it reproduces the reverted
+compete-on-loss regression against our own interactive lane.**
+
 ### Declared perf rows
 
 The rows below declare twenty-six families in the `gate-perf-design` grammar:
@@ -364,6 +405,7 @@ mandate_smoke::m1_lone_tail_loss_model = full | 150 | composite(depth,impairment
 mandate_smoke::probe_m4_clean_band_composition = perf | 12 | baseline@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=loss2pct-iid+jitter=5ms+metric=tail-band-composition
 mandate_smoke::probe_m4_clean_band_composition_noloss = perf | 12 | orthogonal@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=none+metric=tail-band-composition
 mandate_smoke::m4_tcp_competition = full | 17 | composite(flows,load,mechanism,metric,shaper)@constitution | M4@lane=dual+shape=cadence+flows=4+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=loss-based-competitor+metric=bulk-share-and-interactive-tail
+standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail = full | 145 | composite(activity,load,mechanism,metric)@constitution | M4@lane=dual+shape=bursty-cadence+flows=1+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=interactive-standoff+metric=idle-gap-bulk-share-and-resume-tail
 hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
 hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
 hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
@@ -2887,6 +2929,7 @@ mandate_smoke::m4_clean_lane_p99_ceiling
 mandate_smoke::m4_clean_lane_fair_latency
 mandate_smoke::m4_hostile_lane_p99_ceiling
 mandate_smoke::m4_tcp_competition
+standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail
 ```
 
 ## Perf-tier reach into asserting helpers
