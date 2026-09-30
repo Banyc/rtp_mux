@@ -382,6 +382,20 @@ from ~`0.2 MB` per 6 s run (the 64 KiB payload) to ~`5 MB` (the 251-multiple
 payload), so the predecessor arm's delivered-byte totals are undercounts.  The
 predecessor's arm is left unchanged per the alongside-only rule.
 
+**Repaired in the shared helper.** `rtp_mux::testkit::payload` now owns the
+period, a period-aligned chunk (`251 * 256`) and the saturating writer, and both
+stand-off arms use it, so a discontinuous wrap is unrepresentable for every
+caller.  The repair is an instrument change only: no threshold, window, cadence
+or tier moved.  With the counter live, `standoff_burst`'s own numbers move and
+their **sign inverts**: on a quiet x86_64 box its late-gap share reads
+`yield 0.250 [0.155,0.336]` against `standoff 0.019 [0.000,0.128]` (paired mean
+`-0.214`, 95 % CI `[-0.242,-0.186]`, `0/16` positive), i.e. the armed arm now
+measures as delivering *less* than the disarmed one -- the opposite of the
+pre-repair reading (`standoff 0.527` vs `yield 0.400`), which was computed from
+a counter that had stopped advancing.  Its share assertion is red both before
+and after the repair; no assertion flips.  `standoff_nonconvergent` already
+used the aligned chunk, so its numbers are unchanged.
+
 **Instrument sanity (quiet x86_64 box, 8 solo reps).**  With no interactive lane
 the competing arm's share is `0.490` against the standing-off arm's `0.416`
 (paired mean `+0.070`, sd `0.128`); the other two runs read `+0.082` and
