@@ -48,6 +48,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::tools::check_gate::{MustRunArm, declared_must_run};
 use crate::tools::json::{self, Json};
 use crate::tools::pyjson::repr_str;
 
@@ -65,6 +66,10 @@ pub const DEFAULT_TIMEOUT_SECONDS: f64 = 900.0;
 pub const DEFAULT_CARGO: &str = "cargo";
 pub const REPORT_NAME: &str = "mandate-check.json";
 pub const LOG_NAME: &str = "mandate-smoke.log";
+/// The log the MUST-RUN arms' output lands in, beside the producers' logs.
+pub const MUST_RUN_LOG_NAME: &str = "mandate-must-run.log";
+/// The gate manifest the MUST-RUN arms are declared in.
+pub const GATE_MD_NAME: &str = "GATE.md";
 pub const PLOTS_DIRNAME: &str = "plots";
 pub const REPORT_SCHEMA: &str = "mandate-check/10";
 pub const ARMS_DECLARATION_NAME: &str = "mandate-arms.json";
@@ -384,6 +389,11 @@ pub struct Report {
     pub report: String,
     pub primary: Option<Json>,
     pub smoke: Json,
+    /// The MUST-RUN arms' record: the `#[ignore]`d full-tier scenarios the
+    /// crate's own ```gate-must-run block requires, which the producers' default
+    /// invocation skips and this battery executes last. `Json::Null` when the
+    /// crate declares none.
+    pub must_run: Json,
     pub mandates: BTreeMap<String, MandateReport>,
     pub mandate_order: Vec<String>,
     pub section_order: Vec<String>,
@@ -451,6 +461,7 @@ impl Report {
             self.primary.clone().unwrap_or(Json::Null),
         );
         map.insert("smoke".to_string(), self.smoke.clone());
+        map.insert("must_run".to_string(), self.must_run.clone());
         let mut mandates = BTreeMap::new();
         for (id, record) in &self.mandates {
             mandates.insert(id.clone(), record.to_json());
@@ -710,6 +721,7 @@ pub fn build_report(
         report: out_dir.join(REPORT_NAME).display().to_string(),
         primary: None,
         smoke: Json::Object(smoke),
+        must_run: Json::Null,
         mandates,
         mandate_order,
         section_order,
@@ -1557,6 +1569,22 @@ pub fn battery(args: &Args) -> (i32, Option<PathBuf>) {
         runs.push(run);
     }
 
+    // The MUST-RUN step, run last: the arms a crate's own GATE.md declares in
+    // its ```gate-must-run block are `#[ignore]`d full-tier scenarios the
+    // producers' default invocation skips. Running them here -- after every
+    // producer, so the battery's own numbers are recorded first -- is what
+    // makes the declaration non-vacuous; a failed arm joins the battery's exit
+    // status instead of being silently absent.
+    match run_must_run(args, &out_dir, &cargo, &selected, &resolved, &mut report) {
+        Ok(step_codes) => codes.extend(step_codes),
+        Err(problems) => {
+            for problem in &problems {
+                eprintln!("mandate-check: error: {problem}");
+            }
+            return (EXIT_EVIDENCE_FAILURE, Some(out_dir));
+        }
+    }
+
     let primary = report.producers.get(PRIMARY_PRODUCER).cloned();
     if primary.as_ref().is_some_and(|record| record.selected) {
         let record = primary.expect("checked");
@@ -1679,6 +1707,157 @@ pub fn battery(args: &Args) -> (i32, Option<PathBuf>) {
         }
     }
     (exit_code, Some(out_dir))
+}
+
+/// Run the MUST-RUN arms the primary producer's own `GATE.md` declares.
+///
+/// The ```gate-must-run block is the single authority for which opt-in arms the
+/// release gate must execute, so both this runner and `check-gate` read the
+/// same declaration and cannot drift. Empty when the crate declares none. A
+/// failure returns the exit codes the step contributes; a step that could not
+/// be built or run returns its problems as an evidence failure.
+fn run_must_run(
+    args: &Args,
+    out_dir: &Path,
+    cargo: &Path,
+    selected: &[Producer],
+    resolved: &[PathBuf],
+    report: &mut Report,
+) -> Result<Vec<i32>, Vec<String>> {
+    let Some(index) = selected
+        .iter()
+        .position(|entry| entry.id == PRIMARY_PRODUCER)
+    else {
+        return Ok(Vec::new());
+    };
+    let crate_dir = &resolved[index];
+    let gate_path = crate_dir.join(GATE_MD_NAME);
+    let text = std::fs::read_to_string(&gate_path).map_err(|error| {
+        vec![format!(
+            "the gate manifest {} cannot be read: {error}",
+            gate_path.display()
+        )]
+    })?;
+    let arms = declared_must_run(&text)
+        .map_err(|problem| vec![problem])?
+        .unwrap_or_default();
+    if arms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let producer = &selected[index];
+    let log_path = out_dir.join(MUST_RUN_LOG_NAME);
+    let mut log_text = String::new();
+    let mut arm_records: Vec<Json> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    let mut failed = false;
+    for arm in &arms {
+        let command = must_run_command(cargo, &producer.package, arm);
+        log_text.push_str(&format!(
+            "[mandate-check] must-run: {}\n",
+            command.join(" ")
+        ));
+        match exec::run_producer(&command, crate_dir, out_dir, args.quick, args.timeout) {
+            Ok(run) => {
+                log_text.push_str(&run.output);
+                if !log_text.ends_with('\n') {
+                    log_text.push('\n');
+                }
+                failed |= run.timed_out || run.exit_code != Some(0);
+                arm_records.push(must_run_arm_json(arm, &command, &run));
+            }
+            Err(error) => problems.push(format!(
+                "the must_run arm {} could not be started: {error}",
+                arm.identity()
+            )),
+        }
+    }
+    if let Err(error) = std::fs::write(&log_path, &log_text) {
+        problems.push(format!(
+            "the must_run log {} cannot be written: {error}",
+            log_path.display()
+        ));
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    let host = report.producers.get(PRIMARY_PRODUCER);
+    report.must_run = must_run_json(host, &log_path, &arm_records);
+    if failed {
+        Ok(vec![EXIT_MANDATE_FAILURE])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// One MUST-RUN arm's invocation: the arm's own target, `--ignored --exact` so
+/// exactly the declared `#[ignore]`d test runs, serialised because its
+/// measurements are wall-clock. The arm's body is untouched.
+fn must_run_command(cargo: &Path, package: &str, arm: &MustRunArm) -> Vec<String> {
+    let mut out = vec![
+        cargo.display().to_string(),
+        "test".to_string(),
+        "--release".to_string(),
+        "-p".to_string(),
+        package.to_string(),
+        "--test".to_string(),
+        arm.target.clone(),
+        "--".to_string(),
+    ];
+    out.extend(TIMING_ARGS.iter().map(|token| token.to_string()));
+    out.extend([
+        "--ignored".to_string(),
+        "--exact".to_string(),
+        arm.test.clone(),
+        "--nocapture".to_string(),
+        "--test-threads=1".to_string(),
+    ]);
+    out
+}
+
+fn must_run_arm_json(arm: &MustRunArm, command: &[String], run: &exec::RunResult) -> Json {
+    let mut map = BTreeMap::new();
+    map.insert("target".to_string(), Json::Str(arm.target.clone()));
+    map.insert("test".to_string(), Json::Str(arm.test.clone()));
+    map.insert("command".to_string(), json::str_list(command));
+    map.insert(
+        "exit_code".to_string(),
+        run.exit_code
+            .map_or(Json::Null, |code| Json::Int(code as i64)),
+    );
+    map.insert("timed_out".to_string(), Json::Bool(run.timed_out));
+    Json::Object(map)
+}
+
+fn must_run_json(host: Option<&ProducerRecord>, log_path: &Path, arms: &[Json]) -> Json {
+    let mut map = BTreeMap::new();
+    map.insert("required".to_string(), Json::Bool(true));
+    map.insert(
+        "producer".to_string(),
+        Json::Str(PRIMARY_PRODUCER.to_string()),
+    );
+    map.insert(
+        "revision".to_string(),
+        json::opt_str(host.and_then(|record| record.revision.as_deref())),
+    );
+    map.insert(
+        "change_id".to_string(),
+        json::opt_str(host.and_then(|record| record.change_id.as_deref())),
+    );
+    map.insert(
+        "revision_source".to_string(),
+        json::opt_str(host.and_then(|record| record.revision_source.as_deref())),
+    );
+    map.insert(
+        "tree_id".to_string(),
+        json::opt_str(host.and_then(|record| record.tree_id.as_deref())),
+    );
+    map.insert(
+        "tree_id_source".to_string(),
+        json::opt_str(host.and_then(|record| record.tree_id_source.as_deref())),
+    );
+    map.insert("log".to_string(), Json::Str(log_path.display().to_string()));
+    map.insert("arms".to_string(), Json::Array(arms.to_vec()));
+    Json::Object(map)
 }
 
 /// The runner plus the wrapper's history step.

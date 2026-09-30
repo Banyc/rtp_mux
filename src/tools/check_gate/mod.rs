@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use crate::tools::json::Json;
 use crate::tools::pyformat;
 use crate::tools::pyjson::repr_str;
 use crate::tools::pyre::Regex;
@@ -64,6 +65,88 @@ pub const ASSERTING_TIERS: [&str; 2] = ["standard", "full"];
 pub const SKIP_DIRS: [&str; 5] = ["target", ".git", ".jj", "node_modules", ".pytest_cache"];
 /// A file larger than this is data, not a script or a source to read literals from.
 pub const MAX_SCANNED_BYTES: u64 = 2_000_000;
+/// The fenced block that declares the arms the release gate MUST run.
+pub const MUST_RUN_BLOCK: &str = "gate-must-run";
+/// Where `perf-history` archives every run by default.
+pub const DEFAULT_ARCHIVE_DIR: &str = ".net-perf-history";
+/// The subdirectory of the archive that holds mandate-check runs.
+pub const ARCHIVE_RUNS_DIR: &str = "mandate-check";
+/// The archive's pointer to the most recent run directory.
+pub const ARCHIVE_LATEST_NAME: &str = "latest";
+
+/// One MUST-RUN arm: a `#[ignore]`d scenario the release gate must execute.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MustRunArm {
+    pub target: String,
+    pub test: String,
+}
+
+impl MustRunArm {
+    /// The `target::test` identity this arm is declared and matched by.
+    pub fn identity(&self) -> String {
+        format!("{}::{}", self.target, self.test)
+    }
+}
+
+/// The arms of a ```gate-must-run block, in declaration order.
+///
+/// One `<target>::<test>` per line, optionally followed by `= <tier> | <seconds>`
+/// naming the tier and the arm's declared cost. Blank lines and `#` comments are
+/// skipped. A malformed line is an error rather than a silent omission: an arm
+/// the gate cannot parse is an arm the gate cannot require.
+pub fn parse_must_run_block(body: &str) -> Result<Vec<MustRunArm>, String> {
+    let mut arms: Vec<MustRunArm> = Vec::new();
+    for (index, raw) in body.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let token = line.split_whitespace().next().unwrap_or("");
+        let Some((target, test)) = token.split_once("::") else {
+            return Err(format!(
+                "gate-must-run line {} names {} without `<target>::<test>`",
+                index + 1,
+                repr_str(token)
+            ));
+        };
+        if target.is_empty() || test.is_empty() {
+            return Err(format!(
+                "gate-must-run line {} names {} without a target and a test",
+                index + 1,
+                repr_str(token)
+            ));
+        }
+        let arm = MustRunArm {
+            target: target.to_string(),
+            test: test.to_string(),
+        };
+        if arms.contains(&arm) {
+            return Err(format!(
+                "gate-must-run declares {} twice",
+                repr_str(&arm.identity())
+            ));
+        }
+        arms.push(arm);
+    }
+    Ok(arms)
+}
+
+/// The MUST-RUN arms a GATE.md text declares, or `None` when it declares none.
+pub fn declared_must_run(text: &str) -> Result<Option<Vec<MustRunArm>>, String> {
+    match Layout::fenced_block(text, MUST_RUN_BLOCK) {
+        Some(body) => {
+            let arms = parse_must_run_block(&body)?;
+            if arms.is_empty() {
+                return Err(format!(
+                    "the ```{MUST_RUN_BLOCK} block is empty; a declaration with no arm \
+                     requires nothing and means nothing"
+                ));
+            }
+            Ok(Some(arms))
+        }
+        None => Ok(None),
+    }
+}
 
 /// `<property>@<dimension>=<value>[+...]`, the coverage-cell grammar.
 pub fn cell_property_re() -> &'static Regex {
@@ -1287,6 +1370,25 @@ fn run_inner(session: &mut Session<'_>, report_path: Option<PathBuf>) -> R<()> {
         BTreeMap::new()
     };
 
+    // The MUST-RUN step: a crate whose ```gate-must-run block declares arms
+    // must back it with a mandate-check run recorded for this revision. An
+    // `m1_`-named arm the M1 gate cannot run is vacuous coverage, so absence, a
+    // failed arm, or a run of another revision is a gate failure rather than a
+    // note. A crate that declares no block is unaffected.
+    let must_run_problems = must_run_problems(&session.layout, report_path.as_deref());
+    for problem in &must_run_problems {
+        session.print(format!("MUST-RUN: {problem}"));
+    }
+    if !must_run_problems.is_empty() {
+        session.fail(format!(
+            "the MUST-RUN step(s) above are not satisfied for this revision; run \
+             `crates/rtp_mux/tools/mandate-check` on the revision being released so the arms \
+             in the ```{MUST_RUN_BLOCK} block of {manifest_path} execute, then pass its report \
+             with --mandate-check-json (or let it be found under \
+             {DEFAULT_ARCHIVE_DIR}/{ARCHIVE_RUNS_DIR}/{ARCHIVE_LATEST_NAME})"
+        ));
+    }
+
     let report = report_path.or_else(|| {
         let default = session.layout.root.join(DEFAULT_REPORT_NAME);
         default.is_file().then_some(default)
@@ -1399,6 +1501,233 @@ fn run_inner(session: &mut Session<'_>, report_path: Option<PathBuf>) -> R<()> {
     Ok(())
 }
 
+/// The archived or named `mandate-check.json` the MUST-RUN check reads.
+///
+/// Precedence: the `--mandate-check-json` path when given (an explicit choice a
+/// caller made), then the archive's `latest` pointer (the run the release flow
+/// just produced), then a report beside the manifest. `None` when none exists.
+fn must_run_report_path(layout: &Layout, explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    let archive = std::env::var_os("PERF_ARCHIVE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| layout.root.join(DEFAULT_ARCHIVE_DIR));
+    let runs = archive.join(ARCHIVE_RUNS_DIR);
+    let latest = runs.join(ARCHIVE_LATEST_NAME);
+    if let Ok(name) = std::fs::read_to_string(&latest) {
+        let name = name.trim();
+        if !name.is_empty() {
+            let candidate = runs.join(name).join(DEFAULT_REPORT_NAME);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let direct = layout.root.join(DEFAULT_REPORT_NAME);
+    direct.is_file().then_some(direct)
+}
+
+/// What the ```gate-must-run block requires and what the recorded run shows.
+///
+/// Empty when the crate declares no block. Otherwise every problem found: the
+/// report is absent, names another revision, records no must-run step, omits a
+/// declared arm, records an arm that failed or timed out, or records an arm the
+/// gate manifest no longer classifies.
+fn must_run_problems(layout: &Layout, explicit: Option<&Path>) -> Vec<String> {
+    let declared = match declared_must_run(&layout.manifest_text) {
+        Ok(Some(arms)) => arms,
+        Ok(None) => return Vec::new(),
+        Err(problem) => return vec![problem],
+    };
+    let names = || {
+        declared
+            .iter()
+            .map(MustRunArm::identity)
+            .collect::<Vec<String>>()
+            .join(", ")
+    };
+    let mut problems: Vec<String> = Vec::new();
+
+    // Every declared arm must be an ignored scenario the gate manifest
+    // classifies, so the block cannot name an arm that does not exist or one
+    // that stopped being `#[ignore]`d.
+    let classified: BTreeSet<String> = layout
+        .manifest_block("gate-manifest")
+        .map(|body| {
+            body.lines()
+                .filter_map(|line| line.split(" = ").next())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for arm in &declared {
+        if !classified.contains(&arm.identity()) {
+            problems.push(format!(
+                "gate-must-run names {} which the gate-manifest block does not classify as an \
+                 ignored scenario",
+                repr_str(&arm.identity())
+            ));
+        }
+    }
+
+    let Some(report_path) = must_run_report_path(layout, explicit) else {
+        let source = match explicit {
+            Some(path) => format!(
+                "the --mandate-check-json report {} does not exist",
+                path.display()
+            ),
+            None => format!(
+                "no --mandate-check-json was given and no run is archived under \
+                 {DEFAULT_ARCHIVE_DIR}/{ARCHIVE_RUNS_DIR}/{ARCHIVE_LATEST_NAME}"
+            ),
+        };
+        problems.push(format!(
+            "no mandate-check report exists for this revision: {} declares MUST-RUN arms ({}) \
+             but {source}; the step never ran",
+            layout.manifest.display(),
+            names()
+        ));
+        return problems;
+    };
+    let Some(report) = perf::read_mandate_report(&report_path, &mut problems) else {
+        return problems;
+    };
+    let Some(must_run) = report.get("must_run") else {
+        problems.push(format!(
+            "the mandate-check report {} records no must_run step, so the MUST-RUN arms ({}) did \
+             not run on it",
+            report_path.display(),
+            names()
+        ));
+        return problems;
+    };
+    if must_run.as_object().is_none() {
+        problems.push(format!(
+            "the mandate-check report {} records must_run as {}, not an object",
+            report_path.display(),
+            perf::json_repr(Some(must_run))
+        ));
+        return problems;
+    }
+    if !matches!(must_run.get("required"), Some(Json::Bool(true))) {
+        problems.push(format!(
+            "the mandate-check report {} records a must_run step that is not marked required, so \
+             its absence elsewhere would not be caught",
+            report_path.display()
+        ));
+    }
+
+    // The run is evidence for one revision only: a report recorded against
+    // another commit or tree is not evidence for this checkout.
+    let recorded_revision = must_run.get("revision").and_then(Json::as_str);
+    let recorded_tree = must_run.get("tree_id").and_then(Json::as_str);
+    let (current_revision, _change_id, revision_source) =
+        crate::tools::mandate_check::producers::resolve_revision(&layout.root);
+    let (current_tree, _tree_source) = crate::tools::mandate_check::producers::resolve_tree_id(
+        &layout.root,
+        current_revision.as_deref(),
+        revision_source.as_deref(),
+    );
+    match (recorded_tree, current_tree.as_deref()) {
+        (Some(recorded), Some(current)) if recorded != current => {
+            problems.push(format!(
+                "the must_run step of {} was recorded against tree {} but this checkout is tree \
+                 {}; a run recorded against another revision is not evidence for this one",
+                report_path.display(),
+                recorded,
+                current
+            ));
+        }
+        (Some(_), Some(_)) => {}
+        (Some(_), None) => {
+            problems.push(format!(
+                "the must_run step of {} records tree {} but this checkout's tree cannot be \
+                 resolved, so the recorded revision cannot be checked",
+                report_path.display(),
+                recorded_tree.unwrap_or("")
+            ));
+        }
+        (None, _) => match (recorded_revision, current_revision.as_deref()) {
+            (Some(recorded), Some(current)) if recorded != current => {
+                problems.push(format!(
+                    "the must_run step of {} was recorded against revision {} but this checkout \
+                     is {}; a run recorded against another revision is not evidence for this one",
+                    report_path.display(),
+                    recorded,
+                    current
+                ));
+            }
+            (Some(_), None) => {
+                problems.push(format!(
+                    "the must_run step of {} records revision {} but this checkout's revision \
+                     cannot be resolved, so the recorded revision cannot be checked",
+                    report_path.display(),
+                    recorded_revision.unwrap_or("")
+                ));
+            }
+            (None, _) => problems.push(format!(
+                "the must_run step of {} records no revision or tree, so it cannot be attributed \
+                 to the revision being released",
+                report_path.display()
+            )),
+            _ => {}
+        },
+    }
+
+    // Every declared arm must be present and green in the recorded run.
+    let mut recorded: BTreeMap<String, &Json> = BTreeMap::new();
+    for entry in must_run.get("arms").and_then(Json::as_array).unwrap_or(&[]) {
+        let (Some(target), Some(test)) = (
+            entry.get("target").and_then(Json::as_str),
+            entry.get("test").and_then(Json::as_str),
+        ) else {
+            continue;
+        };
+        recorded.insert(format!("{target}::{test}"), entry);
+    }
+    for arm in &declared {
+        let identity = arm.identity();
+        let Some(entry) = recorded.get(&identity) else {
+            problems.push(format!(
+                "the must_run step of {} did not execute the declared arm {}",
+                report_path.display(),
+                repr_str(&identity)
+            ));
+            continue;
+        };
+        if matches!(entry.get("timed_out"), Some(Json::Bool(true))) {
+            problems.push(format!(
+                "the must_run arm {} timed out in {}",
+                repr_str(&identity),
+                report_path.display()
+            ));
+        }
+        if !matches!(entry.get("exit_code"), Some(Json::Int(0))) {
+            problems.push(format!(
+                "the must_run arm {} exited {} in {}",
+                repr_str(&identity),
+                perf::json_repr(entry.get("exit_code")),
+                report_path.display()
+            ));
+        }
+    }
+    for identity in recorded.keys() {
+        if !declared.iter().any(|arm| arm.identity() == *identity) {
+            problems.push(format!(
+                "the must_run step of {} executed {} which the ```{MUST_RUN_BLOCK} block does \
+                 not declare",
+                report_path.display(),
+                repr_str(identity)
+            ));
+        }
+    }
+    problems
+}
+
 /// The assertion tokens of a report-only scenario's own body, sorted.
 fn found_tokens_of(bodies: &BTreeMap<String, String>, target: &str, test: &str) -> Vec<String> {
     let body = bodies
@@ -1428,4 +1757,76 @@ pub fn main(args: Args) -> i32 {
     print!("{}", outcome.stdout);
     eprint!("{}", outcome.stderr);
     outcome.exit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A well-formed block parses to its arms, in declaration order, ignoring
+    /// the `= <tier> | <seconds>` cost tail and blank and comment lines.
+    #[test]
+    fn a_must_run_block_parses_arms_with_their_cost_tail() {
+        let arms = parse_must_run_block(
+            "\n# the interactive-contended arms\n\
+             mandate_smoke::m1_nic_minecraft_saturating_downstream = full | 33\n\
+             minecraft_contested::mc_downstream_saturating_bulk = full | 77\n",
+        )
+        .expect("a well-formed block parses");
+        assert_eq!(
+            arms,
+            vec![
+                MustRunArm {
+                    target: "mandate_smoke".to_string(),
+                    test: "m1_nic_minecraft_saturating_downstream".to_string(),
+                },
+                MustRunArm {
+                    target: "minecraft_contested".to_string(),
+                    test: "mc_downstream_saturating_bulk".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// The parser refuses a line it cannot read: an arm the gate cannot parse
+    /// is an arm the gate cannot require, so it is an error and not a skip.
+    /// This is the vacuity demonstration for the parser -- each malformed input
+    /// would otherwise silently shrink the required set.
+    #[test]
+    fn a_malformed_must_run_line_is_refused() {
+        for (block, needle) in [
+            (
+                "m1_nic_minecraft_saturating_downstream\n",
+                "without `<target>::<test>`",
+            ),
+            ("mandate_smoke::\n", "without a target and a test"),
+            ("::m1_nic\n", "without a target and a test"),
+            ("mandate_smoke::m1_nic\nmandate_smoke::m1_nic\n", "declares"),
+        ] {
+            let Err(problem) = parse_must_run_block(block) else {
+                panic!("{block:?} should be refused");
+            };
+            assert!(
+                problem.contains(needle),
+                "{problem:?} should mention {needle:?}"
+            );
+        }
+    }
+
+    /// Only a present, non-empty block is a declaration: a GATE.md without one
+    /// declares nothing and the checker leaves the crate alone, while an empty
+    /// block is a declaration that requires nothing and is refused rather than
+    /// read as an absent one.
+    #[test]
+    fn a_must_run_block_is_required_only_when_present_and_non_empty() {
+        assert_eq!(declared_must_run("no block here").unwrap(), None);
+        assert!(declared_must_run("```gate-must-run\n```").is_err());
+        assert_eq!(
+            declared_must_run("```gate-must-run\ncc_link_ab::cc_link_ab_arm\n```")
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

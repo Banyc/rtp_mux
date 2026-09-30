@@ -71,6 +71,22 @@ either sees the whole constitution:
    cargo test --release -p rtp_mux --test rtp_mux_jitter -- \
        --ignored jitter_duallane_constitution_gate_p99 --nocapture --test-threads=1
    ```
+   M1's scope is **not `clean-and-hostile-only`**: the interactive-contended
+   arms measure the tail while a saturating bulk lane of our own competes with
+   the interactive lane, and they are the arms a regression on that path
+   reddens. `minecraft_contested::mc_downstream_saturating_bulk` (the
+   Minecraft-shaped composite, saturating downstream bulk on one shared
+   bottleneck), `cc_link_ab::cc_link_reaches_the_bulk_controller_and_bounds_the_shared_queue`,
+   `ibfq_nic_mandate::ibfq_nic_ab_against_the_untouched_dual_lane` and
+   `mandate_smoke::m1_nic_minecraft_saturating_downstream` are named in the
+   MUST-RUN step below, so the release gate executes them rather than merely
+   declaring them; the last three live in their own targets. The live
+   regression this closes — `rtp`'s bulk lane entering a "competing" episode
+   and starving our own interactive lane, a real session's 206 ms / 1965 ms /
+   5004 ms min / avg / max — shipped on a green battery precisely because
+   those arms were `#[ignore]`d and the runner's default invocation skipped
+   them. The step, its declaration and its machine check are in *The MUST-RUN
+   step* below.
 2. **The interactive lane's latency does not degrade under a known offered
    throughput** — the lane is offered a **known rate** and the mandate is that
    its latency stays at the link's floor. The **throughput is the input** and
@@ -2694,6 +2710,50 @@ perf_probe::probe_rtp_echo_4mib_direct = standard
 perf_probe::probe_rtp_echo_4mib_mss8k = standard
 spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect = standard
 spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable = standard
+```
+
+### The MUST-RUN step: the contended arms the release gate executes
+
+A `full`-tier arm is opt-in: a plain `cargo test -p rtp_mux` skips it, and the
+`mandate_smoke` producer's default invocation skips it too. A declaration the
+release gate never runs is vacuous coverage — an `m1_`-named arm with an M1
+metric that the M1 gate cannot run advertises protection that does not exist.
+That is not hypothetical: a change that made `rtp`'s bulk (`Dedicated`) lane
+enter a "competing" episode on sampled loss set it against **our own
+interactive lane**, and a real Minecraft session saw interactive latency of
+206 ms / 1965 ms / 5004 ms (min / avg / max) while `tools/mandate-check`
+reported `PASS exit=0` throughout, because the arms that measure exactly this
+case were `#[ignore]`d and never ran. The `m1_nic_minecraft_saturating_downstream`,
+`minecraft_contested::mc_downstream_saturating_bulk`,
+`cc_link_ab::cc_link_reaches_the_bulk_controller_and_bounds_the_shared_queue`
+and `ibfq_nic_mandate::ibfq_nic_ab_against_the_untouched_dual_lane` arms are
+what that regression reddens; the last three live in their own targets, so the
+step runs each declared arm's own target rather than a single test binary.
+
+The ```gate-must-run block below names those arms. `tools/mandate-check` runs
+each one as its **final step** (after every producer, so the battery's own
+numbers are recorded first), exactly as it is — its target, body, window,
+cadence, tier and guards unchanged — and records the arms' exit codes and the
+checkout's revision and tree in `mandate-check.json` under `must_run`.
+`netem-tools check-gate` then refuses a release when that artifact is absent,
+records another revision, or records a declared arm red, naming the missing
+step; a run recorded against a different revision is not evidence for the one
+being released. Each line is `<target>::<test> = <tier> | <seconds>`, the cost
+being the arm's own declared `gate-perf-design` cost where it has one
+(`m1_nic_minecraft_saturating_downstream` 33 s,
+`mc_downstream_saturating_bulk` 77 s,
+`ibfq_nic_ab_against_the_untouched_dual_lane` 63 s) and the arm's measured
+cost where it does not (`cc_link_ab` ~80 s, its `#[ignore]` reason's four
+interleaved ~10 s runs per arm over two arms). The four arms cost ~253 s
+together; three are declared `full` rows already in the tier's sum (33 + 77 +
+63 = 173 s) and `cc_link_ab` is one of the tier's still-undeclared rows, so the
+step adds no undeclared budget by itself.
+
+```gate-must-run
+mandate_smoke::m1_nic_minecraft_saturating_downstream = full | 33
+minecraft_contested::mc_downstream_saturating_bulk = full | 77
+cc_link_ab::cc_link_reaches_the_bulk_controller_and_bounds_the_shared_queue = full | 80
+ibfq_nic_mandate::ibfq_nic_ab_against_the_untouched_dual_lane = full | 63
 ```
 
 The `gate-asserting` block below records the report-only/asserting split. It
