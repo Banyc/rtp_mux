@@ -256,11 +256,11 @@ opening that gate would inflate the interactive lane's wire on a saturated link
 measurement capability only (`LaneRtpConfig::with_instream_group_fec` /
 `with_retransmission_armor`, inert by default) and is not a product change.
 
-### The interactive stand-off: activity-gated bulk competition
+### The interactive stand-off: offer-gated bulk competition
 
 `rtp`'s bulk (`Dedicated`) lane carries the cross-lane CC link.  The stand-off
-extends that link: while our own interactive lane is active the bulk keeps the
-shipped delay-first policy, and once it has been quiet for
+extends that link: while our own interactive lane is **offering data** the bulk
+keeps the shipped delay-first policy, and once it has not offered for
 `rtp::cc::STANDOFF_WINDOW` (`1500 ms`) the bulk competes against the loss-based
 flow on TCP's terms (an absolute additive increase, a `0.5` multiplicative
 decrease per control RTT); when the interactive lane resumes the bulk drains
@@ -269,33 +269,80 @@ is cleared.  It is armed on a `Dedicated` lane with a CC hub; a connection with
 no CC link, and a hub with the stand-off disarmed
 (`CcSignalHub::without_standoff`, `testing`), keep the shipped policy.
 
+The activity witness is the interactive lane's **application offer clock**, not
+its `RttSample` clock.  `CcSignalSource::offer` is refreshed on the reliable
+layer's application write path and on a send pass with staged data pending, and
+publishes through `CcSignal::offered_quiet_for`; `RttSample` freshness is **not**
+consulted by the gate (it still carries `min_rtt`/`srtt` and the loss-gate
+path-sharedness).  The reason is the field defect that rejected the predecessor:
+an `RttSample` stops arriving exactly when the lane's own packets queue behind
+the competing bulk, so an `RttSample` witness reads a queued lane as an idle one,
+opens the gate, and deepens the queue.  An application offer does not gap.
+
 `standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail`
 measures it: two arms, one dimension apart (same hub, stand-off armed vs
 disarmed), on one shared `1 MiB/s` drop-tail shaper against a saturating rtp
 AIMD reference, with a **bursty** interactive lane (a `250 ms` burst every
 `4 s`, so the gap exceeds the window and the stand-off arms).  It reads the
-bulk lane's share of the two bulk flows' bytes over each gap's late part and
-the interactive p99/max over each resume.
+bulk lane's share of the two bulk flows' bytes over each gap's late part, the
+interactive p99/max over each resume, and the max over the first `8` interactive
+samples after each resume (`resume_first_max`, before a repair can mask the
+hold's own queue).
 
-**Measured (quiet x86_64 box, 8 interleaved reps):** late-gap bulk share
-median `0.464` `[0.155, 0.595]` disarmed vs `0.478` `[0.063, NaN]` armed — a
-delta of `+0.014` against a worst-arm spread of `0.44`, below the spread, so
-not an effect.  Resume p99/max `357.0`/`362.8` ms disarmed vs `357.9`/`364.0`
-ms armed; the interactive tail is repair-dominated (a `~357 ms` plateau) in
-both, so the hold's queue contribution is not separable at this message rate.
+**Measured (quiet x86_64 box, 8 interleaved reps, three independent runs).**
+The idle-gap share effect is **not reproducible**, so the mechanism is
+**rejected**.  Run 1 read late-gap bulk share median `0.345` `[0.019, 0.536]`
+disarmed vs `0.588` `[0.399, 1.000]` armed (median delta `+0.242`; paired
+per-rep median `+0.359`, `7/8` positive); run 2 read `0.582` `[0.213, 0.784]`
+vs `0.435` `[0.314, 0.636]` (delta `-0.147`; paired median `+0.024`, `4/8`);
+run 3 read `0.499` `[0.235, 0.573]` vs `0.414` `[0.129, 0.749]` (delta
+`-0.085`; paired median `+0.065`, `5/8`).  Two of three runs put the armed arm
+**below** the disarmed arm, and the paired median is `+0.359` / `+0.024` /
+`+0.065` — the effect is inside the run-to-run spread, so by the workspace's
+own rule it is not an effect.  The raw min/max share span (`0.571`-`0.619`) is
+stated, not thresholded (a rep whose late-gap byte totals are near zero pins an
+arm's share at `0` or `1`); the arm's product assertion is the paired
+sign+magnitude test (`>= 7/8` positive and a positive paired median), which run
+1 passes and runs 2 and 3 fail.  Resume p99/max `361.9`/`366.0` ms disarmed vs
+`343.8`/`348.7` armed (run 1), `357.0`/`362.9` vs `337.0`/`343.5` (run 2),
+`360.0`/`363.6` vs `355.1`/`361.0` (run 3): the armed arm's interactive tail
+stays inside the disarmed band in every run.
 
-**Do-no-harm fails.**  The frozen MUST-RUN
+**Do-no-harm holds, but it is not enough.**  The frozen MUST-RUN
 `mandate_smoke::m1_nic_minecraft_saturating_downstream` reads signalled p99
-`180.2` ms on trunk and `330.5` ms with the mechanism (13 samples over the
-`250 ms` ceiling): the Minecraft-shaped interactive lane's `RttSample` updates
-gap while its own packets are queued, so the bulk competes with our own
-interactive lane and deepens the queue.  `minecraft_contested::mc_downstream_saturating_bulk`
-still passes.  `ibfq_nic_mandate` and `cc_link_ab` fail identically on trunk
-(pre-existing).  Vacuity: `STANDOFF_WINDOW -> 0` competes always and blows the
-resume p99 to `542.8` ms (from `343.8`); `STANDOFF_HOLD -> 0` is masked by the
-repair tail; forcing `shared_path` true is inconclusive at two reps.  **The
-mechanism is not releasable in this form: it reproduces the reverted
-compete-on-loss regression against our own interactive lane.**
+`168.0` ms / max `175.9` ms (`0/250` samples over the ceiling) on this
+revision, against trunk's `180.2`/`191.8` ms and the `RttSample`-witnessed
+stand-off's `330.5`/`410.6` ms (`13/250`): the offer witness removes the
+self-defeating spiral.  `minecraft_contested::mc_downstream_saturating_bulk`
+passes (pooled p99 `207.0` ms) and `mandate_smoke::m4_tcp_competition`'s
+interactive p99 band is unchanged (per-flow `553`-`741` ms, inside its recorded
+`523`-`764` ms band; `PASS`, exit `0`).  `ibfq_nic_mandate` and `cc_link_ab`
+fail identically on trunk (pre-existing: `cc_link_ab`'s own loss-premise
+assertion never reaches `CC_DATA_LOSS_RATE`, exit `101`; `ibfq`'s `cc_link` p99
+backlog `128441` B vs baseline `116254` B, exit `101`).  Fixing the
+`RttSample` witness is a real do-no-harm result, but the stand-off's own
+promise — reclaiming the idle gap — is not delivered.
+
+**Vacuity (quiet box, 8 reps each; the mutated expression and its occurrence
+count printed between edit and verdict; restored from a copy + `touch`).**
+`STANDOFF_WINDOW -> 0` (one occurrence of `STANDOFF_WINDOW: Duration =
+Duration::from_millis(0)`) collapses the late-gap effect (delta `+0.012`,
+paired median `+0.010`, `4/8` positive) and the arm fails; the resume p99 moves
+`343.8` -> `347.0` ms and the first-8 max `330.1` -> `321.0` ms, so the
+repair-dominated tail does **not** witness the window.  `STANDOFF_HOLD -> 0`
+(one occurrence) also collapses the effect (delta `-0.020`, `5/8`) but
+**lowers** the first-8 max (`330.1` -> `152.1` ms) rather than spiking it: the
+hold's protective direction is **not established** — an inconclusive probe,
+recorded as such.  The offer witness is load-bearing: forcing
+`CcSignalSource::offer` to a no-op (`return;` at the top of the body, one
+occurrence of `VACUITY(c)`) collapses the armed arm to the disarmed level gap
+share (`0.398` vs `0.424`, delta `-0.026`, `4/8` positive) and the arm fails.
+These three probes were run against the arm's earlier min/max-span assertion;
+each printed a paired statistic that also fails the current paired test.
+
+**Verdict: rejected.**  The offer witness is the right fix for the defective
+activity witness and does no harm, but the mechanism does not demonstrably
+reclaim the idle gap in three runs, so it is not retained.
 
 ### Declared perf rows
 

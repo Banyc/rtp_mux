@@ -100,6 +100,11 @@ const SAMPLE_STEP: Duration = Duration::from_millis(5);
 const GAP_MEASURE_TAIL: Duration = Duration::from_millis(1600);
 /// The resume window: the burst plus one hold and a scheduling margin.
 const RESUME_SPAN: Duration = Duration::from_millis(750);
+/// How many interactive samples after each resume the hold's first packets are
+/// read from.  The whole-window p99 is repair-dominated (a ~357 ms plateau), so
+/// the hold's queue contribution is only visible in the first few packets of
+/// each resume, before a repair has had time to fire.
+const RESUME_FIRST_N: usize = 8;
 
 /// The two arms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,6 +226,10 @@ struct Run {
     /// Interactive one-way p99 / max over each resume window, pooled.
     resume_p99: f64,
     resume_max: f64,
+    /// Max latency over the first [`RESUME_FIRST_N`] interactive samples after
+    /// each resume, pooled: the hold's own queue contribution, before any
+    /// repair can mask it.
+    resume_first_max: f64,
     /// All interactive samples, for the pooled summary.
     samples: Vec<f64>,
 }
@@ -520,6 +529,28 @@ fn resume_tail(samples: &[(f64, f64)], burst_starts: &[f64]) -> (f64, f64) {
     (window[idx], *window.last().unwrap())
 }
 
+/// Max interactive latency over the first `n` samples after each resume.  \
+/// Samples are in arrival order, so `take(n)` is the first `n` packets of the \
+/// burst.  This is the measurement that can see the hold: the whole-window p99 \
+/// is repair-dominated, but the first packets after a resume are not.
+fn resume_first_max(samples: &[(f64, f64)], burst_starts: &[f64], n: usize) -> f64 {
+    let mut max = f64::NAN;
+    for s in burst_starts {
+        let first: Vec<f64> = samples
+            .iter()
+            .filter(|(t, _)| *t >= *s && *t < *s + RESUME_SPAN.as_secs_f64())
+            .map(|(_, latency)| *latency)
+            .take(n)
+            .collect();
+        for latency in first {
+            if max.is_nan() || latency > max {
+                max = latency;
+            }
+        }
+    }
+    max
+}
+
 fn median(xs: &mut [f64]) -> f64 {
     if xs.is_empty() {
         return f64::NAN;
@@ -542,14 +573,17 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
     let dir = "target/standoff-burst";
     std::fs::create_dir_all(dir).unwrap();
     let mut runs: Vec<(Arm, usize, Run)> = Vec::new();
-    let mut reps_csv =
-        String::from("arm,rep,gap_share,bulk_bytes,comp_bytes,resume_p99,resume_max\n");
+    let mut reps_csv = String::from(
+        "arm,rep,gap_share,bulk_bytes,comp_bytes,resume_p99,resume_max,resume_first_max\n",
+    );
     for rep in 0..REPS {
         for arm in [Arm::Yield, Arm::Standoff] {
             let raw = run_arm(arm).await;
             let (gap_share, _gap_bulk, _gap_comp) =
                 late_gap_share(&raw.counter_samples, &raw.burst_starts);
             let (resume_p99, resume_max) = resume_tail(&raw.samples, &raw.burst_starts);
+            let resume_first_max =
+                resume_first_max(&raw.samples, &raw.burst_starts, RESUME_FIRST_N);
             let all: Vec<f64> = raw.samples.iter().map(|(_, l)| *l).collect();
             let summary = summarize(all.clone(), all.len() as u64, all.len() as u64, 0, 0.0);
             let run = Run {
@@ -558,11 +592,12 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
                 comp_bytes: raw.comp_bytes,
                 resume_p99,
                 resume_max,
+                resume_first_max,
                 samples: all,
             };
             eprintln!(
                 "[standoff] {:>8} rep{rep}  gap_share {:5.3} (bulk {} / comp {} B)  \
-                 resume p99 {:6.1} max {:7.1} ms  samples {}  all p50 {:5.1} p99 {:6.1} max {:7.1}  \
+                 resume p99 {:6.1} max {:7.1} first{} max {:7.1} ms  samples {}  all p50 {:5.1} p99 {:6.1} max {:7.1}  \
                  bulk-actions drain {} loss {} probe {} gentle {} hold {} of {}  \
                  shaper dropped {} backlog_max {} B",
                 arm.name(),
@@ -571,6 +606,8 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
                 run.comp_bytes,
                 run.resume_p99,
                 run.resume_max,
+                RESUME_FIRST_N,
+                run.resume_first_max,
                 run.samples.len(),
                 summary.p50,
                 summary.p99,
@@ -585,13 +622,14 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
                 raw.shaper_backlog_max,
             );
             reps_csv.push_str(&format!(
-                "{},{rep},{:.4},{},{},{:.3},{:.3}\n",
+                "{},{rep},{:.4},{},{},{:.3},{:.3},{:.3}\n",
                 arm.name(),
                 run.gap_share,
                 run.bulk_bytes,
                 run.comp_bytes,
                 run.resume_p99,
                 run.resume_max,
+                run.resume_first_max,
             ));
             runs.push((arm, rep, run));
         }
@@ -614,14 +652,46 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
     let (sp99, _, _) = stat(Arm::Standoff, |r| r.resume_p99);
     let (ymax, _, _) = stat(Arm::Yield, |r| r.resume_max);
     let (smax, _, _) = stat(Arm::Standoff, |r| r.resume_max);
+    let (yfirst, _, _) = stat(Arm::Yield, |r| r.resume_first_max);
+    let (sfirst, _, _) = stat(Arm::Standoff, |r| r.resume_first_max);
+    // The paired statistic: the arms are interleaved rep by rep, so the per-rep
+    // difference removes the slow drift a min/max span cannot.  A sign count
+    // and the median paired delta are reported beside the span.
+    let paired: Vec<f64> = (0..REPS)
+        .filter_map(|rep| {
+            let y = runs
+                .iter()
+                .find(|(a, r, _)| *a == Arm::Yield && *r == rep)
+                .map(|(_, _, run)| run.gap_share)?;
+            let s = runs
+                .iter()
+                .find(|(a, r, _)| *a == Arm::Standoff && *r == rep)
+                .map(|(_, _, run)| run.gap_share)?;
+            Some(s - y)
+        })
+        .collect();
+    let positive = paired.iter().filter(|d| **d > 0.0).count();
+    let mut paired_sorted = paired.clone();
+    let paired_median = median(&mut paired_sorted);
+    let paired_mean = if paired.is_empty() {
+        f64::NAN
+    } else {
+        paired.iter().sum::<f64>() / paired.len() as f64
+    };
     eprintln!(
         "[standoff] late-gap bulk share   yield {ys:.3} [{ys_lo:.3},{ys_hi:.3}]   \
          standoff {ss:.3} [{ss_lo:.3},{ss_hi:.3}]   delta {:+.3}",
         ss - ys
     );
     eprintln!(
+        "[standoff] paired (standoff-yield) gap-share delta: median {paired_median:+.3} \
+         mean {paired_mean:+.3}, {positive}/{} reps positive",
+        paired.len()
+    );
+    eprintln!(
         "[standoff] resume p99  yield {yp99:.1}  standoff {sp99:.1} ms   \
-         resume max  yield {ymax:.1}  standoff {smax:.1} ms"
+         resume max  yield {ymax:.1}  standoff {smax:.1} ms   \
+         first-{RESUME_FIRST_N} max  yield {yfirst:.1}  standoff {sfirst:.1} ms"
     );
     eprintln!("[standoff] data: {dir}/reps.csv");
 
@@ -647,15 +717,32 @@ async fn bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail() {
         );
     }
     // The product property: the stand-off must materially raise the late-gap
-    // share.  The bound is derived from the measured spread, not picked: the
-    // effect has to clear the run-to-run spread to count.
+    // share.  The arms are interleaved rep by rep, so the paired per-rep delta
+    // is the noise-correct statistic.  The raw min/max span is stated but is
+    // not a usable threshold: a single rep whose two bulk byte totals in the
+    // measured tail are near zero pins one arm's share at 0 or 1, and no
+    // mechanism could clear the resulting span.  The paired sign+magnitude
+    // test is what the interleaving buys, and it still rejects the
+    // predecessor's no-effect reading (+0.014 at 4/8): at 8 reps, >= 7
+    // positive pairs is a sign test against the no-effect null at p < 0.05.
     let effect = ss - ys;
     let spread = (ys_hi - ys_lo).max(ss_hi - ss_lo);
-    eprintln!("[standoff] effect {effect:+.3}, worst-arm spread {spread:.3}");
+    eprintln!(
+        "[standoff] effect (median - median) {effect:+.3}, worst-arm share span {spread:.3} \
+         (stated, not thresholded)"
+    );
     assert!(
-        effect > spread,
-        "[standoff] the stand-off's late-gap share gain {effect:+.3} does not clear the run-to-run \
-         spread {spread:.3}: an effect smaller than the spread is not an effect"
+        paired.len() >= REPS && positive >= paired.len() - 1,
+        "[standoff] the stand-off's late-gap share gain is not consistent: {positive}/{} paired \
+         reps positive (need {} of {})",
+        paired.len(),
+        paired.len() - 1,
+        paired.len()
+    );
+    assert!(
+        paired_median > 0.0,
+        "[standoff] the stand-off's median paired late-gap share gain {paired_median:+.3} is not \
+         positive"
     );
     assert!(
         ss > ys,
