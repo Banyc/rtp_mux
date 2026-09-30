@@ -358,6 +358,70 @@ share is a free variable), or a metric on the reclaim latency itself (the time
 from gate-open to the armed arm's rate crossing the disarmed arm's), not a rep
 count.
 
+### The stand-off against a non-converging competitor, and its reclaim cost
+
+The AIMD competitor above converges both bulk flows to fair sharing, so the
+stand-off's effect on the delivered share is erased and the arm could not decide
+the mechanism.  `standoff_nonconvergent::bulk_standoff_holds_share_against_a_non_converging_competitor`
+replaces it with a **fixed-rate flow that does not yield**: a raw UDP source
+paced at half the bottleneck (`COMPETITOR_RATE_BPS = SHAPER_RATE_BPS / 2`,
+`4 194 304 bit/s`), which offers the same rate under loss and therefore cannot
+converge the split away.  Two phases share the one bottleneck shaper (1 MiB/s,
+128 KiB drop-tail) and the bursty interactive lane (`250 ms` every `4 s`): a
+solo phase with no interactive lane (the competing bulk must out-claim the
+standing-off one) and the gap arms, interleaved rep by rep with the order
+alternated, 16 reps.
+
+**A counter defect in the predecessor arm, found while building this one.** The
+sink verifies the bulk byte stream against a `% 251` payload period; the
+predecessor's `BULK_CHUNK` is `64 KiB`, which is **not** a multiple of 251
+(`65536 mod 251 = 25`), so `saturate`'s wrap is discontinuous and the sink stops
+counting at the first wrap.  This arm uses `BULK_CHUNK = 251 * 256`.  At the
+same offered rate and a competitor rate of 0 the delivered byte total moves
+from ~`0.2 MB` per 6 s run (the 64 KiB payload) to ~`5 MB` (the 251-multiple
+payload), so the predecessor arm's delivered-byte totals are undercounts.  The
+predecessor's arm is left unchanged per the alongside-only rule.
+
+**Instrument sanity (quiet x86_64 box, 8 solo reps).**  With no interactive lane
+the competing arm's share is `0.490` against the standing-off arm's `0.416`
+(paired mean `+0.070`, sd `0.128`); the other two runs read `+0.082` and
+`+0.088`.  The direction is consistent but the separation is **not** resolved
+at 8 reps (~0.6 sd); the share metric's resolved separation is the gap arm's
+reclaim reading below.
+
+**Measured (quiet x86_64 box, 16 interleaved reps; three independent runs).**
+The stand-off's late-gap share gain is **not resolved in any run**.  Run C (the
+revision recorded here): arm medians `0.488` `[0.323,0.491]` standing off vs
+`0.510` `[0.384,0.528]` armed; paired (armed - standing off) median `+0.028`,
+mean `+0.020`, sd `0.073`, sem `0.018`, 95 % CI `[-0.016,+0.056]`, MDE(80 %)
+`0.051`, `11/16` positive (below the 12/16 sign threshold).  Runs A and B
+replicated it: paired mean `+0.014` 95 % CI `[-0.011,+0.038]` (`13/16`) and
+`+0.001` `[-0.029,+0.030]` (`11/16`).  All three intervals span zero, so the
+fixed-rate competitor does not converge the split away -- but neither does the
+mechanism hold a resolved share against it.  The interactive tail is
+repair-dominated and moves by nothing: resume p99 `357.1` vs `360.0` ms, resume
+max `366.1` vs `364.0` ms, first-8 max `327.5` vs `311.0` ms (standing off vs
+armed; the first-8 reading is not a discriminator at this rep count).
+
+**The cost is resolved where the benefit is not.**  The per-episode **reclaim
+latency** (the wall time from a resume's first interactive sample until the
+one-way latency first returns to the rep's own floor) is `p50 0.0 / p95 2.9 /
+max 94.1` ms standing off (`n 24` episodes) against `p50 28.0 / p95 154.0 /
+max 154.0` ms armed (`n 19`); the paired per-rep delta is mean `+51.6` ms, sd
+`66.0`, sem `16.5`, 95 % CI `[+19.3,+84.0]`, MDE(80 %) `46.2`, `n 16`.  Runs A
+and B replicated it (`+58.5` ms, 95 % CI `[+24.4,+92.5]`; `+48.0` ms,
+`[+29.4,+66.6]`).  That is the instrument-sensitivity check the arm asserts (a
+competing bulk must slow reclaim, or the share reading is not evidence about
+the mechanism), and it is the product cost: arming the stand-off moves the
+interactive lane's 95th percentile reclaim from single-digit ms to `154` ms for
+a share gain inside the noise.
+
+**Verdict: rejected.**  Against a competitor that cannot converge the split
+away the stand-off still does not hold a resolved share, while it imposes a
+resolved `+51.6` ms reclaim cost on the interactive lane.  The both-true
+question is now answerable and the answer is no: the reclaim the mechanism
+buys is not worth what it costs the lane it stands off for.
+
 ### Declared perf rows
 
 The rows below declare twenty-six families in the `gate-perf-design` grammar:
@@ -466,7 +530,8 @@ mandate_smoke::m1_lone_tail_loss_model = full | 150 | composite(depth,impairment
 mandate_smoke::probe_m4_clean_band_composition = perf | 12 | baseline@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=loss2pct-iid+jitter=5ms+metric=tail-band-composition
 mandate_smoke::probe_m4_clean_band_composition_noloss = perf | 12 | orthogonal@clean-band | clean-band@lane=dual+flows=4+shape=cadence+impairment=none+metric=tail-band-composition
 mandate_smoke::m4_tcp_competition = full | 17 | composite(flows,load,mechanism,metric,shaper)@constitution | M4@lane=dual+shape=cadence+flows=4+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=loss-based-competitor+metric=bulk-share-and-interactive-tail
-standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail = full | 537 | composite(activity,load,mechanism,metric)@constitution | M4@lane=dual+shape=bursty-cadence+flows=1+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=interactive-standoff+metric=idle-gap-bulk-share-and-resume-tail
+standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail = full | 537 | composite(flows,load,mechanism,metric,shape,shaper)@constitution | M4@lane=dual+shape=bursty-cadence+flows=1+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=interactive-standoff+metric=idle-gap-bulk-share-and-resume-tail
+standoff_nonconvergent::bulk_standoff_holds_share_against_a_non_converging_competitor = full | 650 | composite(flows,load,mechanism,metric,shape,shaper)@constitution | M4@lane=dual+shape=bursty-cadence+flows=1+load=mux-bulk-vs-fixed-rate-competitor+shaper=shared-uplink+mechanism=interactive-standoff+metric=gap-share-and-reclaim-latency
 hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
 hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
 hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
@@ -865,7 +930,7 @@ it — it does, on an absent id).
 ```gate-budgets
 default = 300
 standard = 600
-full = 3400
+full = 4050
 perf = 3500
 baseline = hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 baseline.clean-band = mandate_smoke::probe_m4_clean_band_composition
@@ -2817,6 +2882,8 @@ perf_probe::probe_rtp_echo_4mib_direct = standard
 perf_probe::probe_rtp_echo_4mib_mss8k = standard
 spike_survival::a_field_magnitude_latency_spike_is_survived_without_a_reconnect = standard
 spike_survival::a_floor_link_keeps_the_session_and_its_stream_usable = standard
+standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail = full
+standoff_nonconvergent::bulk_standoff_holds_share_against_a_non_converging_competitor = full
 ```
 
 ### The MUST-RUN step: the contended arms the release gate executes
@@ -2995,6 +3062,7 @@ mandate_smoke::m4_clean_lane_fair_latency
 mandate_smoke::m4_hostile_lane_p99_ceiling
 mandate_smoke::m4_tcp_competition
 standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail
+standoff_nonconvergent::bulk_standoff_holds_share_against_a_non_converging_competitor
 ```
 
 ## Perf-tier reach into asserting helpers
