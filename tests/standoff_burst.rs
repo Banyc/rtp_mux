@@ -65,6 +65,7 @@ use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via_cc_link,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
+use rtp_mux::testkit::payload::{BYTE_SINK_BULK_CHUNK_BYTES, byte_sink_payload, saturate};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// One-way delay, matching the mandate arms.
@@ -99,7 +100,6 @@ const MAX_REP_ATTEMPTS: usize = 4;
 /// The shared bottleneck both bulk flows and the interactive lane cross.
 const SHAPER_RATE_BPS: u64 = 8_388_608; // 1 MiB/s
 const SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
-const BULK_CHUNK: usize = 64 * 1024;
 /// How often both bulk byte counters are sampled.  The share is integrated
 /// over these samples, so the cadence is the share's time resolution.
 const SAMPLE_STEP: Duration = Duration::from_millis(5);
@@ -273,18 +273,6 @@ struct Run {
     resume_first_max: f64,
     /// All interactive samples, for the pooled summary.
     samples: Vec<f64>,
-}
-
-/// Saturate the link until `run_for` elapses.
-async fn saturate(write: &mut (impl AsyncWrite + Unpin), payload: &[u8], run_for: Duration) {
-    let deadline = Instant::now() + run_for;
-    let mut offset = 0usize;
-    while Instant::now() < deadline {
-        match write.write(&payload[offset..]).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => offset = (offset + n) % payload.len(),
-        }
-    }
 }
 
 /// Send `bursts` bursts of `msg_bytes` at `cadence`, `BURST_OFF` apart, over a
@@ -505,7 +493,7 @@ async fn run_arm(arm: Arm) -> RawRun {
             .await
             .unwrap();
 
-            let payload: Vec<u8> = (0..BULK_CHUNK).map(|i| (i % 251) as u8).collect();
+            let payload = byte_sink_payload(BYTE_SINK_BULK_CHUNK_BYTES);
             let comp_payload = payload.clone();
             let bulk_payload = payload.clone();
             // Tag byte so the latency sink attributes the samples, then the

@@ -83,6 +83,7 @@ use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via_cc_link,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
+use rtp_mux::testkit::payload::{BYTE_SINK_BULK_CHUNK_BYTES, byte_sink_payload, saturate};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
@@ -140,12 +141,10 @@ const SANITY_REPS: usize = 8;
 /// How far above a rep's own floor a sample may sit and still read as "at the
 /// floor": the injected jitter plus a scheduling margin.
 const RECLAIM_TOL_MS: f64 = 12.0;
-/// The bulk payload length.  A whole multiple of the sink's `% 251` payload
-/// period, so `saturate`'s wrap at this length is seamless and the sink's
-/// byte-pattern verification never rejects a read: a length that is not a
-/// multiple of 251 makes the sink stop counting at the first wrap, which
-/// undercounts the delivered bytes without any visible error.
-const BULK_CHUNK: usize = 251 * 256;
+/// The bulk payload length: the shared byte-sink helper's period-aligned
+/// chunk, the single authority for a seamless `saturate` wrap (`64 KiB` is
+/// not a whole multiple of the sink's `% 251` period and freezes the count).
+const BULK_CHUNK: usize = BYTE_SINK_BULK_CHUNK_BYTES;
 /// How often both bulk byte counters are sampled.  The share is integrated
 /// over these samples, so the cadence is the share's time resolution.
 const SAMPLE_STEP: Duration = Duration::from_millis(5);
@@ -324,18 +323,6 @@ struct Run {
     reclaim_ms: Vec<f64>,
     /// All interactive samples, for the pooled summary.
     samples: Vec<f64>,
-}
-
-/// Saturate the link until `run_for` elapses.
-async fn saturate(write: &mut (impl AsyncWrite + Unpin), payload: &[u8], run_for: Duration) {
-    let deadline = Instant::now() + run_for;
-    let mut offset = 0usize;
-    while Instant::now() < deadline {
-        match write.write(&payload[offset..]).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => offset = (offset + n) % payload.len(),
-        }
-    }
 }
 
 /// Offer `rate_bps` to `sock` for `run_for`, as a **fixed-rate** flow: the send
@@ -623,7 +610,7 @@ async fn run_arm(arm: Arm, interactive: bool, run_for: Duration) -> RawRun {
             .await
             .unwrap();
 
-            let payload: Vec<u8> = (0..BULK_CHUNK).map(|i| (i % 251) as u8).collect();
+            let payload = byte_sink_payload(BULK_CHUNK);
             let bulk_payload = payload.clone();
             let bulk_fut = async move {
                 let _ = prod_write.write_all(b"B").await;

@@ -24,6 +24,7 @@
 
 pub mod dual;
 pub mod mux_over_rtp;
+pub mod payload;
 pub mod rtp_mux;
 
 /// The production dual-lane birth's liveness deadline, in milliseconds —
