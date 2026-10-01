@@ -80,7 +80,9 @@ use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use rtp::cc::CcSignalHub;
 use rtp::metrics::{MetricsCongestionAction, MetricsEvent, MetricsObserver};
-use rtp::testkit::rtp::{spawn_rtp_bulk_upload_with_options_via, spawn_rtp_byte_sink_server_via};
+use rtp::testkit::rtp::{
+    spawn_rtp_bulk_upload_with_options_via, spawn_rtp_byte_sink_server_tagged_via,
+};
 use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via_cc_link,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
@@ -399,9 +401,14 @@ async fn run_arm(arm: Arm, interactive: bool, run_for: Duration) -> RawRun {
     tasks
         .run(async {
             let shaper = BottleneckShaper::new(SHAPER_RATE_BPS, SHAPER_LIMIT_BYTES);
-            let (prod_addr, bulk_counter) = spawn_rtp_byte_sink_server_via(&task_tx, false)
-                .await
-                .unwrap();
+            // The product bulk writes the `b"B"` tag ahead of its payload (see
+            // `bulk_fut` below), so its sink declares that tag; the plain
+            // sink's phase is anchored at payload offset 0 and an undeclared
+            // tag freezes its delivered counter.
+            let (prod_addr, bulk_counter) =
+                spawn_rtp_byte_sink_server_tagged_via(&task_tx, false, b'B')
+                    .await
+                    .unwrap();
             let prod_pair =
                 NetemPair::spawn_shared(prod_addr, link(47), link(48), Some(shaper.clone()), None)
                     .unwrap();

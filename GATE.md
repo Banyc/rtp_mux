@@ -382,23 +382,35 @@ from ~`0.2 MB` per 6 s run (the 64 KiB payload) to ~`5 MB` (the 251-multiple
 payload), so the predecessor arm's delivered-byte totals are undercounts.  The
 predecessor's arm is left unchanged per the alongside-only rule.
 
-**Repaired in the shared helper.** `rtp_mux::testkit::payload` now owns the
-period, a period-aligned chunk (`251 * 256`) and the saturating writer, and both
-stand-off arms use it, so a discontinuous wrap is unrepresentable for every
-caller.  The repair is an instrument change only: no threshold, window, cadence
-or tier moved.  With the counter live, `standoff_burst`'s own numbers move, and a
-later reading of the same revision **inverted** them: on a quiet x86_64 box its
-late-gap share read `yield 0.250` against `standoff 0.019` (paired mean `-0.214`,
-95 % CI `[-0.242,-0.186]`, `0/16` positive).  That inversion is the **tag-byte
-counter defect**, not a product result: a frozen product counter drives the
-armed arm's share toward `0`, the same revision reads the normal direction both
-frozen and with the byte dropped (`+0.266` / `+0.264`), and the measured size of
-the byte's effect on this arm's counter and share is in *The stand-off's
-multiplicative-decrease factor* above (`perf/beta-sweep/item5/`).
-`standoff_nonconvergent` already used the aligned chunk; its share is affected
-by the same byte, measured in the same place (a sanity row read `0.000` against
-the competitor's `2.88` MB and failed that arm's own "a flow was absent"
-assertion).
+**Repaired in the sink, and re-baselined.** `rtp_mux::testkit::payload` owns the
+period, a period-aligned chunk (`251 * 256`) and the saturating writer, so a
+discontinuous wrap is unrepresentable for every caller, and both stand-off arms
+now declare the `b"B"` tag they write ahead of the payload to
+`rtp::testkit::rtp::spawn_rtp_byte_sink_server_tagged_via`.  The sink's verifier
+consumes the declared tag and anchors the `(offset + j) % 251` pattern at the
+**payload's** own offset 0, so the tag is framing rather than a phase shift.  An
+undeclared tag is what drove `standoff_burst`'s armed arm toward share `0` (a
+frozen counter reads no bytes), and what froze `standoff_nonconvergent`'s sanity
+phase (`delivered bulk 0` against the competitor's `2.88` MB, the arm's own "a
+flow was absent" assertion, exit `101`).  The repair changes the counter's
+phase assumption only: no threshold, window, cadence or tier moved, and both
+arms' assertions are unchanged.
+
+**Re-measured with the repaired counter (quiet x86_64 box, 16 interleaved
+reps).**  `standoff_burst` reads late-gap share `yield 0.199` `[0.160,0.301]`
+against `standoff 0.472` `[0.416,0.505]`, delta `+0.272`; paired (standoff -
+yield) median `+0.247`, mean `+0.248`, sd `0.047`, sem `0.012`, 95 % CI
+`[+0.225,+0.271]`, MDE(80 %) `0.033`, `16/16` positive; its resume p99 `362.9`
+vs `360.0` ms and max `366.7` vs `365.4` ms (yield vs standoff) are unmoved.
+`standoff_nonconvergent` reads late-gap share `yield 0.343` `[0.275,0.359]`
+against `standoff 0.526` `[0.502,0.545]`, delta `+0.184`; paired median
+`+0.203`, mean `+0.207`, sd `0.023`, sem `0.006`, 95 % CI `[+0.196,+0.218]`,
+MDE(80 %) `0.016`, `16/16` positive; its paired reclaim cost is `+4.9` ms, 95 %
+CI `[-4.7,+14.4]`, MDE(80 %) `13.7`, inside the `125.0` ms buffer-drain bound.
+The tagged sink is load-bearing: with the verifier's tag skip removed (one
+substitution of `phase: SinkPhase::Payload` for the `tag.is_some()` branch) the
+counter freezes and the arm's own assertion fires (`sanity yield rep0 delivered
+bulk 0 / comp 3036000 bytes: a flow was absent`, exit `101`).
 
 **Instrument sanity (quiet x86_64 box, 8 solo reps).**  With no interactive lane
 the competing arm's share is `0.490` against the standing-off arm's `0.416`
@@ -564,12 +576,11 @@ recorded share by a resolved `~1.6` pp and widens its spread; the arm's
 cross-arm *delta* is robust to that bias because both arms carry it. When the
 lock is slow the counter freezes outright, and `standoff_nonconvergent`'s
 sanity phase then reads `0.000` and fails the arm. The frozen arms are left
-unchanged; their numbers are taken with the tag byte, and the one recorded
-reading this explains is `standoff_burst`'s post-repair "sign inversion"
-(`standoff 0.019` against `yield 0.250`, paired `-0.214`): a frozen counter on
-the standoff arm drives its share toward `0`, and the same-revision pair above
-reads the normal direction (`+0.266` frozen, `+0.264` no-tag). A re-reading of
-these arms' shares should drop the tag byte.
+unchanged; their numbers are taken with the tag byte, and a frozen counter can drive
+`standoff_burst`'s armed arm toward share `0` within a single run.  The sink
+**declares** the tag and anchors the `% 251` pattern at the payload's own offset
+0, so the arm reads the payload rather than a phase-shifted stream; the
+re-measured readings are in *The stand-off against a non-converging competitor*.
 
 **The Minecraft arm's offer gaps, measured.**  `mandate_smoke::mc_nic_offer_gap_distribution`
 (`full`, 33 s) recovers every cadence sample's send time from the arm's own
