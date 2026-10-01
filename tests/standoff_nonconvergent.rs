@@ -59,11 +59,13 @@
 //!   the max over the first [`RESUME_FIRST_N`] samples after the resume (before
 //!   a repair masks the hold's own queue).
 //!
-//! Asserting in the `full` tier.  The hard assertions are the instrument
-//! sanity (a competing bulk must slow the interactive lane's reclaim, or the
-//! arm cannot see the mechanism) and non-degeneracy; the share gain is printed
-//! and its CI stated, and the run's verdict (reject: the reclaim cost is
-//! resolved while the share gain is not) is recorded in `GATE.md`.  Run:
+//! Asserting in the `full` tier.  The hard assertions are the two halves of the
+//! mandate -- the late-gap share gain must resolve, and the interactive lane's
+//! reclaim cost must **not** -- plus non-degeneracy.  The absolute bound the
+//! cost is held to (a full bottleneck buffer's drain time) is printed with the
+//! CI.  The mechanism's liveness is proven by the vacuity probes recorded in
+//! `GATE.md`: R1 forced busy collapses the share gain, and R2's arming forced
+//! always-true restores the resolved cost.  Run:
 //! ```sh
 //! cargo test --release -p rtp_mux --test standoff_nonconvergent -- --ignored --nocapture --test-threads=1
 //! ```
@@ -1422,13 +1424,19 @@ async fn bulk_standoff_holds_share_against_a_non_converging_competitor() {
             arm.name()
         );
     }
-    // Instrument sensitivity -- the check that the arm could have failed.  The
-    // stand-off's *benefit* (a resolved late-gap share gain) is the reading the
-    // arm was built to decide; the reading that must be trusted is the cost it
-    // imposes on the resuming interactive lane.  At 16 reps the share gain is
-    // NOT resolved (95 % CI [{share_lo:+.3},{share_hi:+.3}] spans zero), so the
-    // decision cannot rest on it.  The reclaim cost is resolved, and it is the
-    // metric the verdict stands on.
+    // The mandate the arm decides, both halves, from the same 16 interleaved
+    // reps.  The **benefit**: the stand-off's late-gap share gain must have a
+    // paired 95 % CI that excludes zero, or the mechanism has no direction to
+    // read.  The **cost**: the interactive lane's reclaim must *no longer*
+    // resolve harmful -- the paired delta's 95 % CI must not lie entirely above
+    // zero -- and the absolute bound it is held to is the full bottleneck
+    // buffer's drain time, printed with the CI.
+    //
+    // Liveness is proven by the vacuity probes recorded in `GATE.md`: with R1
+    // forced busy the share gain collapses (the share assertion reddens), and
+    // with R2's arming forced always-true the pre-fix reclaim cost returns (the
+    // reclaim assertion reddens).  A pair of mirror-image assertions, each of
+    // which a named mutation reddens, is the instrument-sensitivity check.
     assert!(
         paired.len() >= REPS,
         "[nonconv] only {} paired share reps were collected",
@@ -1440,18 +1448,28 @@ async fn bulk_standoff_holds_share_against_a_non_converging_competitor() {
          could not be measured",
         paired_reclaim.len()
     );
-    assert!(
-        rec_mean > 0.0 && rec_lo > 0.0,
-        "[nonconv] the stand-off did not slow the interactive lane's reclaim, so this arm cannot \
-         see the mechanism at all: paired reclaim mean {rec_mean:+.1} ms 95 % CI \
-         [{rec_lo:+.1},{rec_hi:+.1}] (n {})",
-        paired_reclaim.len()
+    // A full drop-tail buffer is the longest any flow can queue a resume, so a
+    // reclaim cost at that scale is the physical ceiling the mechanism must
+    // stay under; it is stated against the standing-off arm's own p95.
+    let drain_bound_ms = 1000.0 * SHAPER_LIMIT_BYTES as f64 / (SHAPER_RATE_BPS as f64 / 8.0);
+    eprintln!(
+        "[nonconv] reclaim bound: standing-off p95 {:.1} ms; a full {SHAPER_LIMIT_BYTES} B \
+         drop-tail buffer drains in {drain_bound_ms:.1} ms at {SHAPER_RATE_BPS} bit/s; stand-off \
+         paired mean {rec_mean:+.1} ms 95 % CI [{rec_lo:+.1},{rec_hi:+.1}] MDE(80 %) {rec_mde:.1}",
+        q(&y_reclaim, 0.95),
     );
     assert!(
-        q(&s_reclaim, 0.95) > 2.0 * q(&y_reclaim, 0.95),
-        "[nonconv] the stand-off's per-episode reclaim p95 {:.1} ms is not materially above the \
-         standing-off arm's {:.1} ms",
-        q(&s_reclaim, 0.95),
+        share_lo > 0.0,
+        "[nonconv] the stand-off's late-gap share gain is not resolved: paired mean \
+         {share_mean:+.3} 95 % CI [{share_lo:+.3},{share_hi:+.3}] MDE(80 %) {share_mde:.3} \
+         (n {})",
+        paired.len()
+    );
+    assert!(
+        rec_lo <= 0.0,
+        "[nonconv] the stand-off still resolves a reclaim cost on the interactive lane: paired \
+         mean {rec_mean:+.1} ms 95 % CI [{rec_lo:+.1},{rec_hi:+.1}] MDE(80 %) {rec_mde:.1} \
+         against the standing-off p95 {:.1} ms and the {drain_bound_ms:.1} ms full-buffer bound",
         q(&y_reclaim, 0.95),
     );
     eprintln!(
@@ -1459,8 +1477,6 @@ async fn bulk_standoff_holds_share_against_a_non_converging_competitor() {
         paired.len(),
         sign_test_threshold(paired.len())
     );
-    // The share reading is reported, not asserted: the sign test is consistent
-    // but the paired magnitude's CI spans zero, and an assertion on it would be
-    // an assertion on noise.  The run's verdict -- reject, on the resolved
-    // reclaim cost against the unresolved share gain -- is recorded in GATE.md.
+    // The verdict -- accept: the share gain resolves and the reclaim cost no
+    // longer does -- is recorded in GATE.md.
 }

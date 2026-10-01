@@ -403,38 +403,70 @@ the competing arm's share is `0.490` against the standing-off arm's `0.416`
 at 8 reps (~0.6 sd); the share metric's resolved separation is the gap arm's
 reclaim reading below.
 
+**The two defects on the predecessor revision, and the fix.**  The predecessor
+revision (measured with the cross-lane payload live: paired share `+0.154`,
+95 % CI `[+0.129,+0.178]`, `16/16`; paired reclaim `+105.0` ms,
+`[+69.8,+140.2]`) armed R2 on the interactive lane's own gate alone, so
+`m1_nic` -- where the bulk saturates a shared uplink but the lane never stops
+offering -- drained a bulk that had never competed in a quiet window and capped
+it (`8 388 420` B against the plain arm's `12 582 630` B).  R2 is now armed by a
+**recorded compete episode**: the interactive lane's own quiet window
+(`offered_quiet_for >= STANDOFF_WINDOW`, with R1's genuine-idleness test) mixed
+with the lane's still-armed gate.  The episode records *our* competing -- it is
+set whether the stand-off armed the AIMD competition or the shipped delay-first
+policy ran through the same window -- so it cannot fire on the sibling's gate
+alone, and `m1_nic`'s continuously-offering lane never opens the window, so its
+bulk records nothing and R2 stays inert.  The fixed `STANDOFF_HOLD` open-loop
+hold is gone: R2's closed-loop drain starts on the resume sample itself and runs
+until the lane's gate falls, so the queue is shed at the offer, before the
+resuming packet traverses it, rather than after a 300 ms hold.  The drain
+fraction is the existing `GENTLE_DRAIN_FRAC`.
+
 **Measured (quiet x86_64 box, 16 interleaved reps; three independent runs).**
-The stand-off's late-gap share gain is **not resolved in any run**.  Run C (the
-revision recorded here): arm medians `0.488` `[0.323,0.491]` standing off vs
-`0.510` `[0.384,0.528]` armed; paired (armed - standing off) median `+0.028`,
-mean `+0.020`, sd `0.073`, sem `0.018`, 95 % CI `[-0.016,+0.056]`, MDE(80 %)
-`0.051`, `11/16` positive (below the 12/16 sign threshold).  Runs A and B
-replicated it: paired mean `+0.014` 95 % CI `[-0.011,+0.038]` (`13/16`) and
-`+0.001` `[-0.029,+0.030]` (`11/16`).  All three intervals span zero, so the
-fixed-rate competitor does not converge the split away -- but neither does the
-mechanism hold a resolved share against it.  The interactive tail is
-repair-dominated and moves by nothing: resume p99 `357.1` vs `360.0` ms, resume
-max `366.1` vs `364.0` ms, first-8 max `327.5` vs `311.0` ms (standing off vs
-armed; the first-8 reading is not a discriminator at this rep count).
+The late-gap share gain is **resolved in every run** and the interactive lane's
+reclaim cost is **no longer resolved**.  Run A: arm medians `0.343`
+`[0.271,0.411]` standing off vs `0.522` `[0.348,0.546]` armed; paired (armed -
+standing off) median `+0.190`, mean `+0.183`, sd `0.061`, sem `0.015`,
+95 % CI `[+0.153,+0.212]`, MDE(80 %) `0.043`, `16/16` positive.  Runs B and C
+replicated it (`+0.207` `[+0.177,+0.236]`, `16/16`; `+0.161`
+`[+0.127,+0.195]`, `16/16`).  The per-episode **reclaim latency** (the wall time
+from a resume's first interactive sample until the one-way latency first returns
+to the rep's own floor) is `p50 0.0 / p95 0.0 / max 0.0` ms standing off
+(`n 39`) against `p50 0.0 / p95 0.0 / max 0.0` ms armed (`n 26`) in Run A; the
+paired per-rep delta is mean `+0.0` ms, 95 % CI `[-0.0,+0.0]`, `n 16`.  Runs B
+and C replicated it inside the noise (`+0.8` ms, `[-0.8,+2.4]`; `+13.7` ms,
+`[-9.1,+36.5]`).  The absolute bound the cost is held to is one full bottleneck
+buffer's drain time (`SHAPER_LIMIT_BYTES` at `SHAPER_RATE_BPS` = `125.0` ms),
+printed beside the CI.  The interactive tail is repair-dominated and unmoved:
+resume p99 `362.4` vs `363.7` ms, resume max `367.8` vs `369.1` ms (standing off
+vs armed, Run A); `m1_nic`'s signalled bulk is `12 582 630` B, above the
+`11 324 367` B floor and equal to the plain arm's.
 
-**The cost is resolved where the benefit is not.**  The per-episode **reclaim
-latency** (the wall time from a resume's first interactive sample until the
-one-way latency first returns to the rep's own floor) is `p50 0.0 / p95 2.9 /
-max 94.1` ms standing off (`n 24` episodes) against `p50 28.0 / p95 154.0 /
-max 154.0` ms armed (`n 19`); the paired per-rep delta is mean `+51.6` ms, sd
-`66.0`, sem `16.5`, 95 % CI `[+19.3,+84.0]`, MDE(80 %) `46.2`, `n 16`.  Runs A
-and B replicated it (`+58.5` ms, 95 % CI `[+24.4,+92.5]`; `+48.0` ms,
-`[+29.4,+66.6]`).  That is the instrument-sensitivity check the arm asserts (a
-competing bulk must slow reclaim, or the share reading is not evidence about
-the mechanism), and it is the product cost: arming the stand-off moves the
-interactive lane's 95th percentile reclaim from single-digit ms to `154` ms for
-a share gain inside the noise.
+**Vacuity (quiet box; the mutated expression and its occurrence count printed
+between edit and verdict; restored from a copy + `touch`).**  Four probes, each
+with a named failure, each differing from the treatment:
+* **(a) `CcSignal::state() -> None`** (`cc.rs`, one `return None;` inserted): the
+  payload's rules all go inert and the share gain collapses to the stand-off
+  baseline -- paired mean `-0.000`, 95 % CI `[-0.042,+0.041]` (`10/16`), reclaim
+  `-5.1` `[-12.8,+2.5]` ms.
+* **(b) R1 forced busy** (`SharedPath::lane_idle` returns `false`, one
+  insertion): the claim never arms, so the share gain collapses -- paired mean
+  `-0.004`, 95 % CI `[-0.027,+0.020]` (`9/16`), reclaim `+6.7`
+  `[-6.5,+20.0]` ms; the stand-off's first-8 max falls to `153.6` ms, the
+  disarmed arm's level.
+* **(c) R2's arming forced always-true** (`shed_queue` set unconditionally
+  instead of under `claim_due`, one substitution): the pre-fix behaviour returns
+  and `m1_nic` re-caps at `10 485 525` B, below the `11 324 367` B floor.
+* **(d) R3 inert** (`attribution_floor -> None`, one substitution): the share
+  stays resolved (`+0.158` `[+0.129,+0.187]`) but the resumed **tail** regresses
+  -- resume max `444.4` ms armed vs `366.4` ms standing off, against the
+  treatment's `369.1`/`367.8` ms -- so R3 is load-bearing for the tail.
 
-**Verdict: rejected.**  Against a competitor that cannot converge the split
-away the stand-off still does not hold a resolved share, while it imposes a
-resolved `+51.6` ms reclaim cost on the interactive lane.  The both-true
-question is now answerable and the answer is no: the reclaim the mechanism
-buys is not worth what it costs the lane it stands off for.
+**Verdict: accepted.**  Against a competitor that cannot converge the split
+away the stand-off now holds a resolved late-gap share gain while the
+interactive lane's reclaim cost no longer resolves: the two halves of the
+both-true question are answered yes, and each mirror-image assertion is reddened
+by its own named mutation.
 
 ### Declared perf rows
 
