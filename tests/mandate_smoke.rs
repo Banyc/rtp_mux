@@ -108,7 +108,7 @@ use futures::future::join_all;
 use mux::LaneClass;
 use netem_test::kit::payload::{cyclic_payload, with_timeout};
 use netem_test::kit::presets::gilbert_elliott_loss;
-use netem_test::kit::stats::{HolSummary, summarize};
+use netem_test::kit::stats::{HolSummary, percentile, summarize};
 use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
 use netem_test::{BottleneckShaper, LossModel, NetemConfig, NetemPair};
 use rtp::metrics::{MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver};
@@ -7363,6 +7363,1088 @@ async fn m4_tcp_standoff_beta_resume() {
     assert!(
         !control_share.is_empty(),
         "[m4-beta-resume] the control cells are missing"
+    );
+}
+
+// ───────── the resume transient's decay, per message index ─────────
+//
+// The composite above reports the resume as two aggregates: the pooled first
+// eight samples of each flow, and the whole-active-window p99. Neither says
+// **how long** the transient lasts, which is the question the lever's shipping
+// decision turns on: a hit confined to the first message(s) with a bounded
+// stabilization time is acceptable, a transient that lasts hundreds of
+// messages is a lasting degradation. This arm records the individual latency
+// of every message by index since the resume, so the decay is a series and
+// the answer is one number per beta.
+//
+// It is a **new arm alongside** the composite: the same topology, the same
+// `M4ResumeSpec` gate, the same window and margin, and the composite's own
+// assertions are untouched. The betas are the control (0.5), the mild end
+// (0.75) and the candidate (0.9); the composite's 1.0 is dropped because its
+// share saturates into 0.9's interval (see `perf/beta-sweep/REPORT-COMPOSITE.md`).
+
+/// The betas the decay sweep measures: the shipped control, the mild end and
+/// the shipping candidate.
+const M4_DECAY_BETAS: [f64; 3] = [0.5, 0.75, 0.9];
+/// Interleaved reps: every rep runs all three betas, order rotated by rep, so a
+/// slow drift is common mode across the cells and the paired deltas are
+/// within-session.
+const M4_DECAY_REPS: usize = 16;
+/// A per-index reading only enters the absolute band search when enough of the
+/// pool contributed: `n >= 24` of the `16 reps x 4 flows = 64` possible
+/// samples, so a caudal index supported by a few late arrivals cannot move it.
+const M4_DECAY_MIN_N: usize = 24;
+/// The horizon inside which the initial excursion's peak is taken: `40`
+/// messages, about the span the reclaim drain is expected to cover. A larger
+/// window median later in the series is the AIMD sawtooth's phase difference
+/// between the cells, not the resume transient.
+const M4_DECAY_PEAK_HORIZON: usize = 40;
+/// The paired **window** the robust decay reads: a `W`-index span over which
+/// each pair's own median difference is taken. `10` messages is `~100 ms` at
+/// the resumed lane's effective (backpressured) rate, and it averages over
+/// enough samples that the occasional repair spike -- two reps of one arm read
+/// `+467`/`+318` ms at a single index -- cannot set the estimate.
+const M4_DECAY_WINDOW: usize = 10;
+/// The window's stride. `5` gives overlapping windows, so the crossing is
+/// resolved to `5` messages rather than `10`.
+const M4_DECAY_WINDOW_STEP: usize = 5;
+/// The practical floor for "back to the control": `25 ms`, about a third of the
+/// first-window excess at `beta 0.9` and below the resumed lane's own
+/// index-to-index variation. A transient is only "settled" once the windowed
+/// median excess is at or below it.
+const M4_DECAY_FLOOR_MS: f64 = 25.0;
+
+/// One sliding window's reading: `(from, to, median, ci_lo, ci_hi, positive,
+/// pairs)`.
+type M4DecayWindow = (usize, usize, f64, f64, f64, usize, usize);
+
+/// One cell's per-index series: the latency and arrival time of message index
+/// `0..` since the resume, per flow, in arrival order.
+struct M4DecayCell {
+    beta: f64,
+    resume_at: f64,
+    /// Whether the stand-off armed before the resume. `false` means the window
+    /// measured the shipped delay-first policy and the per-index series is not
+    /// the lever's.
+    resume_armed: bool,
+    per_flow: Vec<Vec<(f64, f64)>>,
+    quiet_backlog_mean_ms: f64,
+    active_p50: f64,
+    active_p90: f64,
+    active_p99: f64,
+}
+
+fn m4_decay_cell(run: &M4TcpRun, beta: f64) -> M4DecayCell {
+    let agg = m4_resume_cell(run, beta);
+    let resume_at = run
+        .resume_at
+        .expect("the decay arm must record the instant the lane resumed");
+    let mut per_flow: Vec<Vec<(f64, f64)>> = Vec::with_capacity(M4_FLOWS);
+    for flow in 0..M4_FLOWS {
+        let tag = m4_flow_tag(flow);
+        let mut series: Vec<(f64, f64)> = run
+            .samples
+            .iter()
+            .filter(|(t, time, _)| *t == tag && *time >= resume_at)
+            .map(|(_, time, latency)| (*time, *latency))
+            .collect();
+        series.sort_by(|a, b| a.0.total_cmp(&b.0));
+        per_flow.push(series);
+    }
+    M4DecayCell {
+        beta,
+        resume_at,
+        resume_armed: run.resume_armed,
+        per_flow,
+        quiet_backlog_mean_ms: agg.quiet_backlog_mean_ms,
+        active_p50: agg.active_p50,
+        active_p90: agg.active_p90,
+        active_p99: agg.active_p99,
+    }
+}
+
+/// A percentile of an unsorted slice, `NaN` when empty.
+fn m4_percentile_of(mut values: Vec<f64>, q: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    percentile(&values, q)
+}
+
+/// The binomial coefficient `C(n, k)` as `f64`.
+fn m4_binom(n: usize, k: usize) -> f64 {
+    let k = k.min(n - k);
+    let mut r = 1.0f64;
+    for i in 0..k {
+        r = r * (n - i) as f64 / (i + 1) as f64;
+    }
+    r
+}
+
+/// The exact 95 % order-statistic confidence interval of the median of a
+/// **sorted** sample (the binomial rule). For `n < 6` the full range is
+/// returned, so a degenerate sample is not read as a resolved interval.
+fn m4_median_ci(sorted: &[f64]) -> (f64, f64) {
+    let n = sorted.len();
+    if n == 0 {
+        return (f64::NAN, f64::NAN);
+    }
+    if n < 6 {
+        return (sorted[0], sorted[n - 1]);
+    }
+    let two_n = 2f64.powi(n as i32);
+    let mut cum = 0.0f64;
+    let mut rank = 0usize;
+    for k in 0..=n {
+        cum += m4_binom(n, k) / two_n;
+        if cum >= 0.025 {
+            rank = k;
+            break;
+        }
+    }
+    let lo = sorted[rank.saturating_sub(1).min(n - 1)];
+    let hi = sorted[(n - rank).min(n - 1)];
+    (lo, hi)
+}
+
+/// The per-index decay of the interactive lane's resume tail, and the single
+/// number the lever's shipping decision needs: the number of messages (and the
+/// milliseconds) at which the lane is back within the control's spread.
+///
+/// The reading is the **paired per-(rep, flow) difference against the control**,
+/// not the absolute band: the absolute per-index latency rides the bulk lane's
+/// own AIMD sawtooth (the control's per-index p50 swings `95`-`495` ms), which
+/// is common to both cells of a pair and cancels in the difference. The added
+/// transient is therefore the contiguous run from the resume whose paired 95 %
+/// CI excludes zero -- the messages whose latency the lever raised by more than
+/// the run-to-run noise. A beta whose index 0 is not resolved has no added
+/// transient at this sample size, an honest zero.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "the resume transient's per-message decay: 16 interleaved reps x 3 betas x ~14 s; run with --ignored --nocapture --test-threads=1"]
+async fn m4_tcp_standoff_beta_resume_decay() {
+    let _serial = SERIAL.lock().await;
+    let offer_now = std::env::var("MANDATE_SMOKE_FAULT")
+        .is_ok_and(|value| value.trim() == "M4_BETA_RESUME_OFFER_NOW");
+    let dir = out_dir().join("standoff-beta-decay");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cells: Vec<(usize, M4DecayCell)> = Vec::new();
+    let mut series_csv = String::from("rep,beta,flow,index,latency_ms,elapsed_s\n");
+    for rep in 0..M4_DECAY_REPS {
+        // A **rotation**, not a reversal: reversing a three-element list leaves
+        // the middle beta in the middle of every rep, so a positional effect is
+        // attributed to that beta. The rotation puts each beta in each position
+        // across the rep set.
+        let order: Vec<f64> = (0..M4_DECAY_BETAS.len())
+            .map(|k| M4_DECAY_BETAS[(rep + k) % M4_DECAY_BETAS.len()])
+            .collect();
+        for beta in order {
+            let spec = M4ResumeSpec {
+                beta,
+                margin: if offer_now {
+                    Duration::ZERO
+                } else {
+                    M4_RESUME_MARGIN
+                },
+                active: M4_RESUME_ACTIVE,
+                deadline: if offer_now {
+                    Duration::ZERO
+                } else {
+                    M4_RESUME_DEADLINE
+                },
+            };
+            let run = with_timeout(
+                ARM_DEADLINE * 3,
+                "m4/beta-decay window",
+                run_m4_tcp_arm_with(M4_RESUME_WINDOW, Some(spec)),
+            )
+            .await;
+            let cell = m4_decay_cell(&run, beta);
+            let indices: usize = cell.per_flow.iter().map(Vec::len).max().unwrap_or(0);
+            eprintln!(
+                "[m4-decay rep{rep}] beta {beta:.2}  resume_at {:.2}s armed {}  indices {} per flow (min {})  \
+                 active p50 {:7.1} p90 {:7.1} p99 {:7.1}  quiet backlog {:6.1} ms",
+                cell.resume_at,
+                run.resume_armed,
+                indices,
+                cell.per_flow.iter().map(Vec::len).min().unwrap_or(0),
+                cell.active_p50,
+                cell.active_p90,
+                cell.active_p99,
+                cell.quiet_backlog_mean_ms,
+            );
+            for (flow, series) in cell.per_flow.iter().enumerate() {
+                for (index, (elapsed, latency)) in series.iter().enumerate() {
+                    series_csv.push_str(&format!(
+                        "{rep},{beta:.2},{flow},{index},{latency:.3},{elapsed:.4}\n"
+                    ));
+                }
+            }
+            cells.push((rep, cell));
+        }
+    }
+    std::fs::write(dir.join("decay_series.csv"), &series_csv).unwrap();
+
+    // The index axis: the longest per-flow series any cell produced.
+    let max_index = cells
+        .iter()
+        .flat_map(|(_, c)| c.per_flow.iter().map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    // `lat[b][rep][flow][i]` = that pair's latency at index `i`, `None` when the
+    // series is shorter. The **pair** is `(rep, flow)`, so a per-index
+    // difference is within-rep and within-flow and the bulk lane's own AIMD
+    // sawtooth -- which the absolute per-index series rides (the control's own
+    // per-index p50 swings `95`-`495` ms across the window) -- cancels, while
+    // the beta effect does not. That is why the beta's added transient is read
+    // from the paired difference rather than from the absolute band.
+    let mut lat: Vec<Vec<Vec<Vec<Option<f64>>>>> =
+        vec![vec![vec![vec![None; max_index]; M4_FLOWS]; M4_DECAY_REPS]; M4_DECAY_BETAS.len()];
+    for (rep, cell) in &cells {
+        let Some(b) = M4_DECAY_BETAS.iter().position(|beta| *beta == cell.beta) else {
+            continue;
+        };
+        for (flow, flow_series) in cell.per_flow.iter().enumerate() {
+            for (i, (_, latency)) in flow_series.iter().enumerate() {
+                lat[b][*rep][flow][i] = Some(*latency);
+            }
+        }
+    }
+
+    let mut p50s: Vec<Vec<f64>> = vec![vec![f64::NAN; max_index]; M4_DECAY_BETAS.len()];
+    let mut p90s: Vec<Vec<f64>> = vec![vec![f64::NAN; max_index]; M4_DECAY_BETAS.len()];
+    let mut counts: Vec<Vec<usize>> = vec![vec![0; max_index]; M4_DECAY_BETAS.len()];
+    let mut delta_mean: Vec<Vec<f64>> = vec![vec![f64::NAN; max_index]; M4_DECAY_BETAS.len()];
+    let mut delta_med: Vec<Vec<f64>> = vec![vec![f64::NAN; max_index]; M4_DECAY_BETAS.len()];
+    let mut delta_lo: Vec<Vec<f64>> = vec![vec![f64::NAN; max_index]; M4_DECAY_BETAS.len()];
+    let mut delta_hi: Vec<Vec<f64>> = vec![vec![f64::NAN; max_index]; M4_DECAY_BETAS.len()];
+    let mut delta_pos: Vec<Vec<usize>> = vec![vec![0; max_index]; M4_DECAY_BETAS.len()];
+    let mut delta_n: Vec<Vec<usize>> = vec![vec![0; max_index]; M4_DECAY_BETAS.len()];
+    let mut index_csv = String::from(
+        "beta,index,n,p50,p90,paired_mean,paired_median,ci_lo,ci_hi,pos,paired_n,elapsed_s\n",
+    );
+    for i in 0..max_index {
+        for (b, beta) in M4_DECAY_BETAS.iter().enumerate() {
+            let mut at_index: Vec<f64> = Vec::new();
+            let mut paired: Vec<f64> = Vec::new();
+            for (rep, rep_lat) in lat[b].iter().enumerate() {
+                for (flow, pair) in rep_lat.iter().enumerate() {
+                    if let Some(value) = pair[i] {
+                        at_index.push(value);
+                    }
+                    if let (Some(here), Some(control)) = (pair[i], lat[0][rep][flow][i]) {
+                        paired.push(here - control);
+                    }
+                }
+            }
+            counts[b][i] = at_index.len();
+            p50s[b][i] = m4_percentile_of(at_index.clone(), 0.50);
+            p90s[b][i] = m4_percentile_of(at_index.clone(), 0.90);
+            paired.sort_by(|a, b| a.total_cmp(b));
+            let (ci_lo, ci_hi) = m4_median_ci(&paired);
+            delta_mean[b][i] = m4_resume_mean(&paired);
+            delta_med[b][i] = m4_percentile_of(paired.clone(), 0.50);
+            delta_lo[b][i] = ci_lo;
+            delta_hi[b][i] = ci_hi;
+            delta_pos[b][i] = paired.iter().filter(|x| **x > 0.0).count();
+            delta_n[b][i] = paired.len();
+            index_csv.push_str(&format!(
+                "{beta:.2},{i},{},{:.3},{:.3},{:.3},{:.3},{ci_lo:.3},{ci_hi:.3},{},{},{:.4}\n",
+                counts[b][i],
+                p50s[b][i],
+                p90s[b][i],
+                delta_mean[b][i],
+                delta_med[b][i],
+                delta_pos[b][i],
+                paired.len(),
+                m4_resume_mean(
+                    &cells
+                        .iter()
+                        .filter(|(_, c)| c.beta == *beta)
+                        .filter_map(|(_, c)| c
+                            .per_flow
+                            .iter()
+                            .filter_map(|s| s.get(i))
+                            .map(|(t, _)| *t)
+                            .next())
+                        .collect::<Vec<f64>>(),
+                ),
+            ));
+        }
+    }
+    std::fs::write(dir.join("decay_index.csv"), &index_csv).unwrap();
+
+    // The control's active band: the shipped default's own standard deviation
+    // of its whole-active-phase p50/p90. Reported for context; the transient's
+    // **attributable** part is the paired window below, because the absolute
+    // per-index series crosses this band every AIMD cycle.
+    let control_p50: Vec<f64> = cells
+        .iter()
+        .filter(|(_, c)| c.beta == M4_DECAY_BETAS[0])
+        .map(|(_, c)| c.active_p50)
+        .collect();
+    let control_p90: Vec<f64> = cells
+        .iter()
+        .filter(|(_, c)| c.beta == M4_DECAY_BETAS[0])
+        .map(|(_, c)| c.active_p90)
+        .collect();
+    let control_p50_mean = m4_resume_mean(&control_p50);
+    let control_p50_sd = m4_resume_sd(&control_p50);
+    let control_p90_mean = m4_resume_mean(&control_p90);
+    let control_p90_sd = m4_resume_sd(&control_p90);
+    let band50_hi = control_p50_mean + control_p50_sd;
+    let band90_hi = control_p90_mean + control_p90_sd;
+    eprintln!(
+        "[m4-decay control] beta 0.50 active p50 {control_p50_mean:.1} ms (sd {control_p50_sd:.1}) \
+         p90 {control_p90_mean:.1} ms (sd {control_p90_sd:.1}); band upper edges p50 {band50_hi:.1} / p90 {band90_hi:.1} ms"
+    );
+
+    // The robust decay: a **windowed** paired excess. For each `(rep, flow)`
+    // pair the median of its difference over the window is taken, then the
+    // cross-pair median and its exact 95 % order-statistic CI. The per-index
+    // mean is dominated by occasional repair spikes (two reps of one arm read
+    // `+467`/`+318` ms at a single index), so the window's cross-pair median is
+    // the estimate that survives them; the window also averages over the AIMD
+    // sawtooth the raw index rides.
+    let window_starts: Vec<usize> = (0..max_index.saturating_sub(M4_DECAY_WINDOW))
+        .step_by(M4_DECAY_WINDOW_STEP)
+        .collect();
+    // `windows[b]` = `(from, to, median, ci_lo, ci_hi, pos, n)`.
+    let mut windows: Vec<Vec<M4DecayWindow>> = vec![Vec::new(); M4_DECAY_BETAS.len()];
+    let mut window_csv = String::from("beta,from,to,median,ci_lo,ci_hi,pos,n\n");
+    for (b, beta) in M4_DECAY_BETAS.iter().enumerate() {
+        for &from in &window_starts {
+            let to = (from + M4_DECAY_WINDOW).min(max_index);
+            let mut per_pair: Vec<f64> = Vec::new();
+            for (rep, rep_lat) in lat[b].iter().enumerate() {
+                for (flow, pair) in rep_lat.iter().enumerate() {
+                    let diffs: Vec<f64> = (from..to)
+                        .filter_map(|j| match (pair[j], lat[0][rep][flow][j]) {
+                            (Some(here), Some(control)) => Some(here - control),
+                            _ => None,
+                        })
+                        .collect();
+                    if !diffs.is_empty() {
+                        per_pair.push(m4_percentile_of(diffs, 0.50));
+                    }
+                }
+            }
+            per_pair.sort_by(|a, b| a.total_cmp(b));
+            let (ci_lo, ci_hi) = m4_median_ci(&per_pair);
+            let median = m4_percentile_of(per_pair.clone(), 0.50);
+            let pos = per_pair.iter().filter(|x| **x > 0.0).count();
+            let n = per_pair.len();
+            windows[b].push((from, to, median, ci_lo, ci_hi, pos, n));
+            window_csv.push_str(&format!(
+                "{beta:.2},{from},{to},{median:.1},{ci_lo:.1},{ci_hi:.1},{pos},{n}\n"
+            ));
+        }
+    }
+    std::fs::write(dir.join("decay_window.csv"), &window_csv).unwrap();
+
+    // The median arrival of an index since the resume, over every (rep, flow)
+    // that reached it: the messages-to-milliseconds bridge.
+    let index_elapsed_ms = |beta: f64, index: usize| -> f64 {
+        let mut xs: Vec<f64> = Vec::new();
+        for (_, c) in cells.iter().filter(|(_, c)| c.beta == beta) {
+            for flow_series in &c.per_flow {
+                if let Some((elapsed, _)) = flow_series.get(index) {
+                    xs.push((elapsed - c.resume_at) * 1000.0);
+                }
+            }
+        }
+        xs.sort_by(|a, b| a.total_cmp(b));
+        if xs.is_empty() {
+            f64::NAN
+        } else {
+            xs[xs.len() / 2]
+        }
+    };
+
+    let mut summary_csv = String::from(
+        "beta,control,w0_median,w0_ci_lo,w0_ci_hi,w0_pos,w0_n,peak_from,peak_median,\
+         zero_from,zero_index,zero_ms,floor_from,floor_index,floor_ms,last_above_floor_from,\
+         excess_ms,p99_delta_ms,quiet_backlog_mean_ms,drain_4x_backlog_ms,\
+         active_p50,active_p90,active_p99\n",
+    );
+    for (b, beta) in M4_DECAY_BETAS.iter().enumerate() {
+        let cs: Vec<&M4DecayCell> = cells
+            .iter()
+            .filter(|(_, c)| c.beta == *beta)
+            .map(|(_, c)| c)
+            .collect();
+        let w0 = windows[b]
+            .first()
+            .copied()
+            .unwrap_or((0, 0, f64::NAN, f64::NAN, f64::NAN, 0, 0));
+        // The peak of the initial excursion: the largest window median in the
+        // first `M4_DECAY_PEAK_HORIZON` messages. A later peak is the sawtooth's
+        // phase difference between the cells, not the resume transient.
+        let mut peak = w0;
+        for w in windows[b]
+            .iter()
+            .copied()
+            .filter(|w| w.0 <= M4_DECAY_PEAK_HORIZON)
+        {
+            if w.2.is_finite() && (peak.2.is_nan() || w.2 > peak.2) {
+                peak = w;
+            }
+        }
+        // The first window at or after the peak whose median has returned to
+        // zero (the transient's end), and the first at or below the floor.
+        let find = |pred: &dyn Fn(f64) -> bool| -> Option<(usize, usize, f64)> {
+            windows[b]
+                .iter()
+                .copied()
+                .filter(|w| w.0 >= peak.0)
+                .find(|w| pred(w.2))
+                .map(|w| (w.0, w.1, w.2))
+        };
+        let zero = find(&|m| m <= 0.0);
+        let floor = find(&|m| m <= M4_DECAY_FLOOR_MS);
+        let last_above = windows[b]
+            .iter()
+            .copied()
+            .filter(|w| w.2 > M4_DECAY_FLOOR_MS)
+            .map(|w| w.0)
+            .max();
+        let zero_index = zero.map(|z| z.1).unwrap_or(0);
+        let zero_ms = if zero_index == 0 {
+            0.0
+        } else {
+            index_elapsed_ms(*beta, zero_index.min(max_index - 1))
+        };
+        let floor_index = floor.map(|f| f.1).unwrap_or(0);
+        let floor_ms = if floor_index == 0 {
+            0.0
+        } else {
+            index_elapsed_ms(*beta, floor_index.min(max_index - 1))
+        };
+        // The paired latency the raised region carries per pair: the sum of the
+        // positive paired differences over its messages.
+        let transient = if zero_index == 0 {
+            M4_DECAY_WINDOW
+        } else {
+            zero_index
+        };
+        let mut excess_per_pair: Vec<f64> = Vec::new();
+        for (rep, rep_lat) in lat[b].iter().enumerate() {
+            for (flow, pair) in rep_lat.iter().enumerate() {
+                let mut excess = 0.0f64;
+                let mut present = false;
+                for (here, control) in pair.iter().zip(lat[0][rep][flow].iter()).take(transient) {
+                    if let (Some(here), Some(control)) = (here, control) {
+                        excess += (here - control).max(0.0);
+                        present = true;
+                    }
+                }
+                if present {
+                    excess_per_pair.push(excess);
+                }
+            }
+        }
+        let excess_ms = m4_resume_mean(&excess_per_pair);
+        let quiet_backlog = m4_resume_mean(
+            &cs.iter()
+                .map(|c| c.quiet_backlog_mean_ms)
+                .collect::<Vec<f64>>(),
+        );
+        let p99_delta = m4_resume_mean(&cs.iter().map(|c| c.active_p99).collect::<Vec<f64>>())
+            - m4_resume_mean(
+                &cells
+                    .iter()
+                    .filter(|(_, c)| c.beta == M4_DECAY_BETAS[0])
+                    .map(|(_, c)| c.active_p99)
+                    .collect::<Vec<f64>>(),
+            );
+        eprintln!(
+            "[m4-decay] beta {beta:.2}  w0 median {:.1} [{:.1},{:.1}] pos {}/{}  \
+             peak {:.1} at msg {}  zero msg {} ({:.0} ms)  floor msg {} ({:.0} ms)  \
+             last_above_floor msg {:?}  excess {excess_ms:.0} ms/pair  p99 delta {p99_delta:+.1} ms  \
+             quiet_backlog {quiet_backlog:.1} ms  drain_4x {:.1} ms  active p50 {:.1} p90 {:.1} p99 {:.1}",
+            w0.2,
+            w0.3,
+            w0.4,
+            w0.5,
+            w0.6,
+            peak.2,
+            peak.0,
+            zero_index,
+            zero_ms,
+            floor_index,
+            floor_ms,
+            last_above,
+            quiet_backlog * 4.0,
+            m4_resume_mean(&cs.iter().map(|c| c.active_p50).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.active_p90).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.active_p99).collect::<Vec<f64>>()),
+        );
+        summary_csv.push_str(&format!(
+            "{beta:.2},{},{:.1},{:.1},{:.1},{},{},{},{:.1},{},{zero_index},{zero_ms:.1},{},{floor_index},{floor_ms:.1},{:?},{excess_ms:.0},{p99_delta:.1},{quiet_backlog:.3},{:.3},{:.3},{:.3},{:.3}\n",
+            if b == 0 { 1 } else { 0 },
+            w0.2,
+            w0.3,
+            w0.4,
+            w0.5,
+            w0.6,
+            peak.0,
+            peak.2,
+            zero.map(|z| z.0).unwrap_or(0),
+            floor.map(|f| f.0).unwrap_or(0),
+            last_above.unwrap_or(0),
+            quiet_backlog * 4.0,
+            m4_resume_mean(&cs.iter().map(|c| c.active_p50).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.active_p90).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.active_p99).collect::<Vec<f64>>()),
+        ));
+    }
+    std::fs::write(dir.join("decay_summary.csv"), &summary_csv).unwrap();
+    eprintln!("[m4-decay] data: {}", dir.display());
+
+    // ---- assertions: instrument sanity, not the lever's direction ----------
+    for (rep, cell) in &cells {
+        assert!(
+            cell.resume_armed,
+            "[m4-decay] rep{rep} beta {:.2}: the bulk stand-off was never armed before the \
+             resume, so this window measured the shipped delay-first policy rather than the \
+             competing episode the lever sets, and the per-index series is not the lever's \
+             (MANDATE_SMOKE_FAULT=M4_BETA_RESUME_OFFER_NOW produces exactly this)",
+            cell.beta,
+        );
+        assert!(
+            cell.per_flow.iter().all(|s| !s.is_empty()),
+            "[m4-decay] rep{rep} beta {:.2}: a flow delivered no sample after the \
+             resume, so its per-index series is absent and the stabilization \
+             index would be read from a partial pool",
+            cell.beta,
+        );
+        assert!(
+            cell.per_flow.iter().map(Vec::len).max().unwrap_or(0) >= 200,
+            "[m4-decay] rep{rep} beta {:.2}: the longest per-flow series is {} \
+             message(s), short of the 200 the decay needs",
+            cell.beta,
+            cell.per_flow.iter().map(Vec::len).max().unwrap_or(0),
+        );
+    }
+    assert!(
+        max_index >= 200
+            && delta_n.iter().all(|d| d[0] > 0)
+            && windows
+                .iter()
+                .all(|w| w.first().is_some_and(|w0| w0.6 >= M4_DECAY_MIN_N)),
+        "[m4-decay] the sweep read no usable per-index series (max index {max_index}, paired n at \
+         index 0 {:?}, first-window pairs {:?}): the resume yielded no messages to read a \
+         transient from",
+        delta_n.iter().map(|d| d[0]).collect::<Vec<usize>>(),
+        windows
+            .iter()
+            .map(|w| w.first().map(|w0| w0.6).unwrap_or(0))
+            .collect::<Vec<usize>>(),
+    );
+}
+
+// ─── (B) with no competitor: the stand-off cannot arm, so beta is inert ───
+//
+// The operator's second question: on the Minecraft scenario, where there is no
+// TCP competitor, does beta regress the latency? If not, the lever is a win.
+// The answer must be a **paired, same-session** measurement rather than a
+// comparison against an archived baseline: this arm runs the Minecraft shape,
+// M1 clean and M1 hostile, each at beta 0.5 and 0.9 in the same rep, order
+// alternated, and pairs the readings within the session.
+//
+// The structural claim is that with no competitor the stand-off *cannot* arm,
+// so beta is inert there. The gate that arms the stand-off is the interactive
+// lane's own **offer clock**, not the presence of a competitor: a lane offering
+// at its cadence keeps `offered_quiet_for()` far below `STANDOFF_WINDOW`, so
+// `Standoff::decide`'s claim branch never runs and the beta-varying decrease is
+// never reached. This arm demonstrates that from the instrument -- it samples
+// the hub's own activity witness for the whole run and requires the armed time
+// to read exactly zero -- rather than asserting it.
+
+/// The two factors the no-competitor pair runs: the shipped control and the
+/// shipping candidate.
+const BETA_INERT_BETAS: [f64; 2] = [0.5, 0.9];
+/// Interleaved reps of each (shape, beta) pair.
+const BETA_INERT_REPS: usize = 16;
+/// The quiet-clock sampler's cadence: `10 ms` against a `1500 ms` window, so a
+/// window that opens cannot be missed and the sampler's lock traffic is
+/// negligible beside the transport's own read of the same signal.
+const BETA_INERT_QUIET_CADENCE: Duration = Duration::from_millis(10);
+/// A witness reading below this is "the lane is still offering": the offer
+/// clock is reset on every offer and while send-path data is pending, so a
+/// fresh reading is observed at most a cadence plus a scheduling jitter after
+/// an offer. It is deliberately well below `STANDOFF_WINDOW`.
+const QUIET_CLOCK_FRESH_MS: u64 = 500;
+/// The instrument-vacuity block's offer cadence: above `STANDOFF_WINDOW`, so the
+/// lane goes quiet past the window and the sampler reads a non-zero armed time.
+const BETA_INERT_VACUITY_CADENCE: Duration = Duration::from_millis(3000);
+/// The vacuity block's window: long enough for two 3 s gaps, short enough to
+/// cost little, since it is an instrument check and not a product reading.
+const BETA_INERT_VACUITY_WINDOW: Duration = Duration::from_secs(6);
+
+/// One sampled read of a path's stand-off activity witness, restricted to the
+/// arm's own offer window.
+#[derive(Clone, Copy, Debug, Default)]
+struct QuietClock {
+    samples: u64,
+    /// The largest `offered_quiet_for()` the sampler read inside the window.
+    /// `None` (no offer ever) is read as the elapsed time since the probe
+    /// started, the same fallback the transport's own gate uses for a
+    /// never-used path.
+    max_quiet_ms: u64,
+    /// Samples at or above `STANDOFF_WINDOW`, inside the window: the window the
+    /// transport's `claim_due` needs. Zero means the beta-varying branch was
+    /// unreachable.
+    armed_samples: u64,
+    /// The armed samples **before** the offer clock first settled: the
+    /// connection-setup gap between the handshake's own writes and the first
+    /// application offer, which is a property of the arm's setup rather than of
+    /// the lane in operation.
+    armed_startup_samples: u64,
+    /// The armed samples **at or after** the offer clock first settled, i.e.
+    /// while the interactive lane was in steady offer. This is the reading the
+    /// structural claim rests on: zero means the stand-off never armed with the
+    /// lane running.
+    armed_steady_samples: u64,
+    /// The elapsed time at which the offer clock first settled, or `u64::MAX`
+    /// when the lane never reached a steady offer run.
+    steady_from_ms: u64,
+    /// The elapsed time at the first offer the sampler witnessed, or `u64::MAX`
+    /// when it never saw one.
+    first_witness_ms: u64,
+    /// The probe-elapsed cut of the offer window the stats above were taken
+    /// over: the arm's delivered span plus `200 ms`, so the teardown's growing
+    /// quiet (the lane has stopped offering) is not read as an in-arm arming.
+    cutoff_ms: u64,
+}
+
+/// The sampler's raw series: `(probe-elapsed ms, quiet ms)` per sample, plus
+/// the probe elapsed at the first witnessed offer.
+#[derive(Default)]
+struct QuietClockSeries {
+    series: Vec<(u64, u64)>,
+    first_witness_ms: Option<u64>,
+}
+
+/// The quiet-clock sampler as a future: read the path's offer witness every
+/// `cadence` until `stop` is set. It is a future rather than a spawned task so
+/// the crate's no-detached-spawn policy holds: the caller drives it with
+/// `tokio::join!` beside the arm, and it cannot outlive the call.
+async fn quiet_clock_until_stopped(
+    signal: rtp::cc::CcSignal,
+    cadence: Duration,
+    stop: Arc<AtomicBool>,
+) -> QuietClockSeries {
+    let start = Instant::now();
+    let mut out = QuietClockSeries::default();
+    while !stop.load(Ordering::Relaxed) {
+        let observed = signal.offered_quiet_for();
+        let quiet_ms = observed
+            .map(|quiet| quiet.as_millis() as u64)
+            .unwrap_or_else(|| start.elapsed().as_millis() as u64);
+        if observed.is_some() && out.first_witness_ms.is_none() {
+            out.first_witness_ms = Some(start.elapsed().as_millis() as u64);
+        }
+        out.series
+            .push((start.elapsed().as_millis() as u64, quiet_ms));
+        tokio::time::sleep(cadence).await;
+    }
+    out
+}
+
+/// The quiet-clock stats inside the sampler's offer window. The window ends at
+/// the last sample whose witness was **fresh** (below
+/// [`QUIET_CLOCK_FRESH_MS`]): the lane's offer clock is reset on every offer
+/// and on pending send-path data, so a fresh reading means the lane was still
+/// offering, while the growing quiet after the last one is the teardown idle,
+/// not an in-arm arming.
+///
+/// `steady_from_ms` is the instant the interactive lane's **first application
+/// offer** was sent, read from the arm's own timestamped messages
+/// (`arrival - latency`). The offer clock records the transport's handshake
+/// writes too, so the arm's connection-setup gap (handshake offer -> first
+/// application offer, ~1.5 s) is itself a quiet stretch that crosses the
+/// window at its end; it is a property of the arm's setup, not of the lane in
+/// operation, and armed samples before it are counted separately.
+fn quiet_clock_in_window(series: &QuietClockSeries, steady_from_ms: u64) -> QuietClock {
+    let window_ms = rtp::cc::STANDOFF_WINDOW.as_millis() as u64;
+    let cutoff_ms = series
+        .series
+        .iter()
+        .filter(|(_, quiet)| *quiet < QUIET_CLOCK_FRESH_MS)
+        .map(|(elapsed, _)| *elapsed)
+        .max()
+        .unwrap_or(0);
+    let mut clock = QuietClock {
+        first_witness_ms: series.first_witness_ms.unwrap_or(u64::MAX),
+        steady_from_ms,
+        cutoff_ms,
+        ..QuietClock::default()
+    };
+    for (elapsed, quiet) in series.series.iter().copied() {
+        if elapsed > cutoff_ms {
+            break;
+        }
+        clock.samples += 1;
+        clock.max_quiet_ms = clock.max_quiet_ms.max(quiet);
+        if quiet >= window_ms {
+            clock.armed_samples += 1;
+            // A sample is "in steady offer" only once the offer clock has had a
+            // full sampler cadence after the first application offer to reflect
+            // the reset: the sample at the same instant as that offer can still
+            // read the pre-offer (setup-gap) clock, and it is the setup gap the
+            // stand-off is meant to be measured apart from.
+            let steady_after_ms =
+                steady_from_ms.saturating_add(BETA_INERT_QUIET_CADENCE.as_millis() as u64);
+            if steady_from_ms != u64::MAX && elapsed >= steady_after_ms {
+                clock.armed_steady_samples += 1;
+            } else {
+                clock.armed_startup_samples += 1;
+            }
+        }
+    }
+    clock
+}
+
+/// Run one arm with a quiet-clock sampler over its own CC hub, returning the
+/// arm's reading, the clock read inside the arm's offer window, the sampler's
+/// raw series, and the hub's own beta readback.
+async fn run_arm_with_quiet_clock(
+    spec: ArmSpec,
+    hub: rtp::cc::CcSignalHub,
+) -> (ArmRun, QuietClock, QuietClockSeries, f64) {
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let signal = hub.group(loopback, loopback).bulk();
+    let readback = signal.standoff_decrease_factor();
+    // The sampler runs beside the arm on this task, stopped by the arm's own
+    // completion: no detached spawn, and the probe cannot outlive the call.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_arm = Arc::clone(&stop);
+    let (run, series) = tokio::join!(
+        async move {
+            let run = run_arm(spec).await;
+            stop_arm.store(true, Ordering::Relaxed);
+            run
+        },
+        quiet_clock_until_stopped(signal, BETA_INERT_QUIET_CADENCE, stop),
+    );
+    // The arm's own evidence for the lane's **first application offer**: each
+    // delivered message's send time is its arrival minus its measured latency,
+    // and the earliest of those is the instant the application started offering
+    // (the connection-setup handshake's own offers are earlier and, being
+    // setup, are the startup boundary counted separately).
+    let steady_from_ms = run
+        .timeline
+        .iter()
+        .map(|(arrival_s, latency_ms)| (arrival_s * 1000.0 - latency_ms).max(0.0))
+        .fold(f64::INFINITY, f64::min);
+    let steady_from_ms = if steady_from_ms.is_finite() {
+        steady_from_ms as u64
+    } else {
+        u64::MAX
+    };
+    let clock = quiet_clock_in_window(&series, steady_from_ms);
+    (run, clock, series, readback)
+}
+
+/// One no-competitor cell: the arm's reading plus the quiet clock sampled over
+/// its own CC hub.
+struct BetaInertCell {
+    shape: String,
+    rep: usize,
+    beta: f64,
+    readback: f64,
+    p50: f64,
+    p90: f64,
+    p99: f64,
+    max: f64,
+    over250: usize,
+    delivery: f64,
+    bulk_bytes: u64,
+    clock: QuietClock,
+}
+
+/// A paired metric's name and the cell field it reads.
+type BetaInertMetric = (&'static str, fn(&BetaInertCell) -> f64);
+
+/// The no-competitor (B) arms, paired within one session against the same arm
+/// at beta 0.5, with the stand-off's own armed time read from the instrument.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "the no-competitor (B) arms under beta: 3 shapes x 2 betas x 16 interleaved reps; run with --ignored --nocapture --test-threads=1"]
+async fn beta_inert_without_a_competitor() {
+    let _serial = SERIAL.lock().await;
+    // The vacuity hook: build every hub at the control factor, so a beta 0.9
+    // cell's own readback names the arm that did not apply the factor it
+    // labelled the cell with.
+    let flat =
+        std::env::var("MANDATE_SMOKE_FAULT").is_ok_and(|value| value.trim() == "BETA_INERT_FLAT");
+    let dir = out_dir().join("beta-inert");
+    std::fs::create_dir_all(&dir).unwrap();
+    let m1 = mandate_arms("M1");
+    let m1_clean = m1[0].clone();
+    let m1_hostile = m1[1].clone();
+    let shapes = ["minecraft", "m1_clean", "m1_hostile"];
+
+    let mut rows_csv = String::from(
+        "shape,rep,beta,readback,p50,p90,p99,max,over250,delivery,bulk_bytes,\
+         quiet_samples,quiet_max_ms,quiet_armed_samples,quiet_armed_startup_samples,\
+         quiet_armed_steady_samples,quiet_first_witness_ms,quiet_steady_from_ms,quiet_cutoff_ms\n",
+    );
+    let mut quiet_csv = String::from("shape,rep,beta,elapsed_ms,quiet_ms\n");
+    let mut cells: Vec<BetaInertCell> = Vec::new();
+    for shape in shapes {
+        for rep in 0..BETA_INERT_REPS {
+            let mut order: Vec<f64> = BETA_INERT_BETAS.to_vec();
+            if rep % 2 == 1 {
+                order.reverse();
+            }
+            for beta in order {
+                let hub_beta = if flat { BETA_INERT_BETAS[0] } else { beta };
+                let hub = rtp::cc::CcSignalHub::with_standoff_decrease_factor(hub_beta);
+                let spec = match shape {
+                    "minecraft" => mc_nic_arm("mc_beta", Some(hub.clone())),
+                    "m1_clean" => {
+                        let mut spec = m1_clean.clone();
+                        spec.cc_link = Some(hub.clone());
+                        spec
+                    }
+                    _ => {
+                        let mut spec = m1_hostile.clone();
+                        spec.cc_link = Some(hub.clone());
+                        spec
+                    }
+                };
+                let (run, clock, series, readback) = run_arm_with_quiet_clock(spec, hub).await;
+                for (elapsed, quiet) in &series.series {
+                    quiet_csv.push_str(&format!("{shape},{rep},{beta:.2},{elapsed},{quiet}\n"));
+                }
+                let s = &run.summary;
+                let cell = BetaInertCell {
+                    shape: shape.to_owned(),
+                    rep,
+                    beta,
+                    readback,
+                    p50: s.p50,
+                    p90: s.p90,
+                    p99: s.p99,
+                    max: s.max,
+                    over250: over250_count(&run.samples),
+                    delivery: s.delivery_pct,
+                    bulk_bytes: run.bulk_sink_bytes,
+                    clock,
+                };
+                eprintln!(
+                    "[beta-inert {shape} rep{rep}] beta {beta:.2} readback {readback:.2}  \
+                     p50 {:7.1} p90 {:7.1} p99 {:7.1} max {:8.1} over250 {:>4}  \
+                     delivery {:.3}  bulk {} B  quiet samples {} max {:5} ms armed {} \
+                     (startup {} / steady {}) steady_from {} first_witness {} cutoff {}",
+                    cell.p50,
+                    cell.p90,
+                    cell.p99,
+                    cell.max,
+                    cell.over250,
+                    cell.delivery,
+                    cell.bulk_bytes,
+                    cell.clock.samples,
+                    cell.clock.max_quiet_ms,
+                    cell.clock.armed_samples,
+                    cell.clock.armed_startup_samples,
+                    cell.clock.armed_steady_samples,
+                    cell.clock.steady_from_ms,
+                    cell.clock.first_witness_ms,
+                    cell.clock.cutoff_ms,
+                );
+                rows_csv.push_str(&format!(
+                    "{shape},{rep},{beta:.2},{readback:.2},{:.1},{:.1},{:.1},{:.1},{},{:.4},{},{},{},{},{},{},{},{},{}\n",
+                    cell.p50,
+                    cell.p90,
+                    cell.p99,
+                    cell.max,
+                    cell.over250,
+                    cell.delivery,
+                    cell.bulk_bytes,
+                    cell.clock.samples,
+                    cell.clock.max_quiet_ms,
+                    cell.clock.armed_samples,
+                    cell.clock.armed_startup_samples,
+                    cell.clock.armed_steady_samples,
+                    cell.clock.first_witness_ms,
+                    cell.clock.steady_from_ms,
+                    cell.clock.cutoff_ms,
+                ));
+                cells.push(cell);
+            }
+        }
+    }
+
+    // The paired reading per shape: beta 0.9 minus beta 0.5, within the rep.
+    let mut pair_csv = String::from(
+        "shape,metric,control_mean,beta_mean,paired_delta,ci95_lo,ci95_hi,paired_median,\
+         med_ci_lo,med_ci_hi,reps_positive,reps\n",
+    );
+    let metrics: [BetaInertMetric; 4] = [
+        ("p50", |c| c.p50),
+        ("p99", |c| c.p99),
+        ("max", |c| c.max),
+        ("over250", |c| c.over250 as f64),
+    ];
+    for shape in shapes {
+        for (name, pick) in metrics {
+            let value = |beta: f64| -> Vec<f64> {
+                cells
+                    .iter()
+                    .filter(|c| c.shape == shape && c.beta == beta)
+                    .map(pick)
+                    .collect()
+            };
+            let control = value(BETA_INERT_BETAS[0]);
+            let treatment = value(BETA_INERT_BETAS[1]);
+            let mut paired: Vec<f64> = Vec::new();
+            for rep in 0..BETA_INERT_REPS {
+                let at = |beta: f64| {
+                    cells
+                        .iter()
+                        .find(|c| c.shape == shape && c.rep == rep && c.beta == beta)
+                        .map(pick)
+                };
+                if let (Some(c), Some(t)) = (at(BETA_INERT_BETAS[0]), at(BETA_INERT_BETAS[1])) {
+                    paired.push(t - c);
+                }
+            }
+            let d_mean = m4_resume_mean(&paired);
+            let sem = m4_resume_sd(&paired) / (paired.len() as f64).sqrt();
+            let (ci_lo, ci_hi) = if sem.is_finite() {
+                (d_mean - 1.96 * sem, d_mean + 1.96 * sem)
+            } else {
+                (f64::NAN, f64::NAN)
+            };
+            // The **median** paired difference and its exact order-statistic CI,
+            // beside the mean's. A per-rep repair spike moves the mean and not
+            // the median, so the two together say whether an apparent move is a
+            // body shift or one rare event.
+            let mut sorted = paired.clone();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let (med_lo, med_hi) = m4_median_ci(&sorted);
+            let d_med = m4_percentile_of(sorted.clone(), 0.50);
+            let positive = paired.iter().filter(|d| **d > 0.0).count();
+            eprintln!(
+                "[beta-inert] {shape:<11} {name:<7} control {:8.2} beta0.9 {:8.2}  \
+                 paired mean {:+8.2} CI [{:+.2},{:+.2}]  median {:+8.2} CI [{:+.2},{:+.2}]  {positive}/{} positive",
+                m4_resume_mean(&control),
+                m4_resume_mean(&treatment),
+                d_mean,
+                ci_lo,
+                ci_hi,
+                d_med,
+                med_lo,
+                med_hi,
+                paired.len(),
+            );
+            pair_csv.push_str(&format!(
+                "{shape},{name},{:.3},{:.3},{d_mean:.3},{ci_lo:.3},{ci_hi:.3},{d_med:.3},{med_lo:.3},{med_hi:.3},{positive},{}\n",
+                m4_resume_mean(&control),
+                m4_resume_mean(&treatment),
+                paired.len(),
+            ));
+        }
+    }
+    std::fs::write(dir.join("beta_inert_cells.csv"), &rows_csv).unwrap();
+    std::fs::write(dir.join("beta_inert_pairs.csv"), &pair_csv).unwrap();
+
+    // The instrument-vacuity block: the SAME no-competitor topology with the
+    // interactive lane offering only every 3 s, so the offer clock opens the
+    // 1500 ms window and the sampler must read a non-zero armed time. Without
+    // this, a zero armed time in the arms above would be indistinguishable from
+    // a sampler that cannot read.
+    let vacuity_hub = rtp::cc::CcSignalHub::with_standoff_decrease_factor(BETA_INERT_BETAS[1]);
+    let mut vacuity_spec = mc_nic_arm("mc_quiet_vacuity", Some(vacuity_hub.clone()));
+    vacuity_spec.cadence = BETA_INERT_VACUITY_CADENCE;
+    vacuity_spec.window = BETA_INERT_VACUITY_WINDOW;
+    let (vacuity_run, vacuity_clock, vacuity_series, vacuity_readback) =
+        run_arm_with_quiet_clock(vacuity_spec, vacuity_hub).await;
+    for (elapsed, quiet) in &vacuity_series.series {
+        quiet_csv.push_str(&format!("vacuity,0,0.90,{elapsed},{quiet}\n"));
+    }
+    std::fs::write(dir.join("beta_inert_quiet.csv"), &quiet_csv).unwrap();
+    eprintln!(
+        "[beta-inert vacuity] quiet-lane cadence {:?} window {:?}: samples {} max_quiet {} ms \
+         armed {} (startup {} / steady {}) steady_from {} ms (beta readback {:.2}, {} delivered)",
+        BETA_INERT_VACUITY_CADENCE,
+        BETA_INERT_VACUITY_WINDOW,
+        vacuity_clock.samples,
+        vacuity_clock.max_quiet_ms,
+        vacuity_clock.armed_samples,
+        vacuity_clock.armed_startup_samples,
+        vacuity_clock.armed_steady_samples,
+        vacuity_clock.steady_from_ms,
+        vacuity_readback,
+        vacuity_run.summary.received,
+    );
+    eprintln!("[beta-inert] data: {}", dir.display());
+
+    // ---- assertions --------------------------------------------------------
+    assert!(!cells.is_empty(), "[beta-inert] no cell was measured");
+    for cell in &cells {
+        let (shape, rep, beta, readback) = (&cell.shape, cell.rep, cell.beta, cell.readback);
+        assert!(
+            (readback - beta).abs() < 1e-9,
+            "[beta-inert] {shape} rep{rep} beta {beta:.2}: the hub read back {readback:.2} -- \
+             the arm did not apply the per-path factor it labelled the cell with, so a flat pair \
+             would be a property of the arm and not of the lever \
+             (MANDATE_SMOKE_FAULT=BETA_INERT_FLAT produces exactly this)"
+        );
+    }
+    // The structural claim, from the instrument: the stand-off's own armed time
+    // reads zero in every (shape, beta) cell, and its first witness is well
+    // inside the window. The vacuity block above is what makes this fail-able.
+    for cell in &cells {
+        let (shape, rep, beta, clock) = (&cell.shape, cell.rep, cell.beta, cell.clock);
+        assert!(
+            clock.samples > 0,
+            "[beta-inert] {shape} rep{rep} beta {beta:.2}: the quiet-clock sampler took no \
+             sample, so a zero armed time is an absent instrument and not a reading"
+        );
+        assert!(
+            clock.first_witness_ms != u64::MAX,
+            "[beta-inert] {shape} rep{rep} beta {beta:.2}: the sampler never witnessed an offer \
+             on the interactive path, so the quiet clock it read was the never-used-path fallback \
+             rather than the lane's own"
+        );
+        assert!(
+            clock.steady_from_ms != u64::MAX,
+            "[beta-inert] {shape} rep{rep} beta {beta:.2}: the arm delivered no timestamped \
+             message, so the instant the lane's first application offer was sent is unknown and a \
+             zero steady armed time would be vacuous"
+        );
+        assert_eq!(
+            clock.armed_steady_samples,
+            0,
+            "[beta-inert] {shape} rep{rep} beta {beta:.2}: with the interactive lane in steady \
+             offer (fresh from {} ms), the stand-off's offer clock reached STANDOFF_WINDOW ({} ms) \
+             for {} of {} samples after that point (max quiet {} ms) -- the beta-varying branch \
+             was reachable while the lane was running, so beta is not inert here",
+            clock.steady_from_ms,
+            rtp::cc::STANDOFF_WINDOW.as_millis(),
+            clock.armed_steady_samples,
+            clock.samples,
+            clock.max_quiet_ms,
+        );
+    }
+    // The vacuity block must have armed the window **in steady offer**, or the
+    // zeros above are not evidence that the instrument can read a window opening
+    // while the lane is running.
+    assert!(
+        vacuity_clock.armed_steady_samples > 0,
+        "[beta-inert] the instrument-vacuity block (a no-competitor lane offering only every {:?}, \
+         steady from {} ms) read no steady armed time ({} startup / {} steady armed of {} samples, \
+         max quiet {} ms), so the sampler cannot read a window opening and the zero steady readings \
+         above prove nothing",
+        BETA_INERT_VACUITY_CADENCE,
+        vacuity_clock.steady_from_ms,
+        vacuity_clock.armed_startup_samples,
+        vacuity_clock.armed_steady_samples,
+        vacuity_clock.samples,
+        vacuity_clock.max_quiet_ms,
     );
 }
 

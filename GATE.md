@@ -737,6 +737,145 @@ baseline, `M4@lane=dual+shape=quiet-then-resume+flows=4+load=mux-bulk-vs-aimd-re
 a `composite(flows,load,mechanism,metric,shape,shaper)` on the `constitution`
 family, so a later revision can cost it without restating the cell.
 
+### The resume transient's decay, and beta's inertness with no competitor
+
+The composite above reads the resume as two aggregates (each flow's first eight
+samples, the whole-active-window p99) and cannot say how long the transient
+lasts. Two arms close that.
+
+**`mandate_smoke::m4_tcp_standoff_beta_resume_decay`** (`full`, `852` s) reuses
+the composite's topology, `M4ResumeSpec` gate, margin and window, and records
+every interactive message's latency against its **index since the resume**.
+Sixteen interleaved reps of beta {0.5 control, 0.75, 0.9}, order **rotated** by
+rep: reversing a three-element list leaves the middle beta in the middle of
+every rep, which attributes a positional effect to it (the arm's first run used
+a reversal and read beta 0.75 as an outlier-driven `+117` ms at message 0; the
+rotated run reads `+2` ms).
+
+The reading is the **paired per-`(rep, flow)` difference against the control**,
+windowed over 10 messages (stride 5), as a cross-pair **median** with its exact
+95 % order-statistic CI. The pairing cancels the bulk lane's own AIMD sawtooth,
+which the absolute per-index series rides -- the control's own per-index p50
+swings `41`-`479` ms across the window and crosses its active band
+(`159.3 +/- 24.8` ms) every cycle, so an absolute band rule lands at the
+window's end for every beta and measures the sawtooth, not the lever. The
+per-index **mean** is likewise dominated by occasional repair spikes (two reps
+of one arm read `+467`/`+318` ms at a single index); the windowed cross-pair
+median does not move on them.
+
+| metric | bound | BEFORE 0.50 | AFTER 0.75 | AFTER 0.90 |
+| --- | --- | --- | --- | --- |
+| first-window (msgs 0-9) added latency, median over 64 pairs | CI lower `> 0` | 0 (control) | -0.6 `[-12.3,+18.1]` **NOT RESOLVED** | **+63.2 `[+41.2,+93.0]` RESOLVED**, 59/64 positive |
+| per-index paired median, message 0 | CI lower `> 0` | 0 | +2.4 `[-10.3,+16.0]` | **+74.1 `[+59.6,+94.4]`**, 63/64 positive |
+| messages until the windowed median excess is `<= +25 ms` | -- | 0 | 50 | **25 (576.0 ms)** |
+| messages until the windowed median excess is `<= 0` | -- | 0 | 55 | **30 (596.0 ms)** |
+| quiet-phase mean backlog (ms) | none (mechanism) | 68.5 | 75.8 | 83.1 |
+| `4 x quiet backlog` (ms), the closed-loop drain estimate | none (mechanism) | 273.9 | 303.2 | 332.5 |
+| whole-active-window p99 delta vs control (ms) | inside control spread (p99 sd `32.0`) | -- | -11.0 `[-38.3,+16.3]` | **+18.8 `[-22.4,+59.9]`** |
+
+**The single number: at beta 0.9 the resume transient lasts ~30 messages /
+~0.6 s.** The windowed median excess is `+63` ms over the first ten messages
+(`+74` ms at message 0), decays through the `+25 ms` floor at message 25
+(`576` ms) and reaches zero at message 30 (`596` ms), then sits `-1` to `-39` ms
+(faster than the control) through message 60. At beta 0.75 there is **no
+resolved added transient** (first-window median `-0.6` ms, CI including zero);
+the composite's resolved `first_min +35.8 [+3.6,+67.9]` at 0.75 is the
+`min-of-8` statistic's small best-case crossing, not a central shift. The
+measured `596` ms is `1.8x` the closed-loop drain estimate `4 x quiet_backlog =
+332.5` ms (`GENTLE_DRAIN_FRAC` `0.75`, so a reclaim drains the standing queue
+in `backlog / 0.25`); the transient outlasts the estimate because the drain
+competes with the resumed lane's own traffic and the bulk's refill, so the
+estimate is the order and the measurement is the bound.
+
+**A second independent 16-rep block reproduces it.** `decay-r1` (same arm,
+separate session) reads beta 0.9's first-window median `+70.2 [+27.3,+86.0]`
+(49/64 positive), floor at message 25 (`476` ms) and zero at 30 (`509` ms), and
+beta 0.75's `+2.0 [-3.8,+35.9]` (37/64) -- not resolved. Both blocks therefore
+give the same answer: a bounded ~30-message transient at 0.9, none resolved at
+0.75. The whole-window p99 delta flips sign between them (`-10.5` vs `+18.8`
+ms, both inside the control's `sd 32.0`), which is why it is reported as a null
+rather than as a direction.
+
+The **absolute** series is a ramp, not a band: all three betas' per-index p50
+rise from `57`/`54`/`143` ms at message 0 to a `340`-`480` ms plateau by message
+10-45 (the bulk refilling once the stand-off disarms), and the control's
+whole-window series is a sawtooth (`29`-`497` ms). Beta 0.9 left-shifts the ramp
+by ~10 messages; it does not change its shape.
+
+**`mandate_smoke::beta_inert_without_a_competitor`** (`full`, `1548` s) is the
+operator's second question -- on Minecraft, with no TCP competitor, does the
+latency regress? -- as a **paired same-session** measurement: the Minecraft
+shape (`mc_nic_arm`, whose beta-0.5 cell is exactly the frozen arm's signalled
+cell), M1 clean and M1 hostile, each at beta 0.5 and 0.9 within the same rep,
+order alternated, sixteen reps.
+
+| shape | metric | control mean | beta 0.9 mean | paired mean delta (0.9 - 0.5) | 95 % CI | paired median delta [CI] | reps positive |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| minecraft | p50 (ms) | 47.7 | 46.7 | -0.97 | `[-3.63,+1.68]` | +0.61 `[-5.33,+2.72]` | 9/16 |
+| minecraft | p99 (ms) | 188.4 | 184.2 | -4.20 | `[-26.97,+18.58]` | +0.19 `[-23.98,+12.78]` | 9/16 |
+| minecraft | max (ms) | 234.8 | 216.5 | -18.34 | `[-56.03,+19.35]` | -10.12 `[-38.70,+44.15]` | 5/16 |
+| minecraft | samples `> 250 ms` | 1.56 | 0.69 | -0.88 | `[-2.72,+0.97]` | 0.00 `[-2.00,0.00]` | 2/16 |
+| M1 clean | p50 (ms) | 22.12 | 22.09 | -0.028 | `[-0.066,+0.010]` | -0.03 `[-0.09,+0.03]` | 5/16 |
+| M1 clean | p99 (ms) | 29.0 | 27.4 | -1.54 | `[-5.18,+2.10]` | -0.02 `[-0.23,+0.30]` | 6/16 |
+| M1 clean | max (ms) | 41.3 | 41.9 | +0.62 | `[-22.02,+23.26]` | +0.30 `[-0.24,+1.40]` | 9/16 |
+| M1 hostile | p50 (ms) | 2.05 | 1.21 | -0.84 | `[-2.29,+0.61]` | -1.62 `[-1.96,+0.61]` | 6/16 |
+| M1 hostile | p99 (ms) | 151.7 | 154.4 | +2.70 | `[-11.96,+17.36]` | -3.40 `[-15.18,+30.33]` | 8/16 |
+| M1 hostile | max (ms) | 218.1 | 227.0 | +8.85 | `[-18.19,+35.90]` | -7.31 `[-35.63,+55.98]` | 7/16 |
+
+**Every mean and median CI includes zero**, so no shape regresses where there
+is no competitor. The eight-rep blocks that preceded this one are why the rep
+count is sixteen: the Minecraft arm's p99 -- a heavy-tailed order statistic
+dominated by one or two per-rep repair spikes -- read `-17.2 [-47.2,+12.8]` in
+one 8-rep block and `+61.0 [+1.2,+120.8]` in another, so neither was the
+answer; at 16 reps it reads `-4.2 [-27.0,+18.6]` (mean) and `+0.2
+[-24.0,+12.8]` (median). Its p50, the latency a typical message feels, is stable
+across all blocks and inside `+/-3.6` ms.
+
+**The structural claim, from the instrument.** The gate that arms the stand-off
+is the interactive lane's own **offer clock**, so a lane offering on its cadence
+keeps `offered_quiet_for()` far below `STANDOFF_WINDOW` and the beta-varying
+decrease is unreachable. The arm samples the CC hub's own offer witness every
+10 ms and requires the **steady-offer armed time** to read zero, where
+"steady" begins one sampler cadence after the lane's first application offer
+(read from the arm's own timestamped messages, `arrival - latency`). Every one
+of the 96 cells reads `armed_steady_samples = 0`; the quiet clock's maximum is
+`1491`-`1503` ms in every cell, i.e. the arm's connection-**setup gap**
+(handshake offer -> first application offer) crossing the window for at most one
+sampling interval, counted separately and `0` or `1` samples. A no-competitor
+lane offering every 3 s, run as the instrument's own vacuity block inside the
+same test, reads `armed_steady = 133` samples (`1330` ms, max quiet `3003` ms)
+-- so the zeros are a reading, not a dead probe.
+
+**Vacuity.** `MANDATE_SMOKE_FAULT=M4_BETA_RESUME_OFFER_NOW` zeroes the decay
+gate's margin and deadline, so the lane offers immediately and the stand-off is
+never armed: *"the bulk stand-off was never armed before the resume ... the
+per-index series is not the lever's"*, exit `101` (reps reduced to `1` for the
+probe to bound its cost; the guarded property is independent of the rep count).
+`MANDATE_SMOKE_FAULT=BETA_INERT_FLAT` builds every hub at the control factor:
+*"the hub read back 0.50 -- the arm did not apply the per-path factor it
+labelled the cell with"*, exit `101`. The mutated lines (`const M4_DECAY_REPS:
+usize = 1;`, `const BETA_INERT_REPS: usize = 1;`) and their occurrence counts
+(`1` each) were printed between the edit and the verdict, and the tree restored
+from the committed source afterwards.
+
+Both arms are declared `full` in the opt-in manifest and in the asserting block
+and carry **no `gate-perf-design` row**, for the composite's reason: the full
+tier's budget is frozen at `4600` s and already holds `4488` s of declared rows.
+Their cells are
+`M4@lane=dual+shape=quiet-then-resume+flows=4+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=interactive-standoff-beta+metric=resume-decay-by-message-index`
+and
+`M1@lane=dual+shape=cadence+flows=1+impairment=clean-and-hostile+bulk=saturating-or-2MiB3s+shaper=shared-uplink+mechanism=interactive-standoff-beta+metric=latency-under-beta`,
+on the `constitution` and `mc-nic` families.
+
+**The arms require the unlanded `rtp` lever.** Both reference
+`rtp::cc::CcSignalHub::with_standoff_decrease_factor` and
+`rtp::cc::STANDOFF_WINDOW`, which live in `rtp_claim_ws`'s `8698e993ba` and not
+in the pinned `v0.0.106`, so this checkout compiles only with `rtp`'s local path
+uncommented in the measurement copy; the pin bump and re-verification are the
+releasing step, which this iteration does not take (it does not land or tag).
+The always-run M1-M4 arms and the frozen Minecraft arm were re-run on that tree
+and pass (`exit 0`).
+
 ### Declared perf rows
 
 The rows below declare twenty-six families in the `gate-perf-design` grammar:
@@ -3166,6 +3305,8 @@ mandate_smoke::probe_m4_clean_band_composition = perf
 mandate_smoke::probe_m4_clean_band_composition_noloss = perf
 mandate_smoke::m4_tcp_competition = full
 mandate_smoke::m4_tcp_standoff_beta_resume = full
+mandate_smoke::m4_tcp_standoff_beta_resume_decay = full
+mandate_smoke::beta_inert_without_a_competitor = full
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
 rtp_mux::rtp_mux_explorer_relays_onto_better_path = full
@@ -3383,6 +3524,8 @@ mandate_smoke::m4_clean_lane_fair_latency
 mandate_smoke::m4_hostile_lane_p99_ceiling
 mandate_smoke::m4_tcp_competition
 mandate_smoke::m4_tcp_standoff_beta_resume
+mandate_smoke::m4_tcp_standoff_beta_resume_decay
+mandate_smoke::beta_inert_without_a_competitor
 standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail
 standoff_nonconvergent::bulk_standoff_holds_share_against_a_non_converging_competitor
 standoff_beta_sweep::bulk_standoff_beta_controls_the_share_against_an_aimd_competitor
