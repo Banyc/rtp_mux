@@ -5835,6 +5835,89 @@ struct M4TcpRun {
     rung_times: Vec<f64>,
     window: Duration,
     wall: Duration,
+    /// Every interactive sample the sink reported, `(tag, base-clock seconds,
+    /// latency ms)`. Kept raw because the per-flow summaries above integrate
+    /// the *whole* window: the stand-off resume arm splits this series at its
+    /// own resume instant, which no per-flow summary can express.
+    samples: Vec<(u8, f64, f64)>,
+    /// The shared shaper's own backlog over the window, `(base-clock seconds,
+    /// bytes)`, sampled at ~1 ms. `shaper_max_queue_ms`/`link` hold the window
+    /// aggregates; this is the same series unresolved, so a resume arm can read
+    /// the queue the lane crossed at the instant it resumed.
+    backlog_timeline: Vec<(f64, u64)>,
+    /// The product bulk lane's own `congestion_control_rtt`, `(base-clock
+    /// seconds, ms)`, from an observer on the mux bulk lane's client
+    /// connection. Empty unless a caller attached the observer.
+    bulk_rtt_timeline: Vec<(f64, f64)>,
+    /// Both bulk flows' cumulative delivered-byte counters, `(base-clock
+    /// seconds, product bytes, reference bytes)`, sampled with the backlog. The
+    /// share over any sub-window is the increment of these counters, so a resume
+    /// arm can read the share *before* the lane resumed (while the stand-off
+    /// competes) separately from the whole window.
+    bytes_timeline: Vec<(f64, u64, u64)>,
+    /// The stand-off factor the hub read back on this window's path, or `None`
+    /// when the arm ran without a resume spec (the frozen arm's default hub).
+    beta_readback: Option<f64>,
+    /// `base`-clock seconds at which the interactive lane's gated resume offered
+    /// its first message, or `None` when there was no gate.
+    resume_at: Option<f64>,
+    /// Whether the resume's own gate (the bulk stand-off armed for the requested
+    /// margin past `STANDOFF_WINDOW`) was observed before its deadline. Always
+    /// `true` when there was no gate.
+    resume_armed: bool,
+}
+
+/// A gated resume schedule for [`run_m4_tcp_arm_with`]'s interactive lane: hold
+/// the offer until the bulk stand-off has been **armed for `margin` past
+/// `rtp::cc::STANDOFF_WINDOW`** -- the interactive lane's own offer clock quiet
+/// long enough that a competing episode is running and the queue it holds is at
+/// its steady state -- then offer at the production cadence for `active`.
+///
+/// This is the only way to reach the stand-off's per-path decrease factor `beta`
+/// *while* the interactive lane transmits: the gate that arms the stand-off is
+/// the interactive lane's own offer clock, so a lane offering continuously keeps
+/// the stand-off disarmed and `beta` inert (which is why the no-competitor (B)
+/// arms read the shipped policy by construction). The lever can only be measured
+/// as a **resume**: quiet long enough to build the queue, then transmit across
+/// it.
+#[derive(Clone, Copy)]
+struct M4ResumeSpec {
+    /// The stand-off's per-path multiplicative-decrease factor
+    /// (`rtp::cc::CcSignalHub::with_standoff_decrease_factor`).
+    beta: f64,
+    /// How long the offer clock must have been quiet past `STANDOFF_WINDOW`
+    /// before the lane resumes, so the competing episode's queue is steady.
+    margin: Duration,
+    /// How long the resumed lane offers.
+    active: Duration,
+    /// The bounded wait for the gate; expiring without arming makes the window
+    /// an instrument failure (`resume_armed == false`), never a reading.
+    deadline: Duration,
+}
+
+/// An observer on the **product mux bulk lane's** client connection that records
+/// its `congestion_control_rtt` on the arm's own `base` clock, so the RTT
+/// inflation the stand-off's larger share is bought with is read from the flow
+/// that pays it (the same quantity `standoff_beta_sweep` reads from its direct
+/// rtp bulk).
+fn m4_bulk_rtt_observer(base: Instant) -> (MetricsObserver, Arc<Mutex<Vec<(f64, f64)>>>) {
+    let series = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&series);
+    let observer = MetricsObserver::filtered(
+        |event, _| event == MetricsEvent::RttSample,
+        move |observation| {
+            let Some(snapshot) = observation.snapshot else {
+                return;
+            };
+            let Some(rtt) = snapshot.congestion_control_rtt else {
+                return;
+            };
+            sink.lock()
+                .unwrap()
+                .push((base.elapsed().as_secs_f64(), rtt.as_secs_f64() * 1000.0));
+        },
+    );
+    (observer, series)
 }
 
 /// Write a continuous cyclic payload back to back until `run_for` elapses --
@@ -5866,6 +5949,16 @@ async fn m4_tcp_saturate(write: &mut (impl AsyncWrite + Unpin), payload: &[u8], 
 /// loss-based competitor rather than a greedy flow. The three links add no
 /// per-link random loss -- the queue's own overflow is the loss.
 async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
+    run_m4_tcp_arm_with(window, None).await
+}
+
+/// [`run_m4_tcp_arm`] with an optional gated interactive **resume** (see
+/// [`M4ResumeSpec`]). `resume: None` is the frozen arm's topology unchanged: the
+/// interactive lane offers from the start and the stand-off stays disarmed.
+/// `Some(spec)` builds the cross-lane hub with the per-path decrease factor
+/// `spec.beta` and holds the interactive offer until the stand-off has been
+/// armed for `spec.margin` past `STANDOFF_WINDOW`.
+async fn run_m4_tcp_arm_with(window: Duration, resume: Option<M4ResumeSpec>) -> M4TcpRun {
     let fault = m4_tcp_fault();
     let stall_bulk = fault.as_deref() == Some("M4_TCP_STALL_BULK");
     let wall = Instant::now();
@@ -5873,6 +5966,21 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
     let bulk_rtp = LaneRtpConfig::production_bulk();
     let base = Instant::now();
     let (repair_observer, repair_taps) = m4_repair_observer(base);
+    let (bulk_rtt_observer, bulk_rtt_timeline) = m4_bulk_rtt_observer(base);
+    // The cross-lane hub. A resume builds it with the stand-off's per-path
+    // decrease factor; the default hub is the shipped one (`0.5`), so the frozen
+    // arm's topology is unchanged. The gate is read from the same `(local,
+    // remote)` key the transport resolves, so the arm can witness the stand-off
+    // arming before it declares the resume instant.
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let hub = match resume {
+        Some(spec) => rtp::cc::CcSignalHub::with_standoff_decrease_factor(spec.beta),
+        None => rtp::cc::CcSignalHub::new(),
+    };
+    let gate = hub.group(loopback, loopback).bulk();
+    let beta_readback = resume.map(|_| gate.standoff_decrease_factor());
+    let resume_started = Arc::new(AtomicU64::new(0));
+    let resume_armed = Arc::new(AtomicBool::new(resume.is_none()));
     let mut tasks = TestScope::new();
     let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
     let outcome = tasks
@@ -5899,22 +6007,35 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
             let shaper_backlog_max = Arc::new(AtomicU64::new(0));
             let shaper_backlog_sum = Arc::new(AtomicU64::new(0));
             let shaper_backlog_samples = Arc::new(AtomicU64::new(0));
+            let shaper_backlog_timeline = Arc::new(Mutex::new(Vec::<(f64, u64)>::new()));
+            let bytes_timeline = Arc::new(Mutex::new(Vec::<(f64, u64, u64)>::new()));
             let shaper_sampler_stop = Arc::new(AtomicBool::new(false));
             {
                 let shaper = shaper.clone();
                 let max = Arc::clone(&shaper_backlog_max);
                 let sum = Arc::clone(&shaper_backlog_sum);
                 let count = Arc::clone(&shaper_backlog_samples);
+                let timeline = Arc::clone(&shaper_backlog_timeline);
+                let bytes = Arc::clone(&bytes_timeline);
+                let our_bytes = Arc::clone(&bulk_counter);
+                let comp_bytes = Arc::clone(&comp_delivered);
                 let stop = Arc::clone(&shaper_sampler_stop);
                 let task_tx_sampler = task_tx.clone();
                 submit_test_task(
                     &task_tx_sampler,
                     Box::pin(async move {
                         while !stop.load(Ordering::Relaxed) {
+                            let now = base.elapsed().as_secs_f64();
                             let backlog = shaper.backlog_bytes(Instant::now());
                             max.fetch_max(backlog, Ordering::Relaxed);
                             sum.fetch_add(backlog, Ordering::Relaxed);
                             count.fetch_add(1, Ordering::Relaxed);
+                            timeline.lock().unwrap().push((now, backlog));
+                            bytes.lock().unwrap().push((
+                                now,
+                                our_bytes.load(Ordering::Relaxed),
+                                comp_bytes.load(Ordering::Relaxed),
+                            ));
                             tokio::time::sleep(Duration::from_millis(1)).await;
                         }
                     }),
@@ -5951,8 +6072,8 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
                 int_rtp,
                 bulk_rtp,
                 Some(repair_observer.clone()),
-                None,
-                Some(rtp::cc::CcSignalHub::new()),
+                resume.is_some().then(|| bulk_rtt_observer.clone()),
+                Some(hub),
             )
             .await
             .unwrap();
@@ -5993,13 +6114,48 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
                 streams.push((m4_flow_tag(flow), write));
             }
             let mut futs = Vec::with_capacity(M4_FLOWS);
-            for (tag, write) in streams.iter_mut() {
+            for (flow, (tag, write)) in streams.iter_mut().enumerate() {
                 if write.write_all(&[*tag]).await.is_err() {
                     break;
                 }
                 let write = &mut *write;
+                let gate = gate.clone();
+                let resume_started = Arc::clone(&resume_started);
+                let resume_armed = Arc::clone(&resume_armed);
                 futs.push(async move {
-                    send_timestamped_messages(write, base, MSG_BYTES, CADENCE, window).await
+                    let Some(spec) = resume else {
+                        return send_timestamped_messages(write, base, MSG_BYTES, CADENCE, window)
+                            .await;
+                    };
+                    if flow == 0 {
+                        // Flow 0 witnesses the stand-off arming and declares the
+                        // resume instant; the others wait on it, so the first
+                        // offer cannot re-open the yield window under a sibling
+                        // that is still waiting for its own gate.
+                        let stop_at = Instant::now() + spec.deadline;
+                        loop {
+                            if gate
+                                .offered_quiet_for()
+                                .is_some_and(|q| q >= rtp::cc::STANDOFF_WINDOW + spec.margin)
+                            {
+                                resume_armed.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            if Instant::now() >= stop_at {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        resume_started.store(
+                            (base.elapsed().as_secs_f64() * 1e6) as u64,
+                            Ordering::Relaxed,
+                        );
+                    } else {
+                        while resume_started.load(Ordering::Relaxed) == 0 {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    }
+                    send_timestamped_messages(write, base, MSG_BYTES, CADENCE, spec.active).await
                 });
             }
 
@@ -6061,6 +6217,14 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
             };
             let shaper_dropped = shaper.dropped();
             let int_c2s = int_pair.stats_c2s();
+            let backlog_timeline = shaper_backlog_timeline.lock().unwrap().clone();
+            let bulk_rtt = bulk_rtt_timeline.lock().unwrap().clone();
+            let bytes_timeline = bytes_timeline.lock().unwrap().clone();
+            let resume_at = {
+                let stamp = resume_started.load(Ordering::Relaxed);
+                (resume.is_some() && stamp != 0).then(|| stamp as f64 / 1e6)
+            };
+            let resume_armed = resume_armed.load(Ordering::Relaxed);
 
             for (_, write) in streams.iter_mut() {
                 let _ = write.shutdown();
@@ -6086,6 +6250,11 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
                 shaper_backlog_sample_count,
                 shaper_dropped,
                 int_c2s,
+                backlog_timeline,
+                bulk_rtt,
+                bytes_timeline,
+                resume_at,
+                resume_armed,
             )
         })
         .await;
@@ -6099,6 +6268,11 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
         shaper_backlog_sample_count,
         shaper_dropped,
         int_c2s,
+        backlog_timeline,
+        bulk_rtt_timeline,
+        bytes_timeline,
+        resume_at,
+        resume_armed,
     ) = outcome;
 
     // Term (a): the shaper's own queue, in ms. A message can queue behind the
@@ -6203,6 +6377,13 @@ async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
         rung_times: repair_taps.rung_times(),
         window,
         wall: wall.elapsed(),
+        samples,
+        backlog_timeline,
+        bulk_rtt_timeline,
+        bytes_timeline,
+        beta_readback,
+        resume_at,
+        resume_armed,
     }
 }
 
@@ -6611,6 +6792,577 @@ async fn m4_tcp_competition() {
         "[m4-tcp] the interactive repair observer saw {} rung(s) while the shared shaper tail-dropped {} datagram(s): drops occurred but no repair was observed, so the repair term (b) would read as zero from a detached observer",
         run.repair.rungs,
         run.link.shaper_dropped,
+    );
+}
+
+// ─────── M4/TCP + stand-off beta + a resuming interactive lane (the composite) ───────
+//
+// Requirement (A)'s lever is the bulk stand-off's per-path decrease factor
+// (`rtp::cc::STANDOFF_DECREASE_FACTOR`), and `standoff_beta_sweep` measured that
+// a gentler factor takes a larger share of a shared bottleneck from the AIMD
+// reference -- at the cost of a deeper standing queue (114.2 ms of the buffer's
+// 125.0 ms at beta 0.9). That queue is on the SAME drop-tail buffer the
+// interactive lane must cross, and requirement (B) is "no latency drop on the
+// interactive lane". The arms that currently read (B) have no competitor, so
+// the stand-off never arms and they pass by construction.
+//
+// This arm is the composite: `m4_tcp_competition`'s topology (the production
+// dual-lane mux session -- `M4_FLOWS` interactive flows, a saturating mux bulk
+// lane, and an rtp AIMD reference on one shared `BottleneckShaper`) with the
+// stand-off's per-path factor set to `beta` through the existing testing hook,
+// and the interactive lane held quiet until the stand-off has been **armed for
+// `M4_RESUME_MARGIN` past `STANDOFF_WINDOW`** and then offering at the
+// production cadence. That is the only shape in which the lever is reachable at
+// all: the gate that arms the stand-off is the interactive lane's own offer
+// clock, so a lane offering continuously keeps it disarmed and `beta` inert.
+// (B)'s reading here is therefore necessarily a **resume**.
+
+/// The betas this composite sweeps. `0.5` is the control: the stand-off and the
+/// AIMD reference then run the *same* law, so a fair split is the only possible
+/// reading and the sweep's deltas are against an unbiased control. The default
+/// the product ships is also `0.5`, so the control is the shipped behaviour.
+const M4_STANDOFF_BETAS: [f64; 4] = [0.5, 0.75, 0.9, 1.0];
+/// Interleaved reps: every rep runs all four betas, order alternated by rep, so
+/// a slow drift is common mode across the cells rather than attributed to beta.
+const M4_STANDOFF_REPS: usize = 8;
+/// How long the offer clock must have been quiet past `STANDOFF_WINDOW` before
+/// the lane resumes: `STANDOFF_WINDOW` (1.5 s) plus this margin, so the
+/// competing episode's AIMD ramp and queue depth are at their steady state when
+/// the lane starts. `standoff_beta_sweep` measures its tail from 4 s for the
+/// same reason; `1.5 + 2.5 = 4.0` s is the same instant on this clock.
+const M4_RESUME_MARGIN: Duration = Duration::from_millis(2500);
+/// How long the resumed lane offers. The window is `WINDOW` (12 s) and the
+/// resume lands near 4 s, so this leaves slack before the window closes; at
+/// `M4_FLOWS` flows and a 5 ms cadence it yields ~5 600 interactive samples.
+const M4_RESUME_ACTIVE: Duration = Duration::from_millis(7000);
+/// The composite's window. Longer than [`WINDOW`] by 2 s so the resumed active
+/// phase (`resume_at + M4_RESUME_ACTIVE`, with `resume_at` near 5.5 s on the
+/// measured gate) always closes *before* the two saturating bulk flows stop -- a
+/// tail that ran past the window's end would be measured without competition
+/// and would launder the very cost this arm exists to read.
+const M4_RESUME_WINDOW: Duration = Duration::from_secs(14);
+/// The bounded wait for the stand-off to arm. Expiring without arming leaves
+/// `resume_armed == false` and fails the arm by name: a window in which the
+/// stand-off never competed cannot be read as the lever's cost.
+const M4_RESUME_DEADLINE: Duration = Duration::from_secs(9);
+/// How many of each flow's first samples after the resume the concentrated
+/// reading takes. `standoff_burst` uses 8; the same count keeps the two arms'
+/// resume readings comparable.
+const M4_RESUME_FIRST_N: usize = 8;
+/// The sub-window before the resume the quiet-phase share, RTT and backlog are
+/// integrated over: the last 3 s of the competing episode, so the reading is
+/// the steady state rather than the AIMD ramp.
+const M4_RESUME_QUIET_LOOKBACK: f64 = 3.0;
+
+/// One window's resume-cell readings.
+#[derive(Clone, Copy)]
+struct M4ResumeCell {
+    beta: f64,
+    resume_at: f64,
+    resume_armed: bool,
+    beta_readback: f64,
+    /// Pooled interactive tail over the resumed phase `[resume_at, resume_at +
+    /// M4_RESUME_ACTIVE)`, across all `M4_FLOWS` flows.
+    active_n: u64,
+    active_p50: f64,
+    active_p90: f64,
+    active_p99: f64,
+    active_p999: f64,
+    active_max: f64,
+    active_over250: usize,
+    sent: u64,
+    received: u64,
+    /// The concentrated resume reading: the max and p50 over each flow's first
+    /// [`M4_RESUME_FIRST_N`] samples after the resume (pooled), and the pooled
+    /// **minimum** of those first samples -- the best-case crossing of the queue
+    /// the competing episode built, which a repair cannot inflate.
+    first_max: f64,
+    first_p50: f64,
+    first_min: f64,
+    first_n: u64,
+    /// The **very first** sample of each flow after the resume (pooled): the
+    /// first message across the standing queue.
+    lead_p50: f64,
+    lead_max: f64,
+    /// Our bulk lane's share of the two bulk flows' delivered bytes over the
+    /// last `M4_RESUME_QUIET_LOOKBACK` s before the resume, and over the whole
+    /// window.
+    quiet_share: f64,
+    quiet_our: u64,
+    quiet_comp: u64,
+    whole_share: f64,
+    /// The shared shaper's backlog over the quiet lookback and over the resumed
+    /// phase, in ms at `SHARED_UP_RATE_BPS` (a full 128 KiB buffer is 125.0 ms).
+    quiet_backlog_mean_ms: f64,
+    quiet_backlog_max_ms: f64,
+    active_backlog_mean_ms: f64,
+    /// The product bulk lane's own `congestion_control_rtt` over the quiet
+    /// lookback: mean and p95, in ms.
+    rtt_mean_ms: f64,
+    rtt_p95_ms: f64,
+}
+
+fn m4_resume_mean(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return f64::NAN;
+    }
+    xs.iter().sum::<f64>() / xs.len() as f64
+}
+
+fn m4_resume_sd(xs: &[f64]) -> f64 {
+    if xs.len() < 2 {
+        return f64::NAN;
+    }
+    let m = m4_resume_mean(xs);
+    (xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (xs.len() - 1) as f64).sqrt()
+}
+
+/// The delivered-byte increment of both bulk counters over `[from, to)`, from
+/// the arm's own sampled byte timeline (midpoint rule, so a partial interval at
+/// either edge is not counted).
+fn m4_resume_bytes(timeline: &[(f64, u64, u64)], from: f64, to: f64) -> (u64, u64, f64) {
+    let mut our = 0u64;
+    let mut comp = 0u64;
+    let mut secs = 0.0f64;
+    for pair in timeline.windows(2) {
+        let mid = 0.5 * (pair[0].0 + pair[1].0);
+        if mid >= from && mid < to {
+            our += pair[1].1.saturating_sub(pair[0].1);
+            comp += pair[1].2.saturating_sub(pair[0].2);
+            secs += pair[1].0 - pair[0].0;
+        }
+    }
+    (our, comp, secs)
+}
+
+/// The shaper backlog over `[from, to)`: mean and max in bytes and the sample
+/// count, so a zero is distinguishable from an absent series.
+fn m4_resume_backlog(timeline: &[(f64, u64)], from: f64, to: f64) -> (f64, f64, u64) {
+    let xs: Vec<u64> = timeline
+        .iter()
+        .filter(|(t, _)| *t >= from && *t < to)
+        .map(|(_, b)| *b)
+        .collect();
+    if xs.is_empty() {
+        return (f64::NAN, f64::NAN, 0);
+    }
+    let mean = xs.iter().sum::<u64>() as f64 / xs.len() as f64;
+    (mean, *xs.iter().max().unwrap() as f64, xs.len() as u64)
+}
+
+/// The bulk lane's own control RTT over `[from, to)`: mean, p95 and count.
+fn m4_resume_rtt(timeline: &[(f64, f64)], from: f64, to: f64) -> (f64, f64, u64) {
+    let mut xs: Vec<f64> = timeline
+        .iter()
+        .filter(|(t, _)| *t >= from && *t < to)
+        .map(|(_, r)| *r)
+        .filter(|r| r.is_finite())
+        .collect();
+    if xs.is_empty() {
+        return (f64::NAN, f64::NAN, 0);
+    }
+    let n = xs.len() as u64;
+    let mean = xs.iter().sum::<f64>() / n as f64;
+    xs.sort_by(|a, b| a.total_cmp(b));
+    let idx = (((n as f64) * 0.95) as usize).min(xs.len() - 1);
+    (mean, xs[idx], n)
+}
+
+fn m4_resume_cell(run: &M4TcpRun, beta: f64) -> M4ResumeCell {
+    let resume_at = run
+        .resume_at
+        .expect("the resume arm must record the instant the lane resumed");
+    let active_to = resume_at + M4_RESUME_ACTIVE.as_secs_f64() + 0.5;
+    let quiet_from = (resume_at - M4_RESUME_QUIET_LOOKBACK).max(0.0);
+
+    let active: Vec<f64> = run
+        .samples
+        .iter()
+        .filter(|(_, t, _)| *t >= resume_at && *t < active_to)
+        .map(|(_, _, l)| *l)
+        .collect();
+    let sent: u64 = run.flows.iter().map(|f| f.sent).sum();
+    let received = active.len() as u64;
+    let active_summary = summarize(active.clone(), sent, received, 0, 0.0);
+
+    // The concentrated reading: per flow, the first N samples at or after the
+    // resume (in arrival order), pooled. This is the window in which the queue
+    // the competing episode built is crossed, before a repair can mask it.
+    let mut first: Vec<f64> = Vec::new();
+    let mut lead: Vec<f64> = Vec::new();
+    for flow in 0..M4_FLOWS {
+        let tag = m4_flow_tag(flow);
+        let mut flow_samples: Vec<(f64, f64)> = run
+            .samples
+            .iter()
+            .filter(|(t, time, _)| *t == tag && *time >= resume_at)
+            .map(|(_, time, latency)| (*time, *latency))
+            .collect();
+        flow_samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        first.extend(flow_samples.iter().take(M4_RESUME_FIRST_N).map(|(_, l)| *l));
+        if let Some((_, latency)) = flow_samples.first() {
+            lead.push(*latency);
+        }
+    }
+    let first_summary = summarize(
+        first.clone(),
+        first.len() as u64,
+        first.len() as u64,
+        0,
+        0.0,
+    );
+    let lead_summary = summarize(lead.clone(), lead.len() as u64, lead.len() as u64, 0, 0.0);
+    let first_min = first.iter().copied().fold(f64::INFINITY, f64::min);
+
+    let (quiet_our, quiet_comp, _) = m4_resume_bytes(&run.bytes_timeline, quiet_from, resume_at);
+    let quiet_total = quiet_our + quiet_comp;
+    let (whole_our, whole_comp, _) = m4_resume_bytes(&run.bytes_timeline, 0.0, active_to);
+    let whole_total = whole_our + whole_comp;
+    let (q_mean_b, q_max_b, _) = m4_resume_backlog(&run.backlog_timeline, quiet_from, resume_at);
+    let (a_mean_b, _, _) = m4_resume_backlog(&run.backlog_timeline, resume_at, active_to);
+    let (rtt_mean, rtt_p95, _) = m4_resume_rtt(&run.bulk_rtt_timeline, quiet_from, resume_at);
+    let ms_per_byte = 8.0 * 1000.0 / SHARED_UP_RATE_BPS as f64;
+
+    M4ResumeCell {
+        beta,
+        resume_at,
+        resume_armed: run.resume_armed,
+        beta_readback: run.beta_readback.unwrap_or(f64::NAN),
+        active_n: received,
+        active_p50: active_summary.p50,
+        active_p90: active_summary.p90,
+        active_p99: active_summary.p99,
+        active_p999: active_summary.p999,
+        active_max: active_summary.max,
+        active_over250: over250_count(&active),
+        sent,
+        received,
+        first_max: first_summary.max,
+        first_p50: first_summary.p50,
+        first_min,
+        first_n: first.len() as u64,
+        lead_p50: lead_summary.p50,
+        lead_max: lead_summary.max,
+        quiet_share: if quiet_total == 0 {
+            f64::NAN
+        } else {
+            quiet_our as f64 / quiet_total as f64
+        },
+        quiet_our,
+        quiet_comp,
+        whole_share: if whole_total == 0 {
+            f64::NAN
+        } else {
+            whole_our as f64 / whole_total as f64
+        },
+        quiet_backlog_mean_ms: q_mean_b * ms_per_byte,
+        quiet_backlog_max_ms: q_max_b * ms_per_byte,
+        active_backlog_mean_ms: a_mean_b * ms_per_byte,
+        rtt_mean_ms: rtt_mean,
+        rtt_p95_ms: rtt_p95,
+    }
+}
+
+/// The composite: beta's share gain (requirement (A)) against the interactive
+/// lane's resumed tail (requirement (B)).
+///
+/// The **verdict** is the reading the arm exists to produce: if a beta above the
+/// control takes share (the quiet-phase share clears the control's) **and** the
+/// interactive lane's resumed p99 stays inside the control's own rep-to-rep
+/// spread, the lever is a candidate to ship; if the tail degrades beyond that
+/// spread, that is a mandate trade and this arm states which mandate gains and
+/// which loses, by how much -- and a rise in an impaired arm's p99 IS an M1
+/// regression however comfortably it sits inside a guard.
+///
+/// Vacuity is by the arm's own fault hook and the hub readback: hardcoding the
+/// per-path factor to the default fails `beta_readback == beta`, and
+/// `MANDATE_SMOKE_FAULT=M4_BETA_RESUME_OFFER_NOW` zeroes the gate's margin and
+/// deadline so the lane offers immediately -- the stand-off then never arms and
+/// `resume_armed` fails by name while every other reading still prints.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "the beta lever vs the interactive resume tail: 8 interleaved reps x 4 betas x ~14 s; run with --ignored --nocapture --test-threads=1"]
+async fn m4_tcp_standoff_beta_resume() {
+    let _serial = SERIAL.lock().await;
+    let offer_now = std::env::var("MANDATE_SMOKE_FAULT")
+        .is_ok_and(|value| value.trim() == "M4_BETA_RESUME_OFFER_NOW");
+    let dir = out_dir().join("standoff-beta-resume");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cells: Vec<(usize, M4ResumeCell)> = Vec::new();
+    let mut cells_csv = String::from(
+        "rep,beta,resume_at,resume_armed,beta_readback,active_n,active_p50,active_p90,active_p99,\
+         active_p999,active_max,active_over250,sent,received,first_n,first_max,first_p50,\
+         first_min,lead_p50,lead_max,\
+         quiet_share,quiet_our,quiet_comp,whole_share,quiet_backlog_mean_ms,quiet_backlog_max_ms,\
+         active_backlog_mean_ms,rtt_mean_ms,rtt_p95_ms\n",
+    );
+    for rep in 0..M4_STANDOFF_REPS {
+        let mut order: Vec<f64> = M4_STANDOFF_BETAS.to_vec();
+        if rep % 2 == 1 {
+            order.reverse();
+        }
+        for beta in order {
+            let spec = M4ResumeSpec {
+                beta,
+                margin: if offer_now {
+                    Duration::ZERO
+                } else {
+                    M4_RESUME_MARGIN
+                },
+                active: M4_RESUME_ACTIVE,
+                deadline: if offer_now {
+                    Duration::ZERO
+                } else {
+                    M4_RESUME_DEADLINE
+                },
+            };
+            let run = with_timeout(
+                ARM_DEADLINE * 3,
+                "m4/beta-resume window",
+                run_m4_tcp_arm_with(M4_RESUME_WINDOW, Some(spec)),
+            )
+            .await;
+            let cell = m4_resume_cell(&run, beta);
+            eprintln!(
+                "[m4-beta-resume rep{rep}] beta {beta:.2}  resume_at {:.2}s armed {}  \
+                 active n {} p50 {:7.1} p90 {:7.1} p99 {:7.1} p999 {:7.1} max {:8.1} over250 {}  \
+                 first n {} p50 {:7.1} min {:7.1} max {:8.1}  lead p50 {:7.1} max {:7.1}  quiet share {:6.4} ({} / {} B)  whole {:6.4}  \
+                 backlog quiet {:6.1}/{:6.1} ms active {:6.1} ms  rtt mean {:6.1} p95 {:6.1} ms  \
+                 readback {:.2}",
+                cell.resume_at,
+                cell.resume_armed,
+                cell.active_n,
+                cell.active_p50,
+                cell.active_p90,
+                cell.active_p99,
+                cell.active_p999,
+                cell.active_max,
+                cell.active_over250,
+                cell.first_n,
+                cell.first_p50,
+                cell.first_min,
+                cell.first_max,
+                cell.lead_p50,
+                cell.lead_max,
+                cell.quiet_share,
+                cell.quiet_our,
+                cell.quiet_comp,
+                cell.whole_share,
+                cell.quiet_backlog_mean_ms,
+                cell.quiet_backlog_max_ms,
+                cell.active_backlog_mean_ms,
+                cell.rtt_mean_ms,
+                cell.rtt_p95_ms,
+                cell.beta_readback,
+            );
+            cells_csv.push_str(&format!(
+                "{rep},{beta:.2},{:.3},{},{:.2},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.6},{},{},{:.6},{:.3},{:.3},{:.3},{:.3},{:.3}\n",
+                cell.resume_at,
+                cell.resume_armed,
+                cell.beta_readback,
+                cell.active_n,
+                cell.active_p50,
+                cell.active_p90,
+                cell.active_p99,
+                cell.active_p999,
+                cell.active_max,
+                cell.active_over250,
+                cell.sent,
+                cell.received,
+                cell.first_n,
+                cell.first_max,
+                cell.first_p50,
+                cell.first_min,
+                cell.lead_p50,
+                cell.lead_max,
+                cell.quiet_share,
+                cell.quiet_our,
+                cell.quiet_comp,
+                cell.whole_share,
+                cell.quiet_backlog_mean_ms,
+                cell.quiet_backlog_max_ms,
+                cell.active_backlog_mean_ms,
+                cell.rtt_mean_ms,
+                cell.rtt_p95_ms,
+            ));
+            cells.push((rep, cell));
+        }
+    }
+    std::fs::write(dir.join("cells.csv"), &cells_csv).unwrap();
+
+    // The control is the shipped default (`0.5`). Its interactive p99's own
+    // rep-to-rep spread is the band a beta above it may move inside without
+    // being an effect.
+    let control_p99: Vec<f64> = cells
+        .iter()
+        .filter(|(_, c)| c.beta == M4_STANDOFF_BETAS[0])
+        .map(|(_, c)| c.active_p99)
+        .collect();
+    let control_share: Vec<f64> = cells
+        .iter()
+        .filter(|(_, c)| c.beta == M4_STANDOFF_BETAS[0])
+        .map(|(_, c)| c.quiet_share)
+        .collect();
+    let control_p99_mean = m4_resume_mean(&control_p99);
+    let control_p99_sd = m4_resume_sd(&control_p99);
+    let control_p99_lo = control_p99.iter().copied().fold(f64::INFINITY, f64::min);
+    let control_p99_hi = control_p99.iter().copied().fold(0.0f64, f64::max);
+    let control_share_mean = m4_resume_mean(&control_share);
+    eprintln!(
+        "[m4-beta-resume control] beta 0.50 interactive p99 mean {control_p99_mean:.1} ms sd \
+         {control_p99_sd:.1} ms span [{control_p99_lo:.1}, {control_p99_hi:.1}] ms; quiet share \
+         mean {control_share_mean:.4}"
+    );
+
+    let mut summary = String::from(
+        "beta,n,resume_at_mean,quiet_share_mean,quiet_share_paired_delta,ci95_lo,ci95_hi,\
+         active_p50,active_p90,active_p99,active_p999,active_max,active_over250,first_max,\
+         first_min,lead_p50,lead_max,\
+         first_p50,whole_share,quiet_backlog_mean_ms,quiet_backlog_max_ms,active_backlog_mean_ms,\
+         rtt_mean_ms,p99_delta_vs_control\n",
+    );
+    for beta in M4_STANDOFF_BETAS {
+        let cs: Vec<&M4ResumeCell> = cells
+            .iter()
+            .filter(|(_, c)| c.beta == beta)
+            .map(|(_, c)| c)
+            .collect();
+        let share: Vec<f64> = cs.iter().map(|c| c.quiet_share).collect();
+        let p99: Vec<f64> = cs.iter().map(|c| c.active_p99).collect();
+        let paired: Vec<f64> = (0..M4_STANDOFF_REPS)
+            .filter_map(|rep| {
+                let c0 = cells
+                    .iter()
+                    .find(|(r, c)| *r == rep && c.beta == M4_STANDOFF_BETAS[0])
+                    .map(|(_, c)| c.quiet_share)?;
+                let cb = cells
+                    .iter()
+                    .find(|(r, c)| *r == rep && c.beta == beta)
+                    .map(|(_, c)| c.quiet_share)?;
+                Some(cb - c0)
+            })
+            .collect();
+        let d_mean = m4_resume_mean(&paired);
+        let sem = m4_resume_sd(&paired) / (paired.len() as f64).sqrt();
+        let (ci_lo, ci_hi) = if sem.is_finite() {
+            (d_mean - 1.96 * sem, d_mean + 1.96 * sem)
+        } else {
+            (f64::NAN, f64::NAN)
+        };
+        let share_mean = m4_resume_mean(&share);
+        let p99_mean = m4_resume_mean(&p99);
+        let p99_delta = p99_mean - control_p99_mean;
+        eprintln!(
+            "[m4-beta-resume] beta {beta:.2}  n {}  quiet share {:6.4} (paired {:+7.4} CI [{:+.4},{:+.4}])\
+              p50 {:7.1} p90 {:7.1} p99 {:7.1} p999 {:8.1} max {:8.1} over250 sum {}  \
+             first p50 {:7.1} min {:7.1} max {:8.1}  lead p50 {:7.1} max {:7.1}  whole {:6.4}  backlog q {:6.1}/{:6.1} a {:6.1} ms  \
+             rtt {:6.1} ms  p99 delta vs control {:+7.1} ms",
+            cs.len(),
+            share_mean,
+            d_mean,
+            ci_lo,
+            ci_hi,
+            m4_resume_mean(&cs.iter().map(|c| c.active_p50).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.active_p90).collect::<Vec<f64>>()),
+            p99_mean,
+            m4_resume_mean(&cs.iter().map(|c| c.active_p999).collect::<Vec<f64>>()),
+            cs.iter().map(|c| c.active_max).fold(0.0f64, f64::max),
+            cs.iter().map(|c| c.active_over250).sum::<usize>(),
+            m4_resume_mean(&cs.iter().map(|c| c.first_p50).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.first_min).collect::<Vec<f64>>()),
+            cs.iter().map(|c| c.first_max).fold(0.0f64, f64::max),
+            m4_resume_mean(&cs.iter().map(|c| c.lead_p50).collect::<Vec<f64>>()),
+            cs.iter().map(|c| c.lead_max).fold(0.0f64, f64::max),
+            m4_resume_mean(&cs.iter().map(|c| c.whole_share).collect::<Vec<f64>>()),
+            m4_resume_mean(
+                &cs.iter()
+                    .map(|c| c.quiet_backlog_mean_ms)
+                    .collect::<Vec<f64>>()
+            ),
+            m4_resume_mean(
+                &cs.iter()
+                    .map(|c| c.quiet_backlog_max_ms)
+                    .collect::<Vec<f64>>()
+            ),
+            m4_resume_mean(
+                &cs.iter()
+                    .map(|c| c.active_backlog_mean_ms)
+                    .collect::<Vec<f64>>()
+            ),
+            m4_resume_mean(&cs.iter().map(|c| c.rtt_mean_ms).collect::<Vec<f64>>()),
+            p99_delta,
+        );
+        summary.push_str(&format!(
+            "{beta:.2},{},{:.3},{share_mean:.6},{d_mean:.6},{ci_lo:.6},{ci_hi:.6},{:.3},{:.3},\
+             {p99_mean:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.6},{:.3},{:.3},{:.3},{:.3},{p99_delta:.3}\n",
+            cs.len(),
+            m4_resume_mean(&cs.iter().map(|c| c.resume_at).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.active_p50).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.active_p90).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.active_p999).collect::<Vec<f64>>()),
+            cs.iter().map(|c| c.active_max).fold(0.0f64, f64::max),
+            cs.iter().map(|c| c.active_over250).sum::<usize>(),
+            m4_resume_mean(&cs.iter().map(|c| c.first_max).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.first_min).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.lead_p50).collect::<Vec<f64>>()),
+            cs.iter().map(|c| c.lead_max).fold(0.0f64, f64::max),
+            m4_resume_mean(&cs.iter().map(|c| c.first_p50).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.whole_share).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.quiet_backlog_mean_ms).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.quiet_backlog_max_ms).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.active_backlog_mean_ms).collect::<Vec<f64>>()),
+            m4_resume_mean(&cs.iter().map(|c| c.rtt_mean_ms).collect::<Vec<f64>>()),
+        ));
+    }
+    std::fs::write(dir.join("summary.csv"), &summary).unwrap();
+    eprintln!("[m4-beta-resume] data: {}", dir.display());
+
+    // ---- assertions: instrument sanity, not the lever's direction ----------
+    for (rep, cell) in &cells {
+        assert!(
+            cell.resume_armed,
+            "[m4-beta-resume] rep{rep} beta {:.2}: the bulk stand-off was never armed (the \
+             interactive lane's offer clock never stayed quiet past STANDOFF_WINDOW + {:?}) \
+             before the resume, so this window measured the shipped delay-first policy rather \
+             than the competing episode the lever sets and cannot be read as the lever's cost \
+             (MANDATE_SMOKE_FAULT=M4_BETA_RESUME_OFFER_NOW produces exactly this)",
+            cell.beta, M4_RESUME_MARGIN,
+        );
+        assert!(
+            (cell.beta_readback - cell.beta).abs() < 1e-9,
+            "[m4-beta-resume] rep{rep} beta {:.2}: the hub read back {:.2} -- the arm did not \
+             apply the per-path factor it labelled the cell with, so a flat sweep would be a \
+             property of the arm and not of the lever",
+            cell.beta,
+            cell.beta_readback,
+        );
+        assert!(
+            cell.sent > 0 && cell.received > 0 && cell.active_n > 0,
+            "[m4-beta-resume] rep{rep} beta {:.2}: sent {} / received {} interactive message(s) \
+             over the resumed phase -- an interactive lane that offered nothing after its resume \
+             is an instrument failure, not a reading",
+            cell.beta,
+            cell.sent,
+            cell.received,
+        );
+        assert!(
+            cell.quiet_our > 0 && cell.quiet_comp > 0,
+            "[m4-beta-resume] rep{rep} beta {:.2}: our bulk delivered {} B and the competitor \
+             {} B over the quiet lookback -- one bulk flow was absent, so the quiet-phase share \
+             is undefined",
+            cell.beta,
+            cell.quiet_our,
+            cell.quiet_comp,
+        );
+        assert!(
+            cell.first_n > 0,
+            "[m4-beta-resume] rep{rep} beta {:.2}: the resumed phase yielded no samples for the \
+             concentrated first-N reading",
+            cell.beta,
+        );
+    }
+    assert!(
+        !control_share.is_empty(),
+        "[m4-beta-resume] the control cells are missing"
     );
 }
 

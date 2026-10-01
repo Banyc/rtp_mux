@@ -386,15 +386,19 @@ predecessor's arm is left unchanged per the alongside-only rule.
 period, a period-aligned chunk (`251 * 256`) and the saturating writer, and both
 stand-off arms use it, so a discontinuous wrap is unrepresentable for every
 caller.  The repair is an instrument change only: no threshold, window, cadence
-or tier moved.  With the counter live, `standoff_burst`'s own numbers move and
-their **sign inverts**: on a quiet x86_64 box its late-gap share reads
-`yield 0.250 [0.155,0.336]` against `standoff 0.019 [0.000,0.128]` (paired mean
-`-0.214`, 95 % CI `[-0.242,-0.186]`, `0/16` positive), i.e. the armed arm now
-measures as delivering *less* than the disarmed one -- the opposite of the
-pre-repair reading (`standoff 0.527` vs `yield 0.400`), which was computed from
-a counter that had stopped advancing.  Its share assertion is red both before
-and after the repair; no assertion flips.  `standoff_nonconvergent` already
-used the aligned chunk, so its numbers are unchanged.
+or tier moved.  With the counter live, `standoff_burst`'s own numbers move, and a
+later reading of the same revision **inverted** them: on a quiet x86_64 box its
+late-gap share read `yield 0.250` against `standoff 0.019` (paired mean `-0.214`,
+95 % CI `[-0.242,-0.186]`, `0/16` positive).  That inversion is the **tag-byte
+counter defect**, not a product result: a frozen product counter drives the
+armed arm's share toward `0`, the same revision reads the normal direction both
+frozen and with the byte dropped (`+0.266` / `+0.264`), and the measured size of
+the byte's effect on this arm's counter and share is in *The stand-off's
+multiplicative-decrease factor* above (`perf/beta-sweep/item5/`).
+`standoff_nonconvergent` already used the aligned chunk; its share is affected
+by the same byte, measured in the same place (a sanity row read `0.000` against
+the competitor's `2.88` MB and failed that arm's own "a flow was absent"
+assertion).
 
 **Instrument sanity (quiet x86_64 box, 8 solo reps).**  With no interactive lane
 the competing arm's share is `0.490` against the standing-off arm's `0.416`
@@ -538,13 +542,34 @@ with the tag byte, our counter's first non-zero sample is at p50 `3.55` s and
 max `13.31` s -- and in one of 32 cells it stayed `0` for the whole window
 while the controller paced at `300`-`800` pkt/s and the competitor delivered
 `4.79` MB.  Without it, our counter's first non-zero sample is at p50 `1.54` s
-and max `1.55` s, identical to the competitor's `1.55` s.  **The same tag byte is
-written by the frozen `standoff_burst` and `standoff_nonconvergent` product
-bulk** (`prod_write.write_all(b"B")` against the same plain `rtp` sink), so their
-product-side counters carry the same lag and can freeze the same way; they are
-left unchanged because they are frozen arms, and an iteration that owns them
-should drop the tag byte and re-read their shares (their `GATE.md` numbers were
-taken with it).
+and max `1.55` s, identical to the competitor's `1.55` s.  **The same tag byte is written by the frozen `standoff_burst` and
+`standoff_nonconvergent` product bulk** (`prod_write.write_all(b"B")` against the
+same plain `rtp` sink), and its effect on *their* recorded shares is measured on
+the same revision as this arm's, by running each frozen arm against a scratch
+copy with that one line deleted (`perf/beta-sweep/item5/`, paired by `(arm, rep)`,
+n = 16 per arm):
+
+| arm | reading | frozen (with tag) | no-tag | paired delta (frozen - no-tag) |
+| --- | --- | --- | --- | --- |
+| `standoff_burst` | product counter increment over the measured gaps | 5.24 MB (standoff) / 2.13 MB (yield) | 6.28 MB / 3.16 MB | **-1.04 MB [-1.31,-0.77] (standoff), -1.03 MB [-1.23,-0.84] (yield), 0/16 positive each** |
+| `standoff_burst` | competitor counter (never tagged) | 7.45 MB / 9.89 MB | 7.38 MB / 9.83 MB | +0.07 MB [-0.08,+0.22] / +0.06 MB [-0.12,+0.23] (not resolved) |
+| `standoff_burst` | recorded late-gap share | 0.4462 / 0.1801 | 0.4617 / 0.1979 | **-0.0156 [-0.0318,+0.0007] / -0.0178 [-0.0299,-0.0057]** |
+| `standoff_burst` | the arm's own standoff-yield delta | +0.2661 | +0.2639 | -- (the undercount hits both arms) |
+| `standoff_nonconvergent` | sanity-phase share, 14 reps | `0.505`-`0.574`, then **one rep at `0.000` (`bulk 0 B` against the competitor's `2.88 MB`, controller pacing to `1024` pkt/s) that failed the arm's own "a flow was absent" assertion, exit `101`** | `0.505`-`0.587`, no freeze; arm completes (exit `0`) | freeze vs no freeze |
+
+So the recorded shares **are** affected. The product counter is undercounted by a
+resolved `~1.04` MB per measured window even when it does not freeze (the sink
+drops whole mismatched reads, not a constant offset), which depresses each arm's
+recorded share by a resolved `~1.6` pp and widens its spread; the arm's
+cross-arm *delta* is robust to that bias because both arms carry it. When the
+lock is slow the counter freezes outright, and `standoff_nonconvergent`'s
+sanity phase then reads `0.000` and fails the arm. The frozen arms are left
+unchanged; their numbers are taken with the tag byte, and the one recorded
+reading this explains is `standoff_burst`'s post-repair "sign inversion"
+(`standoff 0.019` against `yield 0.250`, paired `-0.214`): a frozen counter on
+the standoff arm drives its share toward `0`, and the same-revision pair above
+reads the normal direction (`+0.266` frozen, `+0.264` no-tag). A re-reading of
+these arms' shares should drop the tag byte.
 
 **The Minecraft arm's offer gaps, measured.**  `mandate_smoke::mc_nic_offer_gap_distribution`
 (`full`, 33 s) recovers every cadence sample's send time from the arm's own
@@ -591,6 +616,126 @@ The arm's `beta` direction is **reported, not asserted**: a flat sweep would be
 an impossibility finding about the rate-response family, not a fault to launder,
 which is why the arm's assertions are the instrument sanity above and the
 per-beta share, its paired CI and the gain/inflation product are the reading.
+
+### The beta lever with the interactive lane resuming: the composite
+
+The beta sweep above measures the lever with our interactive lane **quiet for the
+measured tail**, and the (B) arms (`minecraft`, M1 clean, M1 hostile) have **no
+competitor**, so the stand-off never arms in them. The two facts are one: the
+gate that arms the stand-off is the interactive lane's own offer clock, so a lane
+offering continuously keeps the stand-off disarmed and `beta` inert. Requirement
+(A)'s lever is therefore reachable in exactly one shape: a lane quiet long enough
+for the competing episode to build its queue, and then transmitting. (B) read on
+the lever is necessarily a **resume**.
+
+`mandate_smoke::m4_tcp_standoff_beta_resume` (`full`, `565` s) is that composite.
+It reuses `m4_tcp_competition`'s topology exactly -- the production dual-lane mux
+session (`M4_FLOWS` = 4 interactive flows at `256 B` / `5 ms`, a saturating mux
+bulk lane on the shared cross-lane CC hub, and an rtp AIMD reference) on one
+`8 388 608 bit/s` / `128 KiB` drop-tail shaper -- and differs in two things: the
+hub is built with `CcSignalHub::with_standoff_decrease_factor(beta)`, and the four
+interactive flows hold their first offer until flow `0` witnesses the stand-off
+armed for `M4_RESUME_MARGIN` (`2.5 s`) past `STANDOFF_WINDOW`, then offer for
+`M4_RESUME_ACTIVE` (`7 s`). The window is `14 s` so the resumed phase closes
+before the two bulk flows stop. Eight interleaved reps per beta (`0.5` control,
+`0.75`, `0.9`, `1.0`), order alternated by rep; the measured quiet backlog rises
+`68.4` -> `94.4` ms mean (max saturates the `125.0` ms buffer at every beta), so
+the queue the resume crosses is the lever's own and it is resolved.
+
+**BEFORE (beta 0.50, the shipped default) vs AFTER, per metric, with the bound**
+(`perf/beta-sweep/composite-r1/summary.csv` and `cells.csv`, n = 8 paired reps).
+"Control spread" is the control's own rep-to-rep sd, which is the band a beta
+above it may move inside without being an effect.
+
+| metric | bound | BEFORE 0.50 | AFTER 0.75 | AFTER 0.90 | AFTER 1.00 | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| quiet-phase share of the pair's delivered bytes | `> 0.50` | 0.4635 | **0.5027** PASS | **0.5196** PASS | **0.5433** PASS | PASS |
+| paired delta vs control, 95 % CI | CI lower `> 0` | -- | +0.0392 [+0.0245,+0.0539] PASS | +0.0561 [+0.0453,+0.0668] PASS | +0.0797 [+0.0500,+0.1094] PASS | PASS |
+| quiet-phase mean backlog (ms), buffer 125.0 | none (falsifier input) | 68.4 | 75.8 | 78.8 | 94.4 | -- |
+| bulk `control_rtt` mean (ms) | none (cost of the share) | 126.3 | 130.9 | 132.0 | 155.7 | -- |
+| **interactive active-phase p99 (ms)** | inside control spread (sd 33.0) | 568.5 | 578.5 (+10.0) PASS | **564.5 (-4.0) PASS** | 568.8 (+0.3) PASS | PASS |
+| interactive active-phase p999 (ms) | inside control spread (sd 67.2) | 602.8 | 601.4 PASS | 606.0 PASS | 608.0 PASS | PASS |
+| interactive active-phase max (ms) | inside control spread (sd 72.7) | 619.3 | 612.9 PASS | 626.9 PASS | 618.1 PASS | PASS |
+| interactive `> 250 ms` fraction | inside control spread (sd 0.0620) | 0.2936 | 0.2892 PASS | 0.2977 PASS | 0.3309 PASS | PASS |
+| **first-message crossing, min of first 8 (ms)** | inside control spread (sd 17.0) | 46.2 | 82.0 FAIL | **116.6 FAIL** | 134.1 FAIL | FAIL |
+| first-sample p50 (ms) | inside control spread (sd 18.7) | 74.3 | 151.0 FAIL | 272.5 FAIL | 350.4 FAIL | FAIL |
+| worst first-8 sample (ms) | inside control spread (sd 22.0) | 102.1 | 324.3 FAIL | 450.0 FAIL | 527.9 FAIL | FAIL |
+| interactive messages delivered per window | inside control spread (sd 238) | 3235 | 2622 FAIL | 2672 PASS | 2552 FAIL | mixed |
+| interactive delivery | `= 1.000` | 1.000 | 1.000 PASS | 1.000 PASS | 1.000 PASS | PASS |
+| hub read back the beta the cell ran under | `== beta` | PASS | PASS | PASS | PASS | PASS |
+
+**The two halves are opposed and both are resolved.** (A): every beta above the
+control takes quiet-phase share, `8/8` reps, and the queue it is bought with
+deepens monotonically. (B), the mandate-window tail: the interactive lane's
+`p99`/`p999`/`max` and its `> 250 ms` fraction are all **inside the control's own
+spread** at every beta, and at `0.9` the `p99` is `4.0` ms *below* the control --
+this half passes by the criterion the requirement states.
+
+**And the resume transient is not covered by that window.** The first messages
+after the resume cross the queue the competing episode built, and that crossing
+is resolved and monotonic in beta on statistics the 7 s window dilutes: the
+**minimum** of each flow's first eight samples -- the best-case crossing, which a
+repair cannot inflate -- rises `46.2` -> `116.6` ms at beta `0.9` (paired
+`+70.4`, 95 % CI `[+44.3,+96.4]`, `8/8`) and `134.1` ms at `1.0`; the first-sample
+`p50` rises `74.3` -> `272.5` ms (`+198.2`, `[+69.6,+326.7]`, `8/8`); the worst of
+the first eight per flow rises `102.1` -> `450.0` ms (`+347.9`,
+`[+188.1,+507.6]`, `8/8`). `0.75` is the mild end and still resolves
+(`first_min +35.8 [+3.6,+67.9]`, `6/8`; `first_max +222.1 [+53.0,+391.2]`,
+`6/8`). The lever makes the interactive lane's first message after a quiet gap
+cross `+70` ms of queue at `0.9`, and the body of its first samples moves with
+it; the seven-second `p99` does not, because the crossing is a few dozen samples
+against a repair-dominated `p99` of `568` ms.
+
+**The verdict.** The lever takes share (target met at every beta, `0.75` -> `1.0`)
+and leaves the mandate-window interactive tail inside the control's spread, so by
+the requirement's own criterion beta `0.9` is the candidate to ship -- `1.0` adds
+half a point of share inside `0.9`'s interval at a worse resume cost. The trade
+the criterion does not see is the resume: **M4/(A) gains a `+5.6` pp share for a
+`+10.4` ms deeper standing queue, against an M1-relevant rise of `+70` ms
+best-case and `+348` ms worst-case latency on the interactive lane's first
+messages after it starts.** The stand-off exists to protect exactly that
+resume (`R2`, the closed-loop reclaim drain), and a rise in an impaired lane's
+tail is the regression the constitution orders first, so the lever ships only if
+that resume transient is judged acceptable; the conservative reading is that it
+is not.
+
+**The resume shape is not new; the beta dimension is.** (B) as a resume *is*
+already measured: `standoff_burst`'s bursty lane (`250 ms` every `4 s`, gaps past
+`STANDOFF_WINDOW`) reads the interactive `p99`/`max` over each resume and the max
+over each resume's first `8` samples, and `standoff_nonconvergent` reads a
+per-episode reclaim latency beside it -- both at the shipped `0.5` and against a
+convergent AIMD / fixed-rate competitor. What no arm measured is a resume with
+the **per-path factor** set, which is this one. The `minecraft`/clean/hostile
+arms cannot read (B) as a resume at all: the Minecraft shape's offer gaps are
+`p50 20.01 / max 22.30` ms against a `1500` ms window, so it hosts no idle gap
+to resume from.
+
+**Vacuity** (the mutated line and its occurrence count printed between the edit
+and the verdict; restored from a copy and `touch`ed, sha1-checked):
+
+* `MANDATE_SMOKE_FAULT=M4_BETA_RESUME_OFFER_NOW` zeroes the gate's margin and
+deadline, so the lane offers immediately and the stand-off is never armed:
+*"the bulk stand-off was never armed ... so this window measured the shipped
+delay-first policy rather than the competing episode the lever sets"* fails with
+exit `101`, so the gate assertion is fail-able from the measurement path.
+* `CcSignal::standoff_decrease_factor` forced to return
+`STANDOFF_DECREASE_FACTOR` (one substituted body line, occurrence count `1`):
+*"the hub read back 0.50 -- the arm did not apply the per-path factor it labelled
+the cell with"* fails with exit `101`, so an inert per-path factor cannot be
+reported as a beta composite.
+
+The arm's beta direction is **reported, not asserted**: a flat composite would be
+an impossibility finding about the lever in this topology, not a fault to
+launder, so the arm's assertions are the instrument sanity above and the
+per-beta share, the tail statistics and their paired CIs are the reading.
+
+The arm is declared `full` in the opt-in manifest and in the asserting block. It
+carries **no `gate-perf-design` row**: the full tier's declared subset is at
+`4488` s of its `4600` s budget before it, and its measured `565` s would
+overflow a budget that is frozen. Its cells are, against this crate's
+baseline, `M4@lane=dual+shape=quiet-then-resume+flows=4+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=interactive-standoff-beta+metric=resume-tail-and-bulk-share`,
+a `composite(flows,load,mechanism,metric,shape,shaper)` on the `constitution`
+family, so a later revision can cost it without restating the cell.
 
 ### Declared perf rows
 
@@ -3020,6 +3165,7 @@ mandate_smoke::m1_lone_tail_cover_wire = full
 mandate_smoke::probe_m4_clean_band_composition = perf
 mandate_smoke::probe_m4_clean_band_composition_noloss = perf
 mandate_smoke::m4_tcp_competition = full
+mandate_smoke::m4_tcp_standoff_beta_resume = full
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
 rtp_mux::rtp_mux_explorer_relays_onto_better_path = full
@@ -3236,6 +3382,7 @@ mandate_smoke::m4_clean_lane_p99_ceiling
 mandate_smoke::m4_clean_lane_fair_latency
 mandate_smoke::m4_hostile_lane_p99_ceiling
 mandate_smoke::m4_tcp_competition
+mandate_smoke::m4_tcp_standoff_beta_resume
 standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail
 standoff_nonconvergent::bulk_standoff_holds_share_against_a_non_converging_competitor
 standoff_beta_sweep::bulk_standoff_beta_controls_the_share_against_an_aimd_competitor
