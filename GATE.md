@@ -546,6 +546,22 @@ left unchanged because they are frozen arms, and an iteration that owns them
 should drop the tag byte and re-read their shares (their `GATE.md` numbers were
 taken with it).
 
+**The Minecraft arm's offer gaps, measured.**  `mandate_smoke::mc_nic_offer_gap_distribution`
+(`full`, 33 s) recovers every cadence sample's send time from the arm's own
+delivery timeline (`send = arrival - one_way_latency`) and reports the gap
+distribution, so "the lane stops offering" is a measurement rather than an
+assumption.  Measured on the Minecraft shape (`300 B / 20 ms`, one flow,
+saturating bulk on the shared shaper): `600` offers, `600` sent and received,
+delivery `1.000`, offered span `11.98` s of a `12` s window; gaps mean `20.00`,
+**p50 `20.01`, p90 `20.62`, p99 `21.48`, max `22.30` ms**; and `0.0000` of the
+span has quiet of at least `STANDOFF_WINDOW` (`1500` ms) or of at least one
+round trip (its own `94.8` ms proxy).  The arm offers **continuously**: its
+largest gap is 1.5 % of the stand-off window, so this topology hosts no natural
+stand-off window and no "resumption" event, and the (B) arm's tail is a
+continuous offer rather than a resume.  A sensitivity control on the same
+topology at a `2000` ms cadence reads `0.2501` and `0.9581` for the same two
+fractions, so the instrument separates a gap from no gap.
+
 **Vacuity** (the mutated line and its occurrence count printed between the edit
 and the verdict; restored from a copy and `touch`ed, sha1-checked):
 
@@ -566,6 +582,10 @@ the arm's own bulk-presence assertion failed with exit `101` -- *"our bulk
 delivered 0 B and the competitor 2048640 B over the quiet-elapsed intervals"* --
 which is the reading that led to the sink code, not a fleet-wide flake to be
 retried away.
+
+* `MC_GAP_CADENCE_MS=30000` on the shape probe: *"the Minecraft cadence block
+  offered 0 message(s) (0 sent)"* fails with exit `101`, so the gap distribution
+  cannot be reported from an absent offer series.
 
 The arm's `beta` direction is **reported, not asserted**: a flat sweep would be
 an impossibility finding about the rate-response family, not a fault to launder,
@@ -683,6 +703,7 @@ mandate_smoke::m4_tcp_competition = full | 17 | composite(flows,load,mechanism,m
 standoff_burst::bulk_standoff_reclaims_idle_gaps_without_spiking_the_resume_tail = full | 537 | composite(flows,load,mechanism,metric,shape,shaper)@constitution | M4@lane=dual+shape=bursty-cadence+flows=1+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=interactive-standoff+metric=idle-gap-bulk-share-and-resume-tail
 standoff_nonconvergent::bulk_standoff_holds_share_against_a_non_converging_competitor = full | 650 | composite(flows,load,mechanism,metric,shape,shaper)@constitution | M4@lane=dual+shape=bursty-cadence+flows=1+load=mux-bulk-vs-fixed-rate-competitor+shaper=shared-uplink+mechanism=interactive-standoff+metric=gap-share-and-reclaim-latency
 standoff_beta_sweep::bulk_standoff_beta_controls_the_share_against_an_aimd_competitor = full | 470 | composite(flows,load,mechanism,metric,shaper)@constitution | M4@lane=dual+shape=quiet-interactive+flows=1+load=mux-bulk-vs-aimd-reference+shaper=shared-uplink+mechanism=interactive-standoff-beta+metric=bulk-share-and-rtt-inflation
+mandate_smoke::mc_nic_offer_gap_distribution = full | 33 | baseline@mc-nic | mc-nic@lane=dual+shape=cadence+scale=300B+period=20ms+bulk=saturating+shaper=shared-uplink+mechanism=none+metric=offer-gap-distribution
 hol_probe::hol_cap400_fec_solo = perf | 20 | baseline@hol-fec | hol-fec@impairment=cap400-loss1+fec=on+bulk=none+metric=p99
 hol_probe::hol_cap400_loss1_split_shared = perf | 20 | composite(bulk,impairment,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1-shaper+bulk=split-shared+metric=p99
 hol_probe::hol_cap400_shared = full | 20 | composite(bulk,metric)@hol-cap400 | hol-cap400@impairment=cap400-loss1+bulk=shared+flows=1+metric=p99
@@ -2978,6 +2999,7 @@ minecraft_contested::mc_downstream_saturating_bulk = full
 ibfq_nic_mandate::ibfq_nic_ab_against_the_untouched_dual_lane = full
 minecraft_contested::mc_nic_cross_lane_signal = full
 mandate_smoke::m1_nic_minecraft_saturating_downstream = full
+mandate_smoke::mc_nic_offer_gap_distribution = full
 hol_verify4::v4_clean_muxbulk = perf
 hol_verify4::v4_ge5_muxbulk = perf
 mux_bulk_clean_stall::induced_stall_fires_the_watchdog = full
@@ -3161,6 +3183,7 @@ minecraft_contested::mc_downstream_saturating_bulk
 ibfq_nic_mandate::ibfq_nic_ab_against_the_untouched_dual_lane
 minecraft_contested::mc_nic_cross_lane_signal
 mandate_smoke::m1_nic_minecraft_saturating_downstream
+mandate_smoke::mc_nic_offer_gap_distribution
 mux_bulk_clean_stall::bounded_teardown_does_not_park_on_a_stuck_blocking_task
 mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout
 mux_bulk_clean_stall::induced_stall_fires_the_watchdog

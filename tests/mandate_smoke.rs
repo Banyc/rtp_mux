@@ -7238,3 +7238,176 @@ async fn m1_nic_minecraft_saturating_downstream() {
         plain.bulk_sink_bytes,
     );
 }
+
+/// The Minecraft arm's interactive **offer pattern**, measured from the arm's
+/// own delivery timeline.
+///
+/// Requirement (A) ("out-compete while the interactive lane is not running
+/// traffic at the moment") is only meaningful where the lane actually *stops*
+/// offering; requirement (B) ("no latency drop when it starts transmitting")
+/// is only meaningful where it starts again. Both are statements about the
+/// offer-gap distribution, so this probe measures that distribution for the
+/// shape rather than assuming a gap exists.
+///
+/// Each cadence sample's send time is recoverable exactly: the frame carries
+/// the sender's `base` stamp and the sink reports `base`-clock arrival minus it
+/// ([`ArmRun::timeline`]), so `send = arrival - latency`. The gap distribution
+/// is then read between consecutive sends, and the quiet fractions are the
+/// excess of each gap over a threshold divided by the offered span.
+#[derive(Debug, Clone, Copy)]
+struct OfferShape {
+    offers: usize,
+    sent: u64,
+    received: u64,
+    window_s: f64,
+    span_s: f64,
+    mean_gap_ms: f64,
+    p50_gap_ms: f64,
+    p90_gap_ms: f64,
+    p99_gap_ms: f64,
+    max_gap_ms: f64,
+    /// Fraction of the offered span during which the time since the last offer
+    /// is at least `rtp::cc::STANDOFF_WINDOW`: the window the stand-off's claim
+    /// needs to be due.
+    quiet_ge_standoff: f64,
+    /// The same fraction at one round trip (2 x the one-way p50): R1's
+    /// `lane_idle` rate criterion is `offered_pps < 1 / control_rtt`, i.e. the
+    /// lane has nothing in flight for at least one control interval.
+    quiet_ge_rtt: f64,
+    rtt_proxy_ms: f64,
+}
+
+fn offer_gap_percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)]
+}
+
+fn measure_offer_shape(run: &ArmRun) -> OfferShape {
+    let sends: Vec<f64> = run
+        .timeline
+        .iter()
+        .map(|(arrival, latency)| arrival - latency / 1000.0)
+        .collect();
+    let gaps: Vec<f64> = sends.windows(2).map(|w| (w[1] - w[0]) * 1000.0).collect();
+    let mut sorted = gaps.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let span_s = sends
+        .last()
+        .zip(sends.first())
+        .map(|(last, first)| last - first)
+        .unwrap_or(0.0);
+    let quiet = |threshold_ms: f64| -> f64 {
+        if span_s <= 0.0 {
+            return f64::NAN;
+        }
+        gaps.iter()
+            .map(|gap| (gap - threshold_ms).max(0.0))
+            .sum::<f64>()
+            / (span_s * 1000.0)
+    };
+    let rtt_proxy_ms = 2.0 * run.summary.p50;
+    OfferShape {
+        offers: sends.len(),
+        sent: run.summary.sent,
+        received: run.summary.received,
+        window_s: run.window.as_secs_f64(),
+        span_s,
+        mean_gap_ms: if gaps.is_empty() {
+            f64::NAN
+        } else {
+            gaps.iter().sum::<f64>() / gaps.len() as f64
+        },
+        p50_gap_ms: offer_gap_percentile(&sorted, 0.50),
+        p90_gap_ms: offer_gap_percentile(&sorted, 0.90),
+        p99_gap_ms: offer_gap_percentile(&sorted, 0.99),
+        max_gap_ms: sorted.last().copied().unwrap_or(f64::NAN),
+        quiet_ge_standoff: quiet(rtp::cc::STANDOFF_WINDOW.as_secs_f64() * 1000.0),
+        quiet_ge_rtt: quiet(rtt_proxy_ms),
+        rtt_proxy_ms,
+    }
+}
+
+/// The Minecraft topology's offer-gap probe: runs the arm's own shape (one
+/// block at its real `300 B / 20 ms` cadence) and a **sensitivity control** at a
+/// `2000 ms` cadence, which is above `STANDOFF_WINDOW`, so the quiet-fraction
+/// instrument is shown to be able to read a gap when one exists. Neither block
+/// asserts a product property: the deliverable is the measured distribution,
+/// which is what decides whether the Minecraft shape can host (A) and what
+/// "resumption" means for (B).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "opt-in shape probe: measures the Minecraft arm's interactive offer-gap distribution \
+            (and a 2000 ms sensitivity control); run with --ignored --nocapture"]
+async fn mc_nic_offer_gap_distribution() {
+    // Fault hook: an override cadence (ms) for the first block.  A cadence
+    // above the window (`MC_GAP_CADENCE_MS=30000`) makes the block offer
+    // nothing, so the shape assertion below fires from the measurement path --
+    // the vacuity demonstration for "the offer series was measured".
+    let cadence_ms: u64 = std::env::var("MC_GAP_CADENCE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(20);
+    let mut spec = mc_nic_arm("mc_gap", None);
+    spec.cadence = Duration::from_millis(cadence_ms);
+    let run = run_arm(spec.clone()).await;
+    print_arm(&run);
+    let shape = measure_offer_shape(&run);
+    eprintln!(
+        "[mc-gaps] cadence 300 B / {cadence_ms} ms  offers {} of {} sent ({} received) over a \
+         {:.1} s window (offered span {:.2} s)\n\
+         [mc-gaps] gap ms  mean {:.2}  p50 {:.2}  p90 {:.2}  p99 {:.2}  max {:.2}\n\
+         [mc-gaps] quiet  >= STANDOFF_WINDOW (1500 ms) {:.4} of the span   \
+         >= 1 RTT (proxy {:.1} ms) {:.4} of the span",
+        shape.offers,
+        shape.sent,
+        shape.received,
+        shape.window_s,
+        shape.span_s,
+        shape.mean_gap_ms,
+        shape.p50_gap_ms,
+        shape.p90_gap_ms,
+        shape.p99_gap_ms,
+        shape.max_gap_ms,
+        shape.quiet_ge_standoff,
+        shape.rtt_proxy_ms,
+        shape.quiet_ge_rtt,
+    );
+    // Sensitivity control: the same topology with a cadence above the stand-off
+    // window, so a gap genuinely exists and the quiet-fraction instrument must
+    // read it. A metric that cannot separate these two blocks is not a measure
+    // of the shape.
+    spec.name = "mc_gap_slow";
+    spec.cadence = Duration::from_millis(2000);
+    let slow = run_arm(spec).await;
+    print_arm(&slow);
+    let slow_shape = measure_offer_shape(&slow);
+    eprintln!(
+        "[mc-gaps] sensitivity control 300 B / 2000 ms  offers {} of {} sent  \
+         gap ms p50 {:.2} p90 {:.2} max {:.2}  quiet >= STANDOFF_WINDOW {:.4}  \
+         quiet >= 1 RTT {:.4}",
+        slow_shape.offers,
+        slow_shape.sent,
+        slow_shape.p50_gap_ms,
+        slow_shape.p90_gap_ms,
+        slow_shape.max_gap_ms,
+        slow_shape.quiet_ge_standoff,
+        slow_shape.quiet_ge_rtt,
+    );
+    assert!(
+        shape.offers > 0 && shape.offers as u64 + 1 >= shape.sent,
+        "[mc-gaps] the Minecraft cadence block offered {} message(s) ({} sent): the timeline the \
+         gap distribution is recovered from is empty or truncated, so the shape is unmeasured",
+        shape.offers,
+        shape.sent,
+    );
+    assert!(
+        slow_shape.quiet_ge_standoff > shape.quiet_ge_standoff + 0.1,
+        "[mc-gaps] the 2000 ms sensitivity control's quiet-of-the-stand-off-window fraction \
+         {:.4} does not exceed the 20 ms block's {:.4} by more than 0.1: the quiet-fraction \
+         instrument cannot tell a gap from no gap, so its reading about the Minecraft shape is \
+         not evidence",
+        slow_shape.quiet_ge_standoff,
+        shape.quiet_ge_standoff,
+    );
+}
