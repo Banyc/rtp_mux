@@ -25,7 +25,9 @@
 pub mod dual;
 pub mod mux_over_rtp;
 pub mod payload;
+pub mod profile;
 pub mod rtp_mux;
+pub mod standoff;
 
 /// The production dual-lane birth's liveness deadline, in milliseconds —
 /// re-exported so a measurement arm can assert its relation to the field's

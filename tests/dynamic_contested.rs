@@ -36,10 +36,10 @@ use rtp_mux::testkit::dual::{
 use rtp_mux::testkit::mux_over_rtp::{
     spawn_mux_gaming_latency_bulk_server_via, spawn_mux_latency_bulk_server_via,
 };
+use rtp_mux::testkit::profile::BULK_RAMP;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MSG_SEED_BASE: u64 = 0xD15E;
-const BULK_RAMP: Duration = Duration::from_millis(1500);
 const LATENCY_CADENCE: Duration = Duration::from_millis(25);
 const SMALL_MSG_BYTES: usize = 200;
 const BURST_RATIO: u64 = 16;

@@ -99,16 +99,13 @@ use rtp_mux::testkit::dual::{
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
 use rtp_mux::testkit::payload::{BYTE_SINK_BULK_CHUNK_BYTES, byte_sink_payload, saturate};
+use rtp_mux::testkit::profile::{JITTER, OWD, SHAPER_LIMIT_BYTES, SHAPER_RATE_BPS};
+use rtp_mux::testkit::standoff::SAMPLE_STEP;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// One-way delay on every link, as in the M1/M4 mandate arms.
-const OWD: Duration = Duration::from_millis(25);
-const JITTER: Duration = Duration::from_millis(5);
-/// The shared bottleneck both bulk flows and the interactive lane cross.  The
-/// 128 KiB drop-tail buffer is the same one `M4_TCP_SHAPER_LIMIT_BYTES` uses;
-/// at the shaper rate a full buffer is 125.0 ms of standing queue.
-const SHAPER_RATE_BPS: u64 = 8_388_608; // 1 MiB/s
-const SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
+// The deployment link profile, the shared shaper and the stand-off sampling
+// cadence are declared once in `rtp_mux::testkit`.
+
 /// One window: setup + the stand-off window + the measured tail.
 const RUN_FOR: Duration = Duration::from_secs(12);
 /// The measured tail starts here.  By four seconds the stand-off's 1500 ms
@@ -117,8 +114,6 @@ const RUN_FOR: Duration = Duration::from_secs(12);
 const MEASURE_FROM: Duration = Duration::from_secs(4);
 /// Drains stragglers before the counters are read.
 const GRACE: Duration = Duration::from_secs(1);
-/// How often the byte counters, the shaper backlog and the CC gate are sampled.
-const SAMPLE_STEP: Duration = Duration::from_millis(5);
 /// Interleaved reps: every rep runs all four betas.  Reported with the paired
 /// sd/sem, the 95 % CI and the minimum detectable effect, so a delta inside the
 /// instrument's noise is stated as such rather than read as an effect.

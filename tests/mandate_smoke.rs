@@ -119,26 +119,23 @@ use rtp_mux::testkit::dual::{
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
 use rtp_mux::testkit::mux_over_rtp::send_timestamped_messages;
+use rtp_mux::testkit::profile::{
+    BULK_BURST_BYTES, BULK_PERIOD, BULK_RAMP, BULK_RATE_BPS, JITTER, LOSS_2, M2_OFFER_TOLERANCE,
+    MSG_BYTES, OWD, SHAPER_LIMIT_BYTES, SHAPER_RATE_BPS, loss_pct,
+};
 use rtp_mux::testkit::rtp_mux::ECHO_TAG;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::MissedTickBehavior;
 
 // ─────────────────────────────── arm constants ───────────────────────────────
 
-/// One-way delay applied to every interactive packet: the deployment profile.
-const OWD: Duration = Duration::from_millis(25);
-/// Uniform jitter around [`OWD`] on the clean arm (the existing arms' 5 ms).
-const JITTER: Duration = Duration::from_millis(5);
+// The deployment link profile (`OWD`, `JITTER`, `MSG_BYTES`, `LOSS_2`,
+// `loss_pct`) and the bulk burst shape (`BULK_RATE_BPS`, `BULK_BURST_BYTES`,
+// `BULK_PERIOD`, `BULK_RAMP`) are shared with the sibling perf suites and are
+// declared once in `rtp_mux::testkit::profile`.
+
 /// Uniform jitter on the hostile arms: the field's ~100 ms excursion regime.
 const HOSTILE_JITTER: Duration = Duration::from_millis(100);
-/// `u32` loss threshold equal to `pct` percent per packet.
-const fn loss_pct(pct: u32) -> u32 {
-    (u32::MAX / 100) * pct
-}
-/// The clean/mild arm's independent per-packet loss.
-const LOSS_2: u32 = loss_pct(2);
-/// The interactive message size, a typical game ping.
-const MSG_BYTES: usize = 256;
 /// Interactive cadence: ~5 ms, so a short window still buys thousands of
 /// samples rather than hundreds.
 const CADENCE: Duration = Duration::from_millis(5);
@@ -155,18 +152,12 @@ const RR_QUICK_WINDOW: Duration = Duration::from_secs(5);
 /// Drains stragglers before the summary is read, so a message offered at the
 /// window's edge is not counted as lost.
 const GRACE: Duration = Duration::from_secs(2);
-/// The bulk burst shape on the M1/M2 arms (the existing production load).
-const BULK_RATE_BPS: u64 = 8 * 1024 * 1024;
-const BULK_BURST_BYTES: usize = 2 * 1024 * 1024;
-const BULK_PERIOD: Duration = Duration::from_secs(3);
-const BULK_RAMP: Duration = Duration::from_millis(1500);
-/// The bulk lane's configured capacity, the M3 denominator.
+/// The bulk lane's configured capacity, the M3 denominator. It carries the
+/// deployment's 1 MiB/s numeric value, the same as `profile::BULK_RATE_BPS`,
+/// but is a separate setting: this is the M3 fraction's denominator while that
+/// is the lane's configured cap, and either may move without the other.
 const M3_CAPACITY_BPS: u64 = 8 * 1024 * 1024;
 
-/// The one uplink bottleneck both lanes' writes cross on a `shared_shaper` arm: the
-/// operator's own Minecraft trace's mid-range capacity (1 MiB/s). The shaper is
-/// the *instrument*; the CC signal has no rate of its own.
-const SHARED_UP_RATE_BPS: u64 = 8_388_608;
 /// The saturating bulk window (full / quick tier).
 const BULK_WINDOW: Duration = Duration::from_secs(6);
 const QUICK_BULK_WINDOW: Duration = Duration::from_secs(2);
@@ -292,18 +283,8 @@ const M1_FIELD_RTT_OVER250_GUARD_PCT: f64 = 15.0;
 const M2_HOSTILE_DELIVERY_FLOOR: f64 = 0.995;
 /// M2 lone-tail delivery floor (measured 1.000).
 const M2_LONE_DELIVERY_FLOOR: f64 = 0.995;
-/// How far the measured offer count may fall below the arm's schedule before
-/// the lane is no longer being offered the mandate's known throughput.
-///
-/// The tolerance is slack for **the transport refusing writes**, not for the
-/// sender's schedule: `offer_cadence_on_deadline` owes its schedule the message
-/// count by construction, so on an idle host the arms land on exactly 2400 of
-/// 2400 and a shortfall means the lane would not take the load. It was
-/// originally documented as slack for scheduler jitter, which was the wrong
-/// instrument: the wake-count sender it was written for lost whole ticks on a
-/// loaded host (2313 and 2300 of 2400 at load average 31), so the tolerance was
-/// silently absorbing the host's scheduling rather than any refusal.
-const M2_OFFER_TOLERANCE: f64 = 0.02;
+// The offer-count tolerance is shared with the jitter battery and is declared
+// once in `rtp_mux::testkit::profile::M2_OFFER_TOLERANCE`.
 
 // ───────── the deployed baseline the impaired tail must not regress past ─────
 
@@ -1201,7 +1182,7 @@ async fn run_arm_observed(
                 .unwrap();
             // One downstream queue both lanes cross, when the arm asks for it:
             // the shared-buffer contention the CC signal exists to order.
-            let shared_uplink = shared_shaper.then(|| BottleneckShaper::new(SHARED_UP_RATE_BPS, 0));
+            let shared_uplink = shared_shaper.then(|| BottleneckShaper::new(SHAPER_RATE_BPS, 0));
             let mut bulk_c2s_link = if bulk {
                 bulk_c2s.clone()
             } else {
@@ -5627,14 +5608,15 @@ const M4_TCP_BULK_SHARE_FLOOR: f64 = 0.17;
 /// interactive p99 ~1015 ms, 4.1x M1's ceiling, with the buffer at 0). The
 /// 128 KiB value is the one the `rtp` loss-based A/B (`tests/shared_bottleneck`)
 /// and the `cc_link`/`ibfq` arms use, so the competitor's AIMD engages rather
-/// than the queue growing without a loss to react to.
-const M4_TCP_SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
+/// than the queue growing without a loss to react to. The buffer is
+/// `rtp_mux::testkit::profile::SHAPER_LIMIT_BYTES`, declared once with the arms
+/// that share it.
 
 /// The bottleneck's own queueing over one M4/TCP window, plus the interactive
 /// lane's client->server link counters. The shared-buffer backlog is sampled
 /// from [`BottleneckShaper::backlog_bytes`] while the window runs; its maximum
 /// is the largest queueing delay the bottleneck itself imposed (converted to
-/// time at [`SHARED_UP_RATE_BPS`]) and is the whole of term (a). The shaper's
+/// time at [`SHAPER_RATE_BPS`]) and is the whole of term (a). The shaper's
 /// `dropped` counter is the tail-drop signal the reference's AIMD acts on; the
 /// interactive counters are its `NetemPair`'s c2s direction, read before the
 /// pair is stopped.
@@ -5825,7 +5807,7 @@ struct M4TcpRun {
     /// The two bulk flows' aggregate as a fraction of the shaper's capacity.
     aggregate_fraction: f64,
     /// Term (a): the largest queueing delay the shared bottleneck imposed over
-    /// the window, in ms, from the sampled backlog and [`SHARED_UP_RATE_BPS`].
+    /// the window, in ms, from the sampled backlog and [`SHAPER_RATE_BPS`].
     shaper_max_queue_ms: f64,
     /// The bottleneck's own counters and the interactive lane's c2s counters.
     link: M4LinkEvidence,
@@ -5947,7 +5929,7 @@ async fn m4_tcp_saturate(write: &mut (impl AsyncWrite + Unpin), payload: &[u8], 
 /// ([`dual_mux_client_connect_lane_rtp_via_cc_link`]), so the bulk lane's path
 /// reads `shared` and its delay-first controller yields -- the production
 /// behaviour this arm measures the cost of. The shared shaper has a finite
-/// drop-tail buffer ([`M4_TCP_SHAPER_LIMIT_BYTES`]); those drops are the loss
+/// drop-tail buffer ([`SHAPER_LIMIT_BYTES`]); those drops are the loss
 /// signal the reference's multiplicative decrease acts on, so it is a
 /// loss-based competitor rather than a greedy flow. The three links add no
 /// per-link random loss -- the queue's own overflow is the loss.
@@ -6001,7 +5983,7 @@ async fn run_m4_tcp_arm_with(window: Duration, resume: Option<M4ResumeSpec>) -> 
             // One uplink queue all three flows cross: the interactive lane's
             // packets queue behind the two bulk flows, which is the cost this
             // arm exists to measure.
-            let shaper = BottleneckShaper::new(SHARED_UP_RATE_BPS, M4_TCP_SHAPER_LIMIT_BYTES);
+            let shaper = BottleneckShaper::new(SHAPER_RATE_BPS, SHAPER_LIMIT_BYTES);
             // Sample the shared buffer's own backlog for the whole window: the
             // largest value is the largest queueing delay the bottleneck itself
             // imposed, and its mean is the queue the interactive lane lived in.
@@ -6281,8 +6263,8 @@ async fn run_m4_tcp_arm_with(window: Duration, resume: Option<M4ResumeSpec>) -> 
     // bulk flows for at most this long; the ceiling the samples are split at
     // adds it to the flow's own measured floor, which is the firmest bound the
     // arm's own evidence supports on a message no repair touched.
-    let shaper_max_queue_ms = if SHARED_UP_RATE_BPS > 0 {
-        shaper_max_backlog as f64 * 8.0 * 1000.0 / SHARED_UP_RATE_BPS as f64
+    let shaper_max_queue_ms = if SHAPER_RATE_BPS > 0 {
+        shaper_max_backlog as f64 * 8.0 * 1000.0 / SHAPER_RATE_BPS as f64
     } else {
         0.0
     };
@@ -6341,7 +6323,7 @@ async fn run_m4_tcp_arm_with(window: Duration, resume: Option<M4ResumeSpec>) -> 
     // interactive lane crosses the same queue, but the share this arm reads is
     // between the two bulk flows; only the aggregate is compared against the
     // shaper, so the reference's saturation is visible beside the share.
-    let cap_bytes = (SHARED_UP_RATE_BPS as f64 / 8.0) * window.as_secs_f64();
+    let cap_bytes = (SHAPER_RATE_BPS as f64 / 8.0) * window.as_secs_f64();
     let agg = bulk_delivered + comp_delivered;
     let bulk_share = if agg == 0 {
         0.0
@@ -6414,7 +6396,7 @@ fn print_m4_tcp_arm(run: &M4TcpRun) {
         .iter()
         .map(|f| f.received.saturating_mul(MSG_BYTES as u64))
         .sum();
-    let shaper_bytes = (SHARED_UP_RATE_BPS as f64 / 8.0) * run.window.as_secs_f64();
+    let shaper_bytes = (SHAPER_RATE_BPS as f64 / 8.0) * run.window.as_secs_f64();
     let all_flows_fraction = if shaper_bytes > 0.0 {
         (run.bulk_delivered + run.comp_delivered + interactive_delivered) as f64 / shaper_bytes
     } else {
@@ -6665,7 +6647,7 @@ fn write_supplement(
 /// three additive terms a sender can or cannot move:
 ///
 /// * **(a) bottleneck queueing** -- the shared shaper's own backlog, sampled
-///   while the window runs; its maximum, at [`SHARED_UP_RATE_BPS`], is the
+///   while the window runs; its maximum, at [`SHAPER_RATE_BPS`], is the
 ///   longest a message can wait in the buffer, and is drawn beside the arm's
 ///   tail panels on `tcp_decomp` as `tcp_no_loss_ceiling`;
 /// * **(b) loss repair** -- an rtp metrics observer on the interactive lane's
@@ -6770,7 +6752,7 @@ async fn m4_tcp_competition() {
         "[m4-tcp] the two bulk flows together delivered {:.0} B = {:.4} of the {:.0} B shaper capacity, below the {M4_TCP_SATURATION_FLOOR:.2} saturation floor: the reference is not contesting the link, so the bulk share {:.4} cannot be read as a comparison against a competent loss-based competitor",
         (run.bulk_delivered + run.comp_delivered) as f64,
         run.aggregate_fraction,
-        (SHARED_UP_RATE_BPS as f64 / 8.0) * run.window.as_secs_f64(),
+        (SHAPER_RATE_BPS as f64 / 8.0) * run.window.as_secs_f64(),
         run.bulk_share,
     );
     // The decomposition's own instruments must have measured something, or a
@@ -6894,7 +6876,7 @@ struct M4ResumeCell {
     quiet_comp: u64,
     whole_share: f64,
     /// The shared shaper's backlog over the quiet lookback and over the resumed
-    /// phase, in ms at `SHARED_UP_RATE_BPS` (a full 128 KiB buffer is 125.0 ms).
+    /// phase, in ms at `SHAPER_RATE_BPS` (a full 128 KiB buffer is 125.0 ms).
     quiet_backlog_mean_ms: f64,
     quiet_backlog_max_ms: f64,
     active_backlog_mean_ms: f64,
@@ -7023,7 +7005,7 @@ fn m4_resume_cell(run: &M4TcpRun, beta: f64) -> M4ResumeCell {
     let (q_mean_b, q_max_b, _) = m4_resume_backlog(&run.backlog_timeline, quiet_from, resume_at);
     let (a_mean_b, _, _) = m4_resume_backlog(&run.backlog_timeline, resume_at, active_to);
     let (rtt_mean, rtt_p95, _) = m4_resume_rtt(&run.bulk_rtt_timeline, quiet_from, resume_at);
-    let ms_per_byte = 8.0 * 1000.0 / SHARED_UP_RATE_BPS as f64;
+    let ms_per_byte = 8.0 * 1000.0 / SHAPER_RATE_BPS as f64;
 
     M4ResumeCell {
         beta,

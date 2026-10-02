@@ -37,24 +37,15 @@ use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
+use rtp_mux::testkit::profile::{
+    JITTER, LINK_BYTES_PER_SEC, MSG_BYTES, OWD, SHAPER_LIMIT_BYTES, SHAPER_RATE_BPS,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinSet;
 
-const OWD: Duration = Duration::from_millis(25);
-const JITTER: Duration = Duration::from_millis(5);
-const MSG_BYTES: usize = 256;
 const CADENCE: Duration = Duration::from_millis(25);
 const RUN_FOR: Duration = Duration::from_secs(8);
 const GRACE: Duration = Duration::from_secs(1);
-/// A reporting nominal for the bulk-goodput column, not a rate the arbiter
-/// enforces (it has none): it only keeps the column comparable across arms.
-const LINK_BYTES_PER_SEC: f64 = 1024.0 * 1024.0;
-/// The shared bottleneck both lanes' client→server traffic passes through.
-/// This is the *instrument*, not the arbiter: the arbiter has no rate. It makes
-/// the two lanes genuinely contend for one queue, which the per-lane pairs of
-/// the earlier arm did not.
-const SHAPER_RATE_BPS: u64 = 8_388_608; // 1 MiB/s
-const SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
 const BULK_CHUNK: usize = 64 * 1024;
 const REPS: usize = 3;
 const ARMS: [Arm; 2] = [Arm::Baseline, Arm::Cc];

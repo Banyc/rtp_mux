@@ -49,6 +49,7 @@ use netem_test::kit::submit_test_task;
 use netem_test::{NetemConfig, NetemPair};
 use rtp::testkit::rtp::rtp_connect_with_mss_via;
 use rtp_mux::testkit::mux_over_rtp::spawn_mux_latency_bulk_server_via;
+use rtp_mux::testkit::profile::BULK_RAMP;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Ping message size.
@@ -56,9 +57,6 @@ const PING_BYTES: usize = 200;
 
 /// Queue-length sampler interval.
 const QUEUE_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Bulk ramp time before the ping window starts (mirrors hol_probe).
-const BULK_RAMP: Duration = Duration::from_millis(1500);
 
 /// Result of a single contested-latency repetition.
 #[derive(Clone, Debug, Default)]

@@ -91,17 +91,12 @@ use rtp_mux::testkit::dual::{
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
 use rtp_mux::testkit::mux_over_rtp::send_timestamped_messages;
+use rtp_mux::testkit::profile::{BULK_RATE_BPS, JITTER, MSG_BYTES, OWD};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// One-way delay applied to every packet on both lanes (the deployment link
-/// profile, shared with the `rtp_mux_jitter` battery).
-const OWD: Duration = Duration::from_millis(25);
-/// Uniform jitter around [`OWD`].
-const JITTER: Duration = Duration::from_millis(5);
-/// The configured bulk-lane rate cap (bits per second), applied to both bulk
-/// directions by the impairment proxy — the link capacity the mandate's
-/// goodput is a fraction of.
-const BULK_RATE_BPS: u64 = 8 * 1024 * 1024;
+// The deployment link profile and the bulk rate cap it shares with the sibling
+// perf suites are declared once in `rtp_mux::testkit::profile`.
+
 /// Minimum sink-delivered bulk goodput as a fraction of
 /// [`BULK_RATE_BPS`], the mandate-3 floor. The shape follows the
 /// `rtp_bufferbloat` precedent (`GOODPUT_CAPACITY_FLOOR = 0.35` there, chosen
@@ -111,8 +106,6 @@ const BULK_RATE_BPS: u64 = 8 * 1024 * 1024;
 /// measured band: a change that at least halves the bulk lane's goodput
 /// fails while ordinary host-load noise never trips it.
 const BULK_GOODPUT_CAPACITY_FRACTION: f64 = 0.35;
-/// Interactive message size, a typical game ping.
-const MSG_BYTES: usize = 256;
 const CADENCE: Duration = Duration::from_millis(25);
 /// Measurement window per rep.
 const RUN_FOR: Duration = Duration::from_secs(15);

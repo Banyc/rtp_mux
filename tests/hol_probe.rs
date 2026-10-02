@@ -65,6 +65,7 @@ use rtp_mux::testkit::mux_over_rtp::{
     send_timestamped_messages, spawn_mux_frame_delivery_latency_bulk_server_via,
     spawn_mux_latency_bulk_server_via,
 };
+use rtp_mux::testkit::profile::BULK_RAMP;
 use rtp_mux::testkit::rtp_mux::{
     LaneFecEvidence, RtpMuxFecCapture, rtp_mux_connector_observed_via,
     spawn_rtp_mux_latency_bulk_server_observed_via,
@@ -82,8 +83,6 @@ const DEFAULT_CADENCE: Duration = Duration::from_millis(25);
 const DEFAULT_RUN_FOR: Duration = Duration::from_millis(16_500);
 /// Default grace period for stragglers.
 const DEFAULT_GRACE: Duration = Duration::from_secs(3);
-/// Bulk ramp: interactive runs solo for this long before the bulk flow starts.
-const BULK_RAMP: Duration = Duration::from_millis(1500);
 
 /// Paced bulk arrival rate (bytes/sec) — used ONLY by the dedicated three-run
 /// deterministic regression test (`hol_paced_bulk_median_p99_regression`).

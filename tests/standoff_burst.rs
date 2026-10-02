@@ -69,22 +69,20 @@ use rtp_mux::testkit::dual::{
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
 use rtp_mux::testkit::payload::{BYTE_SINK_BULK_CHUNK_BYTES, byte_sink_payload, saturate};
+use rtp_mux::testkit::profile::{JITTER, MSG_BYTES, OWD, SHAPER_LIMIT_BYTES, SHAPER_RATE_BPS};
+use rtp_mux::testkit::standoff::{
+    BURST_OFF, BURST_ON, BURSTS, FIRST_BURST, GAP_MEASURE_TAIL, MAX_REP_ATTEMPTS, RESUME_FIRST_N,
+    RESUME_SPAN, SAMPLE_STEP,
+};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// One-way delay, matching the mandate arms.
-const OWD: Duration = Duration::from_millis(25);
-const JITTER: Duration = Duration::from_millis(5);
-/// The interactive message size (a typical game ping).
-const MSG_BYTES: usize = 256;
+// The deployment link profile and the shared shaper are declared once in
+// `rtp_mux::testkit::profile`; the stand-off burst/measurement shape is shared
+// with the sibling stand-off gates and declared once in
+// `rtp_mux::testkit::standoff`.
+
 /// Cadence within a burst.
 const CADENCE: Duration = Duration::from_millis(5);
-/// The burst shape: a short active stretch, a long idle gap (several times
-/// `STANDOFF_WINDOW`, so the stand-off genuinely arms inside each gap).
-const BURST_ON: Duration = Duration::from_millis(250);
-const BURST_OFF: Duration = Duration::from_secs(4);
-/// Delay before the first burst, so the lane handshakes settle first.
-const FIRST_BURST: Duration = Duration::from_millis(500);
-const BURSTS: usize = 4;
 /// The whole window: setup + bursts + a closing drain.
 const RUN_FOR: Duration = Duration::from_secs(14);
 /// Drains stragglers before the summary is read.
@@ -96,27 +94,6 @@ const GRACE: Duration = Duration::from_secs(1);
 /// eight-rep arm the paired sd was ~0.23, so sixteen reps carry a ~0.11
 /// half-width and an ~0.14 minimum detectable effect at 80 % power.
 const REPS: usize = 16;
-/// A rep whose bulk or competitor connection delivered no bytes is not a
-/// sample of the mechanism -- the flow was absent.  Re-run it (a bounded
-/// number of times) rather than folding a degenerate ratio into the spread.
-const MAX_REP_ATTEMPTS: usize = 4;
-/// The shared bottleneck both bulk flows and the interactive lane cross.
-const SHAPER_RATE_BPS: u64 = 8_388_608; // 1 MiB/s
-const SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
-/// How often both bulk byte counters are sampled.  The share is integrated
-/// over these samples, so the cadence is the share's time resolution.
-const SAMPLE_STEP: Duration = Duration::from_millis(5);
-/// The part of each gap the share is read over: from the moment the stand-off
-/// window has elapsed (plus slack for the interactive staleness horizon) to the
-/// next burst.  A gap shorter than this contributes no samples.
-const GAP_MEASURE_TAIL: Duration = Duration::from_millis(1600);
-/// The resume window: the burst plus one hold and a scheduling margin.
-const RESUME_SPAN: Duration = Duration::from_millis(750);
-/// How many interactive samples after each resume the hold's first packets are
-/// read from.  The whole-window p99 is repair-dominated (a ~357 ms plateau), so
-/// the hold's queue contribution is only visible in the first few packets of
-/// each resume, before a repair has had time to fire.
-const RESUME_FIRST_N: usize = 8;
 
 /// The two arms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

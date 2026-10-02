@@ -126,35 +126,23 @@ use rtp_mux::testkit::mux_over_rtp::{
     spawn_mux_frame_delivery_latency_bulk_server_with_fec_tuning_via,
     spawn_mux_latency_bulk_server_with_fec_tuning_via,
 };
+use rtp_mux::testkit::profile::{
+    BULK_BURST_BYTES, BULK_PERIOD, BULK_RAMP, BULK_RATE_BPS, JITTER, LOSS_2, M2_OFFER_TOLERANCE,
+    MSG_BYTES, OWD, loss_pct,
+};
 use rtp_mux::testkit::rtp_mux::ECHO_TAG;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::MissedTickBehavior;
 
-/// One-way delay applied to every packet in both directions.
-const OWD: Duration = Duration::from_millis(25);
-/// Uniform jitter around [`OWD`].
-const JITTER: Duration = Duration::from_millis(5);
-/// `u32` loss threshold equal to `pct` percent per packet.
-const fn loss_pct(pct: u32) -> u32 {
-    (u32::MAX / 100) * pct
-}
-/// The original interactive-loss probe's 2% independent per-packet loss.
-const LOSS_2: u32 = loss_pct(2);
+// The deployment link profile (`OWD`, `JITTER`, `MSG_BYTES`, `LOSS_2`,
+// `loss_pct`) and the bulk burst shape (`BULK_RATE_BPS`, `BULK_BURST_BYTES`,
+// `BULK_PERIOD`, `BULK_RAMP`) are shared with the sibling perf suites and are
+// declared once in `rtp_mux::testkit::profile`.
+
 /// A loss level above FEC's 5% enable threshold (see
 /// `rtp/src/traffic_shaping/redundancy/fec_gate.rs`).
 const LOSS_6: u32 = loss_pct(6);
-/// Bottleneck rate for the bulk cases (1 MiB/s): chosen so a 2 MiB burst takes
-/// ~2 s to drain, producing several hundred ms of queueing without the queue
-/// growing without bound across periods.
-const BULK_RATE_BPS: u64 = 1024 * 1024 * 8;
-/// Bytes offered per bulk burst.
-const BULK_BURST_BYTES: usize = 2 * 1024 * 1024;
-/// Interval between bulk bursts.
-const BULK_PERIOD: Duration = Duration::from_secs(3);
-/// Let the ping stream establish a solo floor before the first burst.
-const BULK_RAMP: Duration = Duration::from_millis(1500);
-/// Interactive message size and cadence (a typical game ping).
-const MSG_BYTES: usize = 256;
+/// Interactive cadence (a typical game ping).
 const CADENCE: Duration = Duration::from_millis(25);
 /// Interactive run time — long enough to observe several bulk bursts.
 const RUN_FOR: Duration = Duration::from_secs(30);
@@ -2537,12 +2525,8 @@ async fn jitter_duallane_arms() {
 /// `rtp_mux/GATE.md` ("Performance").
 const INTERACTIVE_NONDEGRADING_P99_MS: f64 = 100.0;
 
-/// How far the measured offer count may fall below the arm's schedule before
-/// the lane is no longer being offered the mandate's known throughput. The
-/// cadence sender's first interval opens with the window, so the measured
-/// 1200 messages of a 1200-message schedule (or one fewer) is the offer; 2 %
-/// is slack for scheduler jitter rather than a tolerance on the offer itself.
-const M2_OFFER_TOLERANCE: f64 = 0.02;
+// The offer-count tolerance is shared with the mandate smoke set and is
+// declared once in `rtp_mux::testkit::profile::M2_OFFER_TOLERANCE`.
 
 /// The interactive-lane constitution gate (mandate 2): the deployment
 /// topology's mandate — the lane is **offered a known throughput** and its

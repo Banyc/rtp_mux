@@ -75,22 +75,16 @@ use rtp_mux::testkit::dual::{
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
 use rtp_mux::testkit::mux_over_rtp::send_timestamped_messages;
+use rtp_mux::testkit::profile::{
+    BULK_BURST_BYTES, BULK_PERIOD, BULK_RAMP, BULK_RATE_BPS, JITTER, MSG_BYTES, OWD,
+};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::MissedTickBehavior;
 
-/// One-way delay applied to every packet in both directions.
-const OWD: Duration = Duration::from_millis(25);
-/// Uniform jitter around [`OWD`].
-const JITTER: Duration = Duration::from_millis(5);
-/// Interactive message size and cadence (a typical game ping).
-const MSG_BYTES: usize = 256;
+// The deployment link profile and the bulk burst shape it shares with the
+// sibling perf suites are declared once in `rtp_mux::testkit::profile`.
+
 const CADENCE: Duration = Duration::from_millis(25);
-/// Bottleneck rate for the bulk lane (1 MiB/s) and its periodic burst shape,
-/// identical to the production `rtp_mux_jitter` dual-lane `both` arm.
-const BULK_RATE_BPS: u64 = 1024 * 1024 * 8;
-const BULK_BURST_BYTES: usize = 2 * 1024 * 1024;
-const BULK_PERIOD: Duration = Duration::from_secs(3);
-const BULK_RAMP: Duration = Duration::from_millis(1500);
 /// Let stragglers arrive before the final counters are read.
 const GRACE: Duration = Duration::from_secs(3);
 /// Bounded queue for test-owned tasks (mirrors the sibling scenarios).

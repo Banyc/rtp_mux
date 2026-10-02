@@ -69,22 +69,14 @@ use rtp_mux::testkit::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via_cc_link,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
 };
+use rtp_mux::testkit::profile::{
+    JITTER, LINK_BYTES_PER_SEC, MSG_BYTES, OWD, SHAPER_LIMIT_BYTES, SHAPER_RATE_BPS,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// One-way delay: a short floor so the queue, not the link, is the variable.
-const OWD: Duration = Duration::from_millis(25);
-const JITTER: Duration = Duration::from_millis(5);
-const MSG_BYTES: usize = 256;
 const CADENCE: Duration = Duration::from_millis(25);
 const RUN_FOR: Duration = Duration::from_secs(8);
 const GRACE: Duration = Duration::from_secs(1);
-/// Reporting nominal for the goodput column, not a rate any arbiter enforces
-/// (the hub has none): it only keeps the column comparable across arms.
-const LINK_BYTES_PER_SEC: f64 = 1024.0 * 1024.0;
-/// The shared bottleneck both lanes' client→server traffic crosses. The
-/// instrument, not the mechanism: the hub has no rate.
-const SHAPER_RATE_BPS: u64 = 8_388_608; // 1 MiB/s
-const SHAPER_LIMIT_BYTES: u64 = 128 * 1024;
 const BULK_CHUNK: usize = 64 * 1024;
 const REPS: usize = 4;
 
