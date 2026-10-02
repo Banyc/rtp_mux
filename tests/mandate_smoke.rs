@@ -5601,17 +5601,6 @@ const M4_TCP_SATURATION_FLOOR: f64 = 0.5;
 /// the equal split, so a floor at the fair share would fail every run.
 const M4_TCP_BULK_SHARE_FLOOR: f64 = 0.17;
 
-/// The shared uplink's drop-tail buffer, in bytes. It must be **finite**: those
-/// drops are the loss signal the reference's multiplicative decrease acts on,
-/// so an unbounded (loss-free) queue leaves the reference a greedy flow that
-/// never decreases and the arm measures queue growth without bound (measured:
-/// interactive p99 ~1015 ms, 4.1x M1's ceiling, with the buffer at 0). The
-/// 128 KiB value is the one the `rtp` loss-based A/B (`tests/shared_bottleneck`)
-/// and the `cc_link`/`ibfq` arms use, so the competitor's AIMD engages rather
-/// than the queue growing without a loss to react to. The buffer is
-/// `rtp_mux::testkit::profile::SHAPER_LIMIT_BYTES`, declared once with the arms
-/// that share it.
-
 /// The bottleneck's own queueing over one M4/TCP window, plus the interactive
 /// lane's client->server link counters. The shared-buffer backlog is sampled
 /// from [`BottleneckShaper::backlog_bytes`] while the window runs; its maximum
@@ -5931,8 +5920,12 @@ async fn m4_tcp_saturate(write: &mut (impl AsyncWrite + Unpin), payload: &[u8], 
 /// behaviour this arm measures the cost of. The shared shaper has a finite
 /// drop-tail buffer ([`SHAPER_LIMIT_BYTES`]); those drops are the loss
 /// signal the reference's multiplicative decrease acts on, so it is a
-/// loss-based competitor rather than a greedy flow. The three links add no
-/// per-link random loss -- the queue's own overflow is the loss.
+/// loss-based competitor rather than a greedy flow. The buffer must be
+/// **finite** for that: with it at 0 the queue grows without bound (measured:
+/// interactive p99 ~1015 ms, 4.1x M1's ceiling). The 128 KiB value is the one
+/// the `rtp` loss-based A/B (`tests/shared_bottleneck`) and the `cc_link`/
+/// `ibfq` arms use. The three links add no per-link random loss -- the queue's
+/// own overflow is the loss.
 async fn run_m4_tcp_arm(window: Duration) -> M4TcpRun {
     run_m4_tcp_arm_with(window, None).await
 }
