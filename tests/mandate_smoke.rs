@@ -5895,12 +5895,15 @@ struct M4ResumeSpec {
     deadline: Duration,
 }
 
+/// The `(base-relative seconds, rtt)` samples an RTT observer records.
+type RttSeries = Arc<Mutex<Vec<(f64, f64)>>>;
+
 /// An observer on the **product mux bulk lane's** client connection that records
 /// its `congestion_control_rtt` on the arm's own `base` clock, so the RTT
 /// inflation the stand-off's larger share is bought with is read from the flow
 /// that pays it (the same quantity `standoff_beta_sweep` reads from its direct
 /// rtp bulk).
-fn m4_bulk_rtt_observer(base: Instant) -> (MetricsObserver, Arc<Mutex<Vec<(f64, f64)>>>) {
+fn m4_bulk_rtt_observer(base: Instant) -> (MetricsObserver, RttSeries) {
     let series = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&series);
     let observer = MetricsObserver::filtered(
@@ -6210,11 +6213,10 @@ async fn run_m4_tcp_arm_with(window: Duration, resume: Option<M4ResumeSpec>) -> 
             shaper_sampler_stop.store(true, Ordering::Relaxed);
             let shaper_max_backlog = shaper_backlog_max.load(Ordering::Relaxed);
             let shaper_backlog_sample_count = shaper_backlog_samples.load(Ordering::Relaxed);
-            let shaper_mean_backlog = if shaper_backlog_sample_count == 0 {
-                0
-            } else {
-                shaper_backlog_sum.load(Ordering::Relaxed) / shaper_backlog_sample_count
-            };
+            let shaper_mean_backlog = shaper_backlog_sum
+                .load(Ordering::Relaxed)
+                .checked_div(shaper_backlog_sample_count)
+                .unwrap_or(0);
             let shaper_dropped = shaper.dropped();
             let int_c2s = int_pair.stats_c2s();
             let backlog_timeline = shaper_backlog_timeline.lock().unwrap().clone();
