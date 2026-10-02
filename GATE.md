@@ -486,10 +486,12 @@ by its own named mutation.
 
 ### The stand-off's multiplicative-decrease factor: the beta sweep
 
-`rtp::cc::STANDOFF_DECREASE_FACTOR` (`0.5`) names the bulk stand-off's **own**
+`rtp::cc::STANDOFF_DECREASE_FACTOR` (`0.75`) names the bulk stand-off's **own**
 multiplicative-decrease factor, separate from the test-only AIMD reference
 law's `REFERENCE_AIMD_DECREASE_FACTOR`; `CcSignalHub::with_standoff_decrease_factor`
-(testing) sets it per path.  Before this revision the two were one constant, so
+(testing) sets it per path.  The shipped value is `0.75`; `0.5` is the control
+this sweep and the composite compare a gentler factor against.  Before this
+revision the two were one constant, so
 every recorded split between the stand-off and the AIMD competitor compared two
 identical controls: it could read whether the stand-off competed at all, never
 whether a *gentler* decrease takes more.
@@ -534,9 +536,10 @@ factor holds is `115.1` ms of the buffer's `125.0` ms at beta = `1.0`, and every
 beta's pair-aggregate still saturates the shaper (`0.791`-`0.866`), so the
 shares are read against a competitor that contested the link.
 
-The shipped default is `0.5`, so this lever's own arm is the only place a
-different beta runs, and requirement (B)'s no-competitor scenarios are
-untouched by it.  The battery run on the same revision reads
+The shipped default is `0.75`, so `0.5` is this arm's control and the per-path
+hook is what runs a different beta in the sweep; requirement (B)'s
+no-competitor scenarios are untouched by the shipped value because they set the
+factor explicitly.  The battery run on the same revision reads
 `m1_nic_minecraft_saturating_downstream` exit `0` (mc_signalled p99 `173.7` ms
 against its `180.2` ms read, `12 582 630` B bulk, uncapped), M1 clean p99
 `26.9` ms and hostile p99 `156.0` ms, M2 delivery `1.000`, M3 `0.958`, M4 pass.
@@ -653,7 +656,7 @@ before the two bulk flows stop. Eight interleaved reps per beta (`0.5` control,
 `68.4` -> `94.4` ms mean (max saturates the `125.0` ms buffer at every beta), so
 the queue the resume crosses is the lever's own and it is resolved.
 
-**BEFORE (beta 0.50, the shipped default) vs AFTER, per metric, with the bound**
+**BEFORE (beta 0.50, the arm's control) vs AFTER, per metric, with the bound**
 (`perf/beta-sweep/composite-r1/summary.csv` and `cells.csv`, n = 8 paired reps).
 "Control spread" is the control's own rep-to-rep sd, which is the band a beta
 above it may move inside without being an effect.
@@ -714,7 +717,7 @@ is not.
 already measured: `standoff_burst`'s bursty lane (`250 ms` every `4 s`, gaps past
 `STANDOFF_WINDOW`) reads the interactive `p99`/`max` over each resume and the max
 over each resume's first `8` samples, and `standoff_nonconvergent` reads a
-per-episode reclaim latency beside it -- both at the shipped `0.5` and against a
+per-episode reclaim latency beside it -- both at the `0.5` control and against a
 convergent AIMD / fixed-rate competitor. What no arm measured is a resume with
 the **per-path factor** set, which is this one. The `minecraft`/clean/hostile
 arms cannot read (B) as a resume at all: the Minecraft shape's offer gaps are
@@ -882,10 +885,10 @@ on the `constitution` and `mc-nic` families.
 `rtp::cc::CcSignalHub::with_standoff_decrease_factor` and
 `rtp::cc::STANDOFF_WINDOW`, which live in `rtp_claim_ws`'s `8698e993ba` and not
 in the pinned `v0.0.106`, so this checkout compiles only with `rtp`'s local path
-uncommented in the measurement copy; the pin bump and re-verification are the
-releasing step, which this iteration does not take (it does not land or tag).
-The always-run M1-M4 arms and the frozen Minecraft arm were re-run on that tree
-and pass (`exit 0`).
+uncommented in the measurement copy; the pin bump is the releasing step.  The
+certified production default is `0.75` (`rtp_claim_ws`'s `e148a737`), and the
+full battery re-run at it, with the beta arms, is recorded in
+`perf/beta-default/`.
 
 ### Declared perf rows
 
